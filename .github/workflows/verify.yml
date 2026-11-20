@@ -1,0 +1,32 @@
+name: Verify TaskPulse
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: macos-15
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Run backend regression tests
+        run: |
+          python3 -m venv "$RUNNER_TEMP/taskpulse-tests"
+          "$RUNNER_TEMP/taskpulse-tests/bin/python" -m pip install 'requests>=2.31,<3'
+          "$RUNNER_TEMP/taskpulse-tests/bin/python" -m unittest discover -s tests -v
+      - name: Compile the AppKit app
+        run: |
+          for arch in arm64 x86_64; do
+            swiftc -O -target "$arch-apple-macos13.0" pulse.swift -framework Cocoa -o "$RUNNER_TEMP/TaskPulse-$arch"
+          done
+      - name: Check extension and package script syntax
+        run: |
+          node --check edge-ext/background.js
+          for script in packaging/build.sh packaging/install.command packaging/uninstall.command; do
+            bash -n "$script"
+          done

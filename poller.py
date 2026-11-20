@@ -5,7 +5,7 @@
 # ///
 """TaskPulse —— 桌面角落的 Agent 会话监视器（后台服务）。
 
-每 60 秒拉一次会话列表与队列快照，维护四态：
+定期发现会话，并较频繁地复查运行中的队列，维护任务状态：
   running   进行中（agent 还在思考）
   stuck     卡住（本轮思考超过阈值，或这一轮被限流打断）
   attention 待你处理（agent 停下且有新回复）
@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import NamedTuple
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -72,6 +73,8 @@ DEFAULTS = {
     },
     "poll": {
         "interval_seconds": 60,
+        "active_interval_seconds": 10,
+        "active_watch_limit": 2,
         "watch_limit": 20,
         "stuck_seconds": 600,
         "window_limit": 10,
@@ -128,10 +131,12 @@ HOST = (PLATFORM.get("base_url") or "").rstrip("/")
 API = HOST + (PLATFORM.get("api_prefix") or "")
 PORT = int(CFG["ui"]["port"])
 AGENT_IDS = list(PLATFORM.get("agent_ids") or [])
-POLL_SECONDS = int(CFG["poll"]["interval_seconds"])
+POLL_SECONDS = max(1, int(CFG["poll"]["interval_seconds"]))
 TP_DEBUG = os.environ.get("TP_DEBUG") == "1"
-_fail_count = 0
-WATCH_LIMIT = int(CFG["poll"]["watch_limit"])   # 只对最近更新的 N 个会话查队列
+WATCH_LIMIT = max(0, int(CFG["poll"]["watch_limit"]))
+ACTIVE_POLL_SECONDS = max(0, int(CFG["poll"]["active_interval_seconds"]))
+ACTIVE_WATCH_LIMIT = min(WATCH_LIMIT, max(0, int(CFG["poll"]["active_watch_limit"])))
+ROUND_BUDGET_SECONDS = 10
 DEFAULT_STUCK_SECONDS = int(CFG["poll"]["stuck_seconds"])
 DEFAULT_WINDOW_LIMIT = int(CFG["poll"]["window_limit"])
 DEADLINE_REMIND_SECONDS = 1800
@@ -305,216 +310,320 @@ class AgentClient:
         self.f_pending = qf.get("pending") or ""
         self.idle = tuple(qf.get("idle") or ())
 
-    def _post(self, path: str, body: dict) -> dict:
-        r = self.session.request("POST", API + path, json=body, timeout=25)
-        return r.json()
+    def _request_data(self, method: str, path: str, timeout: float, **kwargs) -> dict:
+        response = self.session.request(method, API + path, timeout=timeout, **kwargs)
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int) and not 200 <= status < 300:
+            raise requests.HTTPError(f"{path.split('?')[0]} 返回 HTTP {status}", response=response)
+        result = response.json()
+        if (not isinstance(result, dict) or result.get("success") is False
+                or not isinstance(result.get("data"), dict)):
+            raise ValueError(f"{path.split('?')[0]} 返回的数据格式无效")
+        return result["data"]
 
-    def _get(self, path: str) -> dict:
-        r = self.session.request("GET", API + path, timeout=25)
-        return r.json()
+    def conversations(self, timeout: float) -> list[dict]:
+        data = self._request_data("POST", self.ep_conversations, timeout, json=self.body)
+        if "groups" not in data and "ungrouped" not in data:
+            raise ValueError("会话列表缺少 groups 和 ungrouped")
 
-    def conversations(self) -> list[dict]:
-        data = self._post(self.ep_conversations, self.body).get("data") or {}
+        groups = data.get("groups")
+        ungrouped = data.get("ungrouped")
+        if groups is None:
+            groups = []
+        if not isinstance(groups, list):
+            raise ValueError("会话分组格式无效")
+        if ungrouped is not None:
+            groups = [*groups, ungrouped]
 
         items: list[dict] = []
-        for group in data.get("groups") or []:
+        for group in groups:
+            if not isinstance(group, dict):
+                raise ValueError("会话分组格式无效")
             gname = group.get("name") or ""
-            for conv in group.get("conversations") or []:
-                conv = dict(conv)
-                conv["groupName"] = gname
-                items.append(conv)
-        for conv in (data.get("ungrouped") or {}).get("conversations") or []:
-            conv = dict(conv)
-            conv.setdefault("groupName", "")
-            items.append(conv)
+            conversations = group.get("conversations")
+            if conversations is None:
+                continue
+            if not isinstance(conversations, list):
+                raise ValueError("分组会话列表格式无效")
+            for conv in conversations:
+                items.append({**conv, "groupName": gname or conv.get("groupName", "")})
 
         seen, out = set(), []
         for c in items:
-            cid = c.get("id")
+            cid = int(c.get("id") or 0)
             if not cid or cid in seen:
                 continue
             seen.add(cid)
+            c["id"] = cid
+            c["updateTime"] = int(c.get("updateTime") or 0)
             out.append(c)
-        out.sort(key=lambda c: c.get("updateTime") or 0, reverse=True)
+        out.sort(key=lambda c: c["updateTime"], reverse=True)
         return out
 
-    def queue(self, cid: int) -> dict:
-        try:
-            return self._get(self.ep_queue.format(cid=cid)).get("data") or {}
-        except Exception as exc:  # noqa: BLE001
-            log(f"queue {cid} failed: {exc}")
-            return {}
+    def queue(self, cid: int, timeout: float) -> tuple[bool, str | int]:
+        data = self._request_data("GET", self.ep_queue.format(cid=cid), timeout)
+        raw = data.get(self.f_state)
+        if not isinstance(raw, (str, int)) or raw == "":
+            raise ValueError(f"队列缺少有效的 {self.f_state}")
+        pending = data.get(self.f_pending) if self.f_pending else None
+        return bool(pending) or raw not in self.idle, raw
 
-    def last_message(self, cid: int) -> dict:
+    def last_message(self, cid: int, timeout: float) -> dict:
         """只取最后一条消息（体积小），用于识别「限流失败」这类停摆而不是交付。"""
-        try:
-            r = self._get(self.ep_messages.format(cid=cid))
-            lst = (r.get("data") or {}).get(self.list_key) or []
-            return lst[0] if lst else {}
-        except Exception as exc:  # noqa: BLE001
-            log(f"last_message {cid} failed: {exc}")
-            return {}
+        data = self._request_data("GET", self.ep_messages.format(cid=cid), timeout)
+        messages = data.get(self.list_key)
+        return messages[0] if isinstance(messages, list) and messages and isinstance(messages[0], dict) else {}
 
 
 # ── 状态机 ──────────────────────────────────────────────────────────
 
-def refresh(state: dict, agent: AgentClient) -> dict:
-    cfg = state.setdefault("config", {})
-    cfg.setdefault("stuck_seconds", DEFAULT_STUCK_SECONDS)
-    cfg.setdefault("window_limit", DEFAULT_WINDOW_LIMIT)
-    tasks = state.setdefault("tasks", {})
+class QueueSample(NamedTuple):
+    at: int
+    busy: bool | None
+    raw: str | int | None = None
+    checked_reply: str | None = None
+    failed: bool | None = None
 
-    convs = agent.conversations()
-    stamp = now_ms()
-    act = load_active()
 
-    for conv in convs[:WATCH_LIMIT]:
+def running(task: dict) -> bool:
+    return not task.get("muted") and bool(task.get("running_since"))
+
+
+def fast_candidates(tasks: dict, stamp: int) -> list[dict]:
+    if not ACTIVE_POLL_SECONDS or not ACTIVE_WATCH_LIMIT:
+        return []
+    retry_ms = max(ACTIVE_POLL_SECONDS, min(POLL_SECONDS, 60)) * 1000
+    eligible = [task for task in tasks.values() if running(task)
+                and (not task.get("queue_error") or stamp - (task.get("queue_checked_at") or 0) >= retry_ms)]
+    # 最久没检查的先查，避免同一批任务一直占满快速复查的名额。
+    eligible.sort(key=lambda task: task.get("queue_checked_at") or 0)
+    return [{"id": task["id"], "updateTime": task.get("update_ms") or 0}
+            for task in eligible[:ACTIVE_WATCH_LIMIT]]
+
+
+def pending_reply(task: dict, update: int, stamp: int) -> str | None:
+    started = task.get("running_since") or 0
+    is_newer = update > (task.get("acked_update") or 0)
+    if started:
+        return f"run:{started}" if is_newer or stamp - started >= 20_000 else None
+
+    previous = task.get("reply_version")
+    if task.get("reply_completed_at") and update <= task["reply_completed_at"]:
+        # 快速复查先看到忙转闲，会话列表随后补到同一轮的时间戳。
+        return previous if task.get("reply_pending") else None
+    if is_newer:
+        return f"update:{update}"
+    if task.get("reply_pending"):
+        return previous
+    if "reply_pending" not in task and task.get("status") == "attention":
+        return f"update:{update}"  # 老状态文件没有独立的未读标记
+    return None
+
+
+def mark_seen(task: dict) -> None:
+    task["acked_update"] = task.get("update_ms") or 0
+    task["acked_at"] = now_ms()
+    task["reply_pending"] = False
+    if task.get("status") in ("attention", "stuck") or task.get("status") is None:
+        task["prev"] = task.get("status") or "running"
+        task["status"] = "seen"
+
+
+def request_timeout(deadline: float) -> float:
+    # requests 的超时按连接和读取分别计算；到预算边界时停止发起新请求。
+    return min(4.0, (deadline - time.monotonic()) / 2)
+
+
+def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
+                  deadline: float) -> dict[str, QueueSample]:
+    samples = {}
+    for conv in convs:
         cid = str(conv["id"])
-        is_new = cid not in tasks
-        task = tasks.get(cid) or {"acked_update": 0, "notified_update": 0,
-                                  "stuck_notified": 0, "deadline_notified": 0,
-                                  "deadline": None, "running_since": 0, "muted": False}
-        task.update({
-            "id": conv["id"],
-            "name": conv.get("name") or f"会话 {conv['id']}",
-            "agent_id": conv.get("agentId") or (AGENT_IDS[0] if AGENT_IDS else ""),
-            "update_ms": conv.get("updateTime") or 0,
-        })
-        if is_new:
-            # 首次见到该会话视为「已查看」，避免历史任务一次性刷满小窗；
-            # 标签页还开着就继续以暗色留在列表里
-            task["acked_update"] = conv.get("updateTime") or 0
-            task["prev"] = "running"
-            task["status"] = "seen"
-        elif task.get("archived") and (conv.get("updateTime") or 0) > (task.get("acked_update") or 0):
-            # 归档之后会话又有了新动作：解除归档，回到「已查看」暗色行
-            task["archived"] = False
-            task["muted"] = False
-            task["auto_archived"] = 0
-            task["prev"] = "running"
-            task["status"] = "seen"
-            log("unarchive id=%s %s" % (cid, task.get("name")))
-        task["url"] = conv_url(task["agent_id"], cid)
-
-        if task.get("status") == "seen" and task.get("prev") not in ("running", "attention", "stuck"):
-            task["prev"] = "running"   # 兼容旧数据/无效值：默认归入「进行中」
-
-        if task.get("muted"):
-            # 已手动确认完成：不再拉队列、不再改状态，等用户取消勾选
-            task["status"] = "done"
-            task["seen_ms"] = stamp
-            tasks[cid] = task
+        task = tasks.get(cid, {})
+        update = conv["updateTime"]
+        if task.get("muted") and not (task.get("archived") and update > (task.get("acked_update") or 0)):
             continue
+        timeout = request_timeout(deadline)
+        if timeout < 0.25:
+            break
+        try:
+            busy, raw = agent.queue(conv["id"], timeout)
+            samples[cid] = QueueSample(now_ms(), busy, raw)
+        except Exception as exc:
+            if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                if exc.response.status_code in (401, 403, 429):
+                    raise  # 认证或限流故障暂停整轮，避免继续发请求
+            log(f"queue {cid} failed: {exc}")
+            samples[cid] = QueueSample(now_ms(), None)
 
-        q = agent.queue(conv["id"])
-        raw = q.get(agent.f_state)
-        task["raw_state"] = raw
-        pending = q.get(agent.f_pending) if agent.f_pending else None
-        busy = bool(pending) or (raw not in ((None,) + agent.idle))
+    if not FAIL_MARKS:
+        return samples
+    for conv in convs:
+        cid = str(conv["id"])
+        sample = samples.get(cid)
+        task = tasks.get(cid)
+        if not sample or sample.busy is not False or not task:
+            continue
+        reply = pending_reply(task, conv["updateTime"], sample.at)
+        if not reply or task.get("classified_reply") == reply:
+            continue
+        if task.get("message_reply") == reply and task.get("message_attempts", 0) >= 2:
+            continue
+        timeout = request_timeout(deadline)
+        if timeout < 0.25:
+            break
+        failed = None
+        try:
+            message = agent.last_message(conv["id"], timeout)
+            content = message.get("content")
+            if message.get("sender") == "assistant" and isinstance(content, str) and content:
+                failed = any(mark in content for mark in FAIL_MARKS)
+        except Exception as exc:
+            if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                if exc.response.status_code == 429:
+                    raise
+            log(f"last_message {cid} failed: {exc}")
+        samples[cid] = sample._replace(checked_reply=reply, failed=failed)
+    return samples
 
-        if busy:
-            task["failed"] = False   # 又跑起来了（多半是在重试），先撤销失败标记
-            if not task.get("running_since"):
-                task["running_since"] = stamp
-            elapsed = (stamp - task["running_since"]) // 1000
-            task["status"] = "stuck" if elapsed >= cfg["stuck_seconds"] else "running"
-            if task["status"] == "stuck" and task["stuck_notified"] != task["running_since"]:
-                task["stuck_notified"] = task["running_since"]
-                notify("任务疑似卡住",
-                       f"{task['name']} 已运行 {elapsed // 60} 分钟，去看看")
-        else:
-            was_active = task.get("running_since") or 0
-            task["running_since"] = 0
-            task.pop("stuck_notified", None)
-            task["stuck_notified"] = 0
-            fresh = task["update_ms"] > (task.get("acked_update") or 0)
-            lasted = (stamp - was_active) // 1000 if was_active else 0
-            if not fresh and lasted >= 20:
-                fresh = True   # 跑过一阵子才停，即便 updateTime 没变也算有新回复
-            if fresh:
-                upd = task["update_ms"]
-                # 每个新回复只验一次：拉最后一条消息，看是不是「限流失败」而不是交付
-                if task.get("checked_update") != upd:
-                    m = agent.last_message(conv["id"])
-                    txt = (m.get("content") or "") if m.get("sender") == "assistant" else ""
-                    if txt:
-                        task["checked_update"] = upd
-                        if any(k in txt for k in FAIL_MARKS):
-                            task["failed_update"] = upd
-                            log("rate limited id=%s %s" % (cid, task.get("name")))
-                if task.get("failed_update") == upd:
-                    # agent 已停下但这一轮是被限流打断的 → 按「卡住」标红，提醒重试
-                    task["status"] = "stuck"
-                    task["failed"] = True
-                else:
-                    task["status"] = "attention"
-                    task["failed"] = False
-                if was_active and task.get("notified_update") != task["update_ms"]:
-                    task["notified_update"] = task["update_ms"]
-                    # 弹窗改由浮窗自己弹（可点击跳转），这里不再发系统通知
-            else:
-                cur = task.get("status")
-                if cur in ("running", "attention", "stuck"):
-                    task["prev"] = cur
-                elif task.get("prev") not in ("running", "attention", "stuck"):
-                    task["prev"] = "running"
-                task["status"] = "seen"
-                task["failed"] = False
 
-        # 用户此刻正停在这个标签页上看（窗口聚焦）→ 回复直接算已读，不计数、不弹提示
-        if task["status"] == "attention" and watching(cid, act):
-            task["prev"] = "attention"
-            task["status"] = "seen"
-            task["acked_update"] = task.get("update_ms") or 0
-            log("auto seen id=%s (正在看的标签页)" % cid)
+def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
+                       notifications: list[tuple[str, str]]) -> None:
+    task["queue_checked_at"] = sample.at
+    task["queue_error"] = sample.busy is None
+    if sample.busy is None:
+        return
+    task["queue_observed_at"] = sample.at
+    task["raw_state"] = sample.raw
 
-        deadline = task.get("deadline")
-        if deadline and task["status"] != "done" and stamp > deadline:
-            if stamp - (task.get("deadline_notified") or 0) > DEADLINE_REMIND_SECONDS * 1000:
+    started = task.get("running_since") or 0
+    if sample.busy:
+        if not started:
+            started = sample.at
+            task["running_since"] = started
+        task["failed"] = False
+        task["reply_pending"] = False
+        elapsed = (sample.at - started) // 1000
+        task["status"] = "stuck" if elapsed >= DEFAULT_STUCK_SECONDS else "running"
+        if task["status"] == "stuck" and task.get("stuck_notified") != started:
+            task["stuck_notified"] = started
+            notifications.append(("任务疑似卡住", f"{task['name']} 已运行 {elapsed // 60} 分钟，去看看"))
+        return
+
+    update = task["update_ms"]
+    reply = pending_reply(task, update, sample.at)
+    task["running_since"] = 0
+    task["stuck_notified"] = 0
+
+    if not reply:
+        if update <= (task.get("reply_completed_at") or 0):
+            task["acked_update"] = max(update, task.get("acked_update") or 0)
+        if task.get("status") in ("running", "attention", "stuck"):
+            task["prev"] = task["status"]
+        task["status"] = "seen"
+        task["failed"] = False
+        task["reply_pending"] = False
+        return
+
+    if started:
+        task["reply_completed_at"] = sample.at
+    if reply != task.get("reply_version"):
+        task["failed"] = False
+    task["reply_version"] = reply
+    task["reply_pending"] = True
+    if sample.checked_reply == reply:
+        attempts = task.get("message_attempts", 0) if task.get("message_reply") == reply else 0
+        task["message_reply"] = reply
+        task["message_attempts"] = attempts + 1
+        if sample.failed is not None:
+            task["classified_reply"] = reply
+            task["failed"] = sample.failed
+    task["status"] = "stuck" if task.get("failed") else "attention"
+
+    if task["status"] == "attention" and watching(str(task["id"]), act):
+        mark_seen(task)
+
+
+def poll_tick(agent: AgentClient, *, full: bool) -> dict:
+    deadline = time.monotonic() + ROUND_BUDGET_SECONDS
+    base = load_state()
+    tasks = base.get("tasks") or {}
+    stamp = now_ms()
+    if full:
+        conversations = agent.conversations(request_timeout(deadline))[:WATCH_LIMIT]
+        # 慢请求耗尽预算时，下轮先补最久未检查的会话。
+        conversations.sort(key=lambda conv: tasks.get(str(conv["id"]), {}).get("queue_checked_at") or 0)
+    else:
+        conversations = fast_candidates(tasks, stamp)
+    samples = sample_queues(agent, conversations, tasks, deadline)
+    if not full and not samples:
+        return base
+
+    notifications: list[tuple[str, str]] = []
+    with _lock:
+        state = load_state()
+        tasks = state.setdefault("tasks", {})
+        act = load_active()
+        stamp = now_ms()
+        for conv in conversations:
+            cid = str(conv["id"])
+            update = conv["updateTime"]
+            task = tasks.get(cid)
+            if full:
+                if task is None:
+                    task = tasks[cid] = {"status": "seen", "prev": "running", "acked_update": update}
+                task.setdefault("queue_observed_at", task.get("seen_ms") or 0)
+                task.update(id=conv["id"], name=conv.get("name") or f"会话 {cid}",
+                            agent_id=conv.get("agentId") or (AGENT_IDS[0] if AGENT_IDS else ""),
+                            update_ms=update, seen_ms=stamp)
+                task["url"] = conv_url(task["agent_id"], cid)
+                if task.get("archived") and update > (task.get("acked_update") or 0):
+                    task.update(archived=False, muted=False, auto_archived=0, prev="running", status="seen")
+            if not task:
+                continue
+            if task.get("muted"):
+                task["status"] = "done"
+                continue
+            sample = samples.get(cid)
+            if sample is not None and (full or running(task)):
+                apply_queue_sample(task, sample, act, notifications)
+
+        for task in tasks.values():
+            deadline_ms = task.get("deadline")
+            if task.get("muted") or not deadline_ms or stamp < deadline_ms:
+                continue
+            if stamp - (task.get("deadline_notified") or 0) >= DEADLINE_REMIND_SECONDS * 1000:
                 task["deadline_notified"] = stamp
-                notify("任务已超时", f"{task['name']} 超过你设定的时间")
-            task["overdue"] = True
-        else:
-            task["overdue"] = False
+                notifications.append(("任务已超时", f"{task['name']} 超过你设定的时间"))
 
-        task["seen_ms"] = stamp
-        tasks[cid] = task
+        if full:
+            for cid, task in list(tasks.items()):
+                last = max(task.get("update_ms") or 0, task.get("acked_update") or 0)
+                if (task.get("status") == "seen" and not task.get("muted") and not task.get("queue_error")
+                        and last and stamp - last > AUTO_ARCHIVE_HOURS * 3600_000):
+                    task.update(muted=True, archived=True, status="done", auto_archived=stamp)
+                if task.get("status") in ("done", "seen") and stamp - (task.get("seen_ms") or 0) > 7 * 86400_000:
+                    del tasks[cid]
+            state.pop("poller_error", None)
+            state.pop("poller_error_at", None)
+        if full or any(sample.busy is not None for sample in samples.values()):
+            state["updated"] = stamp
+        save_state(state)
 
-    # 「已查看」超过 AUTO_ARCHIVE_HOURS 没有任何新进展 → 自动归档（等同勾选），移出列表
-    for cid in list(tasks):
-        t = tasks[cid]
-        if t.get("status") != "seen" or t.get("muted") or t.get("archived"):
-            continue
-        last = max(t.get("update_ms") or 0, t.get("acked_update") or 0)
-        if last and stamp - last > AUTO_ARCHIVE_HOURS * 3600_000:
-            t["muted"] = True
-            t["archived"] = True
-            t["status"] = "done"
-            t["auto_archived"] = stamp
-            log("auto archive id=%s idle=%dh %s"
-                % (cid, int((stamp - last) / 3600_000), t.get("name")))
-
-    # 清理长时间不动的已完成任务，避免文件膨胀
-    for cid in list(tasks):
-        t = tasks[cid]
-        if t.get("status") in ("done", "seen") and stamp - (t.get("seen_ms") or 0) > 7 * 86400_000:
-            del tasks[cid]
-
-    state["updated"] = stamp
-    try:
-        snapshot_edge_tabs()
-    except Exception:
-        pass
+    for title, body in notifications:
+        notify(title, body)
+    if full and sys.platform == "darwin":
+        snapshot_edge_tabs(timeout=2)
     return state
 
 
 # ── 视图 ────────────────────────────────────────────────────────────
 
 def view(state: dict) -> dict:
-    cfg = state.get("config") or {}
-    limit = cfg.get("window_limit") or DEFAULT_WINDOW_LIMIT
-    stuck = cfg.get("stuck_seconds") or DEFAULT_STUCK_SECONDS
+    limit = DEFAULT_WINDOW_LIMIT
+    stuck = DEFAULT_STUCK_SECONDS
     stamp = now_ms()
+    stale_after_seconds = max(POLL_SECONDS * 2, 45)
 
     rows = []
     for task in (state.get("tasks") or {}).values():
@@ -522,9 +631,12 @@ def view(state: dict) -> dict:
             continue
         if (not task.get("muted")) and task.get("status") == "done" and stamp - (task.get("seen_ms") or 0) > 6 * 3600_000:
             continue
-        elapsed = 0
-        if task.get("running_since"):
-            elapsed = (stamp - task["running_since"]) // 1000
+        observed = task.get("queue_observed_at", task.get("seen_ms")) or 0
+        stale = task.get("status") != "done" and (
+            bool(task.get("queue_error")) or not observed
+            or (running(task) and stamp - observed > stale_after_seconds * 1000))
+        started = task.get("running_since") or 0
+        elapsed = max(0, ((observed if stale else stamp) - started) // 1000) if started else 0
         progress = 1.0 if task.get("status") in ("attention", "done") else min(elapsed / stuck, 1.0)
         rows.append({
             "id": task["id"],
@@ -532,6 +644,8 @@ def view(state: dict) -> dict:
             "group": _tab_groups.get(str(task["id"]), ""),
             "status": task.get("status"),
             "prev": task.get("prev"),
+            "reply_version": task.get("reply_version"),
+            "stale": stale,
             "progress": round(progress, 3),
             "elapsed": elapsed,
             "updated_ms": task.get("update_ms"),
@@ -540,7 +654,7 @@ def view(state: dict) -> dict:
             "deadline": task.get("deadline"),
             "deadline_left": (int((task["deadline"] - stamp) / 1000)
                               if task.get("deadline") else None),
-            "overdue": bool(task.get("overdue")),
+            "overdue": bool(task.get("deadline") and stamp >= task["deadline"]),
             "failed": bool(task.get("failed")),
             "muted": bool(task.get("muted")),
             "acked_at": task.get("acked_at"),
@@ -566,16 +680,17 @@ def view(state: dict) -> dict:
         "updated": state.get("updated"),
         "poller_error": state.get("poller_error"),
         "poller_error_at": state.get("poller_error_at"),
+        "stale_after_seconds": stale_after_seconds,
+        "stale_count": sum(1 for r in rows if r["stale"]),
         "stuck_seconds": stuck,
         "window_limit": limit,
         "tasks": active[:limit],
         "active": active,
         "all": rows,
-        # 「进行中」= 此刻真的在干活的 agent（busy 分支每轮重算，与是否已读无关）
         "counts": {
-            "running": sum(1 for r in active if r["status"] == "running"),
-            **{s: sum(1 for r in rows if r["status"] == s)
-               for s in ("stuck", "attention", "done", "seen")},
+            **{s: sum(1 for r in rows if r["status"] == s and not r["stale"])
+               for s in ("running", "stuck")},
+            **{s: sum(1 for r in rows if r["status"] == s) for s in ("attention", "done", "seen")},
         },
     }
 
@@ -669,11 +784,11 @@ end tell
 """
 
 
-def snapshot_edge_tabs() -> dict:
+def snapshot_edge_tabs(timeout: float = 10) -> dict:
     """一次取回所有标签的 (窗口序号, 标签序号)，供点击时 O(1) 定位。"""
     try:
         out = subprocess.run(["osascript", "-e", EDGE_TABS_SCRIPT],
-                             capture_output=True, text=True, timeout=10).stdout
+                             capture_output=True, text=True, timeout=timeout, check=True).stdout
     except Exception:
         return {}
     mapping = {}
@@ -773,69 +888,211 @@ def open_conversation(cid: str) -> str:
 
 # ── HTTP ────────────────────────────────────────────────────────────
 
-DASHBOARD = """<!doctype html><html lang="zh"><meta charset="utf-8">
+DASHBOARD = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TaskPulse · 会话看板</title>
 <style>
- :root{color-scheme:dark}
- body{margin:0;background:#141518;color:#e8e9ec;font:14px/1.5 -apple-system,"PingFang SC",sans-serif}
- .wrap{max-width:860px;margin:0 auto;padding:28px 20px 60px}
- h1{font-size:18px;font-weight:600;margin:0 0 4px}
- .sub{color:#8a8f98;font-size:12px;margin-bottom:20px}
- .row{display:flex;align-items:center;gap:12px;padding:12px 14px;background:#1c1e22;
-      border-radius:10px;margin-bottom:8px;cursor:pointer;border:1px solid #24262b}
- .row:hover{border-color:#3a3e46;background:#202329}
- .dot{width:9px;height:9px;border-radius:50%;flex:0 0 9px}
- .name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
- .meta{color:#8a8f98;font-size:12px;white-space:nowrap}
- .bar{height:4px;background:#2a2d33;border-radius:2px;width:110px;overflow:hidden;flex:0 0 110px}
- .bar>i{display:block;height:100%;border-radius:2px}
- .st-running .dot{background:#4c8dff}.st-running .bar>i{background:#4c8dff}
- .st-attention .dot{background:#ff9f0a}.st-attention .bar>i{background:#ff9f0a}
-.st-seen .dot{background:#4c8dff;opacity:.5}.st-seen .bar>i{background:#4c8dff}
-.st-seen{opacity:.55}
- .st-stuck .dot{background:#ff453a}.st-stuck .bar>i{background:#ff453a}
- .st-done .dot{background:#30d158}.st-done .bar>i{background:#30d158}
- .st-done{opacity:.55}
- .tag{font-size:11px;padding:1px 7px;border-radius:5px;background:#26282e;color:#b6bac2}
- .overdue{color:#ff453a}
+ :root{color-scheme:dark;--bg:#101726;--surface:#182337;--edge:#2c3b54;--ink:#edf3fc;--muted:#a7b8d1;
+       --blue:#74aeff;--amber:#f6bd68;--red:#ff8580;--green:#62d8ad;--slate:#93a9c6}
+ *{box-sizing:border-box}
+ body{margin:0;background:radial-gradient(ellipse at top,#1b2b45 0,var(--bg) 48%);
+      min-height:100vh;color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}
+ button{font:inherit;color:inherit;cursor:pointer}
+ button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+ .wrap{max-width:900px;margin:auto;padding:48px 24px 64px}
+ header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:20px}
+ h1{font-size:26px;font-weight:650;letter-spacing:-.035em;margin:0}
+ time,.meta{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+ .counts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:20px}
+ .count,.row{--accent:var(--slate);border:1px solid var(--edge);border-radius:12px;background:var(--surface)}
+ .running{--accent:var(--blue)}.attention{--accent:var(--amber)}.stuck{--accent:var(--red)}
+ .done{--accent:var(--green)}.unconfirmed{--accent:var(--slate)}
+ .count{padding:10px 14px;border-top:2px solid var(--accent);display:flex;gap:4px;flex-direction:column}
+ .count span{color:var(--muted);font-size:12px}
+ .count output{color:var(--accent);font-size:24px;font-weight:650;line-height:1.15;font-variant-numeric:tabular-nums}
+ .notice{color:var(--amber);margin:0 0 14px}
+ .row{display:flex;align-items:center;gap:8px;margin-bottom:8px;padding-right:10px}
+ .row:hover,.row:focus-within{border-color:#506684;background:#1c2b42}
+ .jump{width:100%;display:grid;grid-template-columns:8px minmax(0,1fr) auto auto 76px;align-items:center;
+       text-align:left;gap:12px;border:0;border-radius:10px;background:none;padding:12px}
+ .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+ .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .seen .name,.done .name,.unconfirmed .name{color:#c4d0e2}
+ .tag{white-space:nowrap;font-size:11px;padding:2px 7px;border:1px solid var(--edge);
+      border-radius:6px;color:var(--accent);background:#111a2a}
+ .overdue{color:var(--red)}
+ .bar{height:4px;background:#30405b;border-radius:3px;overflow:hidden}
+ .bar i{display:block;height:100%;border-radius:3px;background:var(--accent)}
+ .deadline{flex:none;border:1px solid var(--edge);border-radius:7px;background:#101a2b;color:var(--muted);
+           font-size:12px;padding:4px 7px}
+ .deadline:hover{color:var(--ink);border-color:#607797}
+ .empty{color:var(--muted);margin:16px 0}
+ @media(max-width:560px){
+   .wrap{padding:24px 14px 40px}
+   .counts{grid-template-columns:repeat(2,minmax(0,1fr))}
+   .jump{grid-template-columns:7px minmax(0,1fr) auto;gap:7px}
+   .jump .meta,.bar{display:none}
+ }
 </style>
-<div class="wrap">
- <h1>TaskPulse</h1>
- <div class="sub" id="sub">连接中…</div>
+</head>
+<body>
+<main class="wrap">
+ <header><h1>TaskPulse</h1><time id="sample-time"></time></header>
+ <div class="counts">
+  <div class="count running"><span>进行中</span><output id="running">—</output></div>
+  <div class="count attention"><span>待我处理</span><output id="attention">—</output></div>
+  <div class="count stuck"><span>卡住</span><output id="stuck">—</output></div>
+  <div class="count done"><span>已完成</span><output id="done">—</output></div>
+ </div>
+ <p class="notice" id="health" role="status">连接中…</p>
+ <p class="notice" id="action-status" role="status" hidden></p>
  <div id="list"></div>
-</div>
+ <p class="empty" id="empty" hidden>暂无任务</p>
+</main>
 <script>
-const CLR={running:"#4c8dff",attention:"#ff9f0a",stuck:"#ff453a",done:"#30d158"};
-const TXT={running:"进行中",attention:"待我处理",stuck:"卡住",seen:"已查看",done:"已完成"};
-function render(d){
-  document.getElementById("sub").textContent =
-    `进行中 ${d.counts.running} · 待我处理 ${d.counts.attention} · 卡住 ${d.counts.stuck} · 已完成 ${d.counts.done} · 更新于 ` +
-    new Date(d.updated).toLocaleTimeString();
-  const list=document.getElementById("list");
-  list.innerHTML = d.all.map(t=>{
-    const pct=Math.round(t.progress*100);
-    const meta = t.status==="running" ? `${Math.floor(t.elapsed/60)}分${t.elapsed%60}秒`
-               : t.status==="done" ? "已读" : `${t.idle_minutes} 分钟前回复`;
-    return `<div class="row st-${t.status}" onclick="jump(${t.id})">
-      <span class="dot"></span>
-      <span class="name">${t.name}</span>
-      <span class="tag">${TXT[t.status]||""}</span>
-      <span class="meta ${t.overdue?'overdue':''}">${t.overdue?'已超时':meta}</span>
-      <span class="bar"><i style="width:${pct}%"></i></span>
-      <span class="tag" onclick="event.stopPropagation();setDeadline(${t.id})">⏱</span>
-    </div>`;
-  }).join("") || '<div class="sub">暂无任务</div>';
+const labels = {running:"进行中", attention:"待我处理", stuck:"卡住", seen:"已查看", done:"已完成"};
+const counters = ["running", "attention", "stuck", "done"];
+const list = document.getElementById("list");
+const health = document.getElementById("health");
+const rows = new Map();
+let pollTimer, lastData, fetching = false, failures = 0;
+
+function element(tag, cls, value = "") {
+  const node = document.createElement(tag);
+  node.className = cls;
+  node.textContent = value;
+  return node;
 }
-async function jump(id){ await fetch("/open?id="+id,{method:"POST"}); }
-async function setDeadline(id){
-  const m = prompt("几分钟后必须完成？（留空清除）","30");
-  if (m === null) return;
-  const q = m.trim() ? `&minutes=${Number(m)}` : "";
-  await fetch(`/deadline?id=${id}${q}`,{method:"POST"});
+
+function makeRow(id) {
+  const row = element("div", "row");
+  const jump = element("button", "jump");
+  const name = element("span", "name");
+  const tag = element("span", "tag");
+  const meta = element("span", "meta");
+  const bar = element("span", "bar");
+  const progress = document.createElement("i");
+  const deadline = element("button", "deadline", "截止");
+  jump.type = deadline.type = "button";
+  bar.setAttribute("aria-hidden", "true");
+  deadline.title = "设置截止时间";
+  bar.append(progress);
+  jump.append(element("span", "dot"), name, tag, meta, bar);
+  jump.addEventListener("click", () => post("/open", id));
+  deadline.addEventListener("click", () => setDeadline(id));
+  row.append(jump, deadline);
+  return {row, name, tag, meta, progress};
 }
-async function tick(){ try{ render(await (await fetch("/state")).json()); }catch(e){} }
-tick(); setInterval(tick, 3000);
+
+function showHealth(message, old = false) {
+  if (health.textContent !== message) health.textContent = message;
+  health.hidden = !message;
+  if (old) for (const key of counters) document.getElementById(key).textContent = "—";
+}
+
+function render(data, disconnected = false) {
+  const old = !data.updated || (Date.now() - data.updated) / 1000 > (data.stale_after_seconds || 180);
+  const stale = disconnected || data.poller_error || old;
+  const msg = disconnected ? "本机服务连接中断，显示上次快照"
+            : data.poller_error ? "上游取数失败，显示上次快照"
+            : !data.updated ? "等待首次采样…"
+            : old ? "取数暂未更新，显示上次快照"
+            : data.stale_count ? data.stale_count + " 个会话状态待确认" : "";
+  showHealth(msg, stale);
+  health.title = data.poller_error || "";
+  if (!stale) for (const key of counters) document.getElementById(key).textContent = data.counts[key];
+  document.getElementById("sample-time").textContent = data.updated
+    ? "采样于 " + new Date(data.updated).toLocaleTimeString() : "";
+
+  const ids = new Set();
+  let position = list.firstElementChild;
+  for (const task of data.all) {
+    const id = task.id;
+    const nodes = rows.get(id) || makeRow(id);
+    const known = Object.hasOwn(labels, task.status);
+    const status = known ? task.status : "unconfirmed";
+    const unconfirmed = task.stale || (stale && (status === "running" || status === "stuck"));
+    ids.add(id);
+    rows.set(id, nodes);
+    if (nodes.row !== position) list.insertBefore(nodes.row, position);
+    position = nodes.row.nextElementSibling;
+    nodes.row.className = "row " + status + (unconfirmed ? " unconfirmed" : "");
+    nodes.name.textContent = task.name;
+    nodes.name.title = task.name;
+    nodes.tag.textContent = unconfirmed ? "待确认" : labels[status] || "待确认";
+    nodes.meta.className = task.overdue ? "meta overdue" : "meta";
+    nodes.meta.textContent = task.overdue ? "已超时"
+      : status === "running" || (status === "stuck" && !task.failed)
+      ? Math.floor(task.elapsed / 60) + "分" + task.elapsed % 60 + "秒"
+      : task.failed ? "限流"
+      : status === "done" ? "已完成" : task.idle_minutes + " 分钟前";
+    nodes.progress.style.width = Math.round(task.progress * 100) + "%";
+  }
+  for (const [id, nodes] of rows) {
+    if (ids.has(id)) continue;
+    nodes.row.remove();
+    rows.delete(id);
+  }
+  document.getElementById("empty").hidden = data.all.length > 0 || Boolean(stale);
+}
+
+async function post(path, id, minutes) {
+  const notice = document.getElementById("action-status");
+  notice.hidden = true;
+  const params = new URLSearchParams({id});
+  if (minutes !== undefined && minutes !== "") params.set("minutes", minutes);
+  try {
+    const response = await fetch(path + "?" + params, {method:"POST"});
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error();
+    schedule(0);
+  } catch {
+    notice.textContent = "操作失败，请重试";
+    notice.hidden = false;
+  }
+}
+
+function setDeadline(id) {
+  const answer = prompt("几分钟后必须完成？（留空清除）", "30");
+  if (answer !== null) void post("/deadline", id, answer.trim());
+}
+
+function schedule(delay) {
+  clearTimeout(pollTimer);
+  if (!document.hidden) pollTimer = setTimeout(tick, delay);
+}
+
+async function tick() {
+  if (document.hidden || fetching) return;
+  fetching = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+  try {
+    const response = await fetch("/state", {signal:controller.signal});
+    if (!response.ok) throw new Error();
+    const data = await response.json();
+    render(data);
+    lastData = data;
+    failures = 0;
+  } catch {
+    failures = Math.min(failures + 1, 3);
+    if (lastData) render(lastData, true);
+    else showHealth("本机服务连接中断", true);
+    health.title = "";
+  } finally {
+    clearTimeout(timeout);
+    fetching = false;
+    schedule(3000 * 2 ** failures);
+  }
+}
+document.addEventListener("visibilitychange", () => schedule(0));
+schedule(0);
 </script>
+</body>
+</html>
 """
 
 
@@ -867,8 +1124,7 @@ class Handler(BaseHTTPRequestHandler):
         global _ext_seen
         path = urlparse(self.path).path
         if path == "/state":
-            with _lock:
-                self._json(view(load_state()))
+            self._json(view(load_state()))
         elif path == "/diag":
             self._json({"ext_seen_age": round(time.time() - _ext_seen, 1),
                         "cmd_queue": _cmd_q.qsize(),
@@ -945,135 +1201,113 @@ class Handler(BaseHTTPRequestHandler):
                 with _lock:
                     state = load_state()
                     task = (state.get("tasks") or {}).get(cid)
-                    if task:
-                        task["acked_update"] = task.get("update_ms") or 0
-                        if task.get("status") != "running":
-                            task["prev"] = task.get("status") or "running"
-                            task["status"] = "seen"
+                    if task and not task.get("muted"):
+                        mark_seen(task)
                         save_state(state)
             self._json({"ok": True, "result": result})
             return
 
+        if parsed.path == "/active":
+            # 切入、切出都视为读过；读请求体时不占状态锁。
+            try:
+                ln = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(ln)) if ln > 0 else {}
+                match = re.search(r"[?&]conversationId=(\d+)", payload.get("url") or "")
+            except (AttributeError, TypeError, ValueError):
+                match = None
+            cid = match.group(1) if match else ""
+
+        deadline = None
+        if parsed.path == "/deadline" and query.get("minutes"):
+            try:
+                deadline = now_ms() + int(float(query["minutes"][0]) * 60_000)
+            except (ValueError, OverflowError):
+                self._json({"ok": False, "error": "无效的截止时间"}, 400)
+                return
+
+        if parsed.path not in ("/ack", "/unack", "/active", "/deadline"):
+            self._json({"error": "not found"}, 404)
+            return
+
         with _lock:
             state = load_state()
-            tasks = state.setdefault("tasks", {})
-            task = tasks.get(cid)
-            if parsed.path == "/ack":
-                if task:
-                    task["acked_update"] = task.get("update_ms") or 0
-                    task["status"] = "done"
-                    task["muted"] = True
+            task = (state.get("tasks") or {}).get(cid)
+            changed = bool(task)
+            if task:
+                if parsed.path == "/ack":
+                    mark_seen(task)
+                    task.update(status="done", muted=True, running_since=0)
+                elif parsed.path == "/unack":
+                    if task.get("muted"):
+                        task.update(muted=False, archived=False, status="seen",
+                                    seen_ms=now_ms(), running_since=0, queue_error=True)
+                elif parsed.path == "/active":
+                    changed = not task.get("muted") and task.get("status") in ("attention", "stuck")
+                    if changed:
+                        mark_seen(task)
+                else:
+                    task.update(deadline=deadline, deadline_notified=0)
+                if changed:
                     save_state(state)
-                self._json({"ok": bool(task)})
-            elif parsed.path == "/unack":
-                if task:
-                    task["muted"] = False
-                    task["seen_ms"] = now_ms()
-                    save_state(state)
-                self._json({"ok": bool(task)})
-            elif parsed.path == "/active":
-                # 用户切到某个已开的标签页：视为已读，但继续监控（不等同于勾选完成）
-                try:
-                    ln = int(self.headers.get("Content-Length") or 0)
-                except ValueError:
-                    ln = 0
-                raw = self.rfile.read(ln) if ln > 0 else b"{}"
-                url = ""
-                try:
-                    url = (json.loads(raw or b"{}").get("url") or "")
-                except Exception:
-                    pass
-                m = re.search(r"[?&]conversationId=(\d+)", url)
-                hit = False
-                if m:
-                    task = tasks.get(m.group(1))
-                    if task and not task.get("muted") and task.get("status") in ("attention", "stuck"):
-                        task["acked_update"] = task.get("update_ms") or 0
-                        task["prev"] = task.get("status")
-                        task["status"] = "seen"
-                        task["acked_at"] = now_ms()
-                        save_state(state)
-                        hit = True
-                self._json({"ok": hit})
-            elif parsed.path == "/deadline":
-                if task:
-                    minutes = (query.get("minutes") or [""])[0]
-                    if minutes:
-                        task["deadline"] = now_ms() + int(float(minutes) * 60000)
-                        task["deadline_notified"] = 0
-                    else:
-                        task["deadline"] = None
-                    save_state(state)
-                self._json({"ok": bool(task)})
-            else:
-                self._json({"error": "not found"}, 404)
+        self._json({"ok": changed})
 
 
 # ── 主循环 ──────────────────────────────────────────────────────────
 
 def poll_loop() -> None:
-    """取数线程外壳：任何中断（含 SSO 库的 sys.exit）都不能让取数悄悄停掉。"""
-    global _fail_count
-    while True:
-        try:
-            _poll_forever()
-            return
-        except BaseException as exc:  # noqa: BLE001
-            _fail_count += 1
-            name, msg = type(exc).__name__, str(exc)
-            auth = name == "SystemExit" or "token" in msg.lower() or "auth" in msg.lower()
-            backoff = min(60 * (2 ** (_fail_count - 1)), 1800) if auth else 60
-            hint = ""
-            if auth:
-                hint = ("（认证失败：先按日志提示完成一次授权；若授权页没有反应，"
-                        "检查 auth.env 与 auth.provider 配置）")
-            log("取数线程中断: %s: %s；%d 秒后重启%s" % (name, msg, backoff, hint))
-            _mark_error("%s: %s" % (name, msg))
-            time.sleep(backoff)
+    lock = take_lock()
+    while lock is None:
+        log("取数锁被占用，5 秒后重试")
+        time.sleep(5)
+        lock = take_lock()
+    with lock:
+        _poll_forever()
 
 
 def _mark_error(msg: str) -> None:
     """把取数故障写进 state，UI/诊断能看到「数字不再更新」的原因。"""
     try:
-        state = load_state()
-        state["poller_error"] = msg
-        state["poller_error_at"] = now_ms()
-        save_state(state)
-    except Exception:
-        pass
+        with _lock:
+            state = load_state()
+            state["poller_error"] = msg
+            state["poller_error_at"] = now_ms()
+            save_state(state)
+    except OSError as exc:
+        log(f"记录取数故障失败：{exc}")
 
 
 def _poll_forever() -> None:
-    global _fail_count
     agent = None
-    lock = None
-    while lock is None:                 # 与上一个进程交接时可能短暂被占，别就此放弃
-        lock = take_lock()
-        if lock is None:
-            log("取数锁被占用，5 秒后重试")
-            time.sleep(5)
-    log("取数循环已启动，间隔 %ss" % POLL_SECONDS)
+    failures = 0
+    next_full = next_fast = time.monotonic()
+    log(f"取数循环已启动：每 {POLL_SECONDS} 秒全量检查，"
+        f"运行中每 {ACTIVE_POLL_SECONDS} 秒最多复查 {ACTIVE_WATCH_LIMIT} 个")
     while True:
-        t0 = time.time()
+        started = time.monotonic()
+        full = started >= next_full
         try:
             if agent is None:
                 agent = AgentClient()
-            base = load_state()
-            state = refresh(base, agent)
-            # 取数期间用户可能勾选/设了 deadline（HTTP 线程写盘）→ 以磁盘为准重算一次
-            disk = load_state()
-            if (disk.get("updated") or 0) > (base.get("updated") or 0):
-                state = refresh(disk, agent)
-            state.pop("poller_error", None)
-            state.pop("poller_error_at", None)
-            save_state(state)
-            _fail_count = 0
+            state = poll_tick(agent, full=full)
+            failures = 0
+            if full:
+                next_full = started + POLL_SECONDS
+            next_fast = float("inf")
+            if ACTIVE_POLL_SECONDS and ACTIVE_WATCH_LIMIT and any(
+                    running(task) for task in (state.get("tasks") or {}).values()):
+                next_fast = started + ACTIVE_POLL_SECONDS
             if TP_DEBUG:
-                log("poll tick ok %.1fs" % (time.time() - t0))
-        except Exception as exc:  # noqa: BLE001
-            log(f"poll failed: {exc}")
-            agent = None        # 认证/网络异常时下一轮重建会话
-        time.sleep(max(1.0, POLL_SECONDS - (time.time() - t0)))
+                log("poll %s ok %.1fs" % ("full" if full else "active", time.monotonic() - started))
+        except (Exception, SystemExit) as exc:
+            failures += 1
+            message = f"{type(exc).__name__}: {exc}"
+            backoff = max(POLL_SECONDS, min(60 * 2 ** min(failures - 1, 5), 1800))
+            log(f"取数失败：{message}，{backoff} 秒后重试")
+            _mark_error(message)
+            agent = None
+            next_full = time.monotonic() + backoff
+            next_fast = float("inf")
+        time.sleep(max(0.05, min(next_full, next_fast) - time.monotonic()))
 
 
 DEMO_TASKS = [
@@ -1117,6 +1351,7 @@ def take_lock():
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fh
     except OSError:
+        fh.close()
         return None
 
 
@@ -1164,15 +1399,14 @@ def main() -> int:
         lock = take_lock()
         if lock is None:
             return 0
-        agent = AgentClient()
-        state = refresh(load_state(), agent)
-        save_state(state)
+        with lock:
+            state = poll_tick(AgentClient(), full=True)
         print(json.dumps(view(state), ensure_ascii=False, indent=1))
         return 0
 
     # 取数循环常驻本进程：省掉每次都启动解释器的开销，也复用已建立的会话（少换 token）
-    threading.Thread(target=poll_loop, name="poller", daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    threading.Thread(target=poll_loop, name="poller", daemon=True).start()
     log(f"TaskPulse serving on http://127.0.0.1:{PORT}")
     server.serve_forever()
     return 0

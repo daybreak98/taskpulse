@@ -37,7 +37,7 @@ let COMPACT_W: CGFloat = 44
 let EDGE_SNAP: CGFloat = 26
 let ANIM = 0.06
 
-struct TaskItem: Decodable {
+struct TaskItem: Decodable, Equatable {
     let id: Int
     let name: String
     let group: String?
@@ -51,8 +51,10 @@ struct TaskItem: Decodable {
     /// agent 停下但这一轮是被限流打断的（不是交付），按卡住标红
     let failed: Bool?
     let muted: Bool?
+    let stale: Bool?
+    let reply_version: String?
 }
-struct Counts: Decodable {
+struct Counts: Decodable, Equatable {
     let running: Int
     let stuck: Int
     let attention: Int
@@ -62,35 +64,30 @@ struct Payload: Decodable {
     let updated: Int?
     let window_limit: Int?
     let poller_error: String?
+    let stale_after_seconds: Double?
+    let stale_count: Int?
     let tasks: [TaskItem]
     let active: [TaskItem]
     let all: [TaskItem]
     let counts: Counts
 }
 
-/// 取数停摆多久算「数据不可信」。正常间隔 60s，连续两次没成功就该提示，
-/// 留到 180s 是为了不因单次网络抖动误报。
-let STALE_SECONDS: Double = 180
-
-/// 快照多久没更新了；没有 updated 字段时当作「未知」，返回 nil
-func staleness(_ p: Payload?) -> Double? {
-    guard let ms = p?.updated, ms > 0 else { return nil }
-    return Date().timeIntervalSince1970 - Double(ms) / 1000
+func rgb(_ value: UInt32, alpha: CGFloat = 1) -> NSColor {
+    NSColor(srgbRed: CGFloat((value >> 16) & 0xff) / 255,
+            green: CGFloat((value >> 8) & 0xff) / 255,
+            blue: CGFloat(value & 0xff) / 255, alpha: alpha)
 }
-
-func isStale(_ p: Payload?) -> Bool {
-    guard let s = staleness(p) else { return false }
-    return s > STALE_SECONDS
-}
-
 
 let palette: [String: NSColor] = [
-    "running": NSColor(srgbRed: 0.31, green: 0.58, blue: 1.0, alpha: 1),
-    "attention": NSColor(srgbRed: 1.0, green: 0.65, blue: 0.1, alpha: 1),
-    "stuck": NSColor(srgbRed: 1.0, green: 0.29, blue: 0.24, alpha: 1),
-    "seen": NSColor(srgbRed: 0.31, green: 0.58, blue: 1.0, alpha: 1),
-    "done": NSColor(srgbRed: 0.25, green: 0.78, blue: 0.42, alpha: 1),
+    "running": rgb(0x74AEFF),
+    "attention": rgb(0xF6BD68),
+    "stuck": rgb(0xFF8580),
+    "seen": rgb(0x93A9C6),
+    "done": rgb(0x62D8AD),
 ]
+let panelTint = rgb(0x101726, alpha: 0.84)
+let mainText = rgb(0xEDF3FC)
+let secondaryText = rgb(0xA7B8D1)
 // 越靠前越严重
 let severity: [String: Int] = ["stuck": 3, "attention": 2, "running": 1, "seen": 0, "done": 0]
 
@@ -130,8 +127,9 @@ func makeGroups(_ items: [TaskItem]) -> [GroupVM] {
     }
     var out: [GroupVM] = []
     for (name, tasks) in buckets {
-        let worst = tasks.max { (severity[$0.status] ?? 0) < (severity[$1.status] ?? 0) }?.status ?? "done"
-        let open = tasks.filter { $0.status != "done" && $0.status != "seen" }.count
+        let confirmed = tasks.filter { $0.stale != true || $0.status == "attention" }
+        let worst = confirmed.max { (severity[$0.status] ?? 0) < (severity[$1.status] ?? 0) }?.status ?? "seen"
+        let open = confirmed.filter { (severity[$0.status] ?? 0) > 0 }.count
         let prog = tasks.isEmpty ? 0 : tasks.reduce(0.0) { $0 + $1.progress } / Double(tasks.count)
         out.append(GroupVM(name: name, tasks: tasks, worst: worst, open: open, progress: prog))
     }
@@ -146,37 +144,40 @@ func makeGroups(_ items: [TaskItem]) -> [GroupVM] {
 
 final class BadgeView: NSView {
     var kind = "running"
-    var value = 0 { didSet { needsDisplay = true } }
+    var value: Int? = 0 { didSet { needsDisplay = true } }
     /// 当前正在按这个状态筛选
     var active = false { didSet { needsDisplay = true } }
     var onClick: (() -> Void)?
 
     override var isFlipped: Bool { true }
 
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        onClick == nil ? nil : super.hitTest(point)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
-        let hasData = value > 0
+        let hasData = (value ?? 0) > 0
         let color = palette[kind] ?? .gray
         let r = NSRect(x: 0.75, y: 0.75, width: bounds.width - 1.5, height: bounds.height - 1.5)
         let path = NSBezierPath(roundedRect: r, xRadius: 5, yRadius: 5)
 
-        if active {
-            color.withAlphaComponent(0.20).setFill(); path.fill()
-            color.setStroke(); path.lineWidth = 1.4; path.stroke()
-        } else if hasData {
-            color.withAlphaComponent(0.92).setFill(); path.fill()
-        } else {
-            NSColor.white.withAlphaComponent(0.06).setFill(); path.fill()
+        let emphasized = active && value != nil
+        let tinted = emphasized || hasData
+        let fill = tinted ? color.withAlphaComponent(emphasized ? 0.23 : 0.15)
+                          : secondaryText.withAlphaComponent(0.09)
+        fill.setFill()
+        path.fill()
+        if tinted {
+            color.withAlphaComponent(emphasized ? 0.95 : 0.45).setStroke()
+            path.lineWidth = emphasized ? 1.2 : 0.65
+            path.stroke()
         }
 
-        let textColor: NSColor = active
-            ? .white
-            : (hasData ? NSColor(srgbRed: 0.06, green: 0.07, blue: 0.09, alpha: 1)
-                       : NSColor.white.withAlphaComponent(0.34))
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .bold),
-            .foregroundColor: textColor,
+            .foregroundColor: tinted ? color : secondaryText.withAlphaComponent(0.75),
         ]
-        let s = "\(value)" as NSString
+        let s = (value.map { String($0) } ?? "–") as NSString
         let size = s.size(withAttributes: attrs)
         s.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2),
                withAttributes: attrs)
@@ -201,8 +202,8 @@ final class PinView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let c = pinned
-            ? NSColor(srgbRed: 1.0, green: 0.65, blue: 0.1, alpha: 1)
-            : NSColor.white.withAlphaComponent(0.34)
+            ? palette["attention"]!
+            : secondaryText.withAlphaComponent(0.75)
         let cx = bounds.midX, cy = bounds.midY
 
         let head = NSBezierPath(ovalIn: NSRect(x: cx - 3.2, y: cy - 5, width: 6.4, height: 6.4))
@@ -316,14 +317,16 @@ final class GroupRowView: NSView {
 
 final class TaskRowView: NSView {
     let item: TaskItem
+    let unconfirmed: Bool
     var checked: Bool
     var onClick: ((TaskItem) -> Void)?
     var onCheck: ((TaskItem, Bool) -> Void)?
     var onDeadline: ((TaskItem, Int?) -> Void)?
     private var hovered = false
 
-    init(item: TaskItem, width: CGFloat, checked: Bool) {
+    init(item: TaskItem, width: CGFloat, checked: Bool, snapshotStale: Bool) {
         self.item = item
+        self.unconfirmed = item.stale == true || (snapshotStale && (item.status == "running" || item.status == "stuck"))
         self.checked = checked
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: TASK_ROW_H))
         self.toolTip = item.name
@@ -336,8 +339,8 @@ final class TaskRowView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let w = bounds.width
         let done = checked || item.status == "done"
-        let color = palette[item.status] ?? .gray
-        let alpha: CGFloat = done ? 0.4 : (item.status == "seen" ? 0.34 : 1)
+        let color = palette[unconfirmed ? "seen" : item.status] ?? secondaryText
+        let alpha: CGFloat = done || unconfirmed || item.status == "seen" ? 0.68 : 1
 
         if hovered {
             NSColor.white.withAlphaComponent(0.075).setFill()
@@ -350,14 +353,14 @@ final class TaskRowView: NSView {
         let meta = metaText()
         let metaAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular),
-            .foregroundColor: item.overdue ? palette["stuck"]! : NSColor.white.withAlphaComponent(0.36 * alpha),
+            .foregroundColor: item.overdue ? palette["stuck"]! : secondaryText.withAlphaComponent(0.9 * alpha),
         ]
         let metaW = (meta as NSString).size(withAttributes: metaAttrs).width
         (meta as NSString).draw(at: NSPoint(x: w - 34 - metaW, y: TASK_ROW_H / 2 - 5.5), withAttributes: metaAttrs)
 
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.9 * alpha),
+            .foregroundColor: mainText.withAlphaComponent(alpha),
             .strikethroughStyle: done ? 1 : 0,
         ]
         var title = item.name
@@ -403,6 +406,7 @@ final class TaskRowView: NSView {
 
     private func metaText() -> String {
         if item.overdue { return "超时" }
+        if unconfirmed { return "待确认" }
         switch item.status {
         case "stuck": return (item.failed ?? false) ? "限流" : String(format: "%d:%02d", item.elapsed / 60, item.elapsed % 60)
         case "running": return String(format: "%d:%02d", item.elapsed / 60, item.elapsed % 60)
@@ -455,6 +459,8 @@ final class TaskRowView: NSView {
 
 final class PulseView: NSView {
     var payload: Payload?
+    var connectionLost = false
+    var actionMessage: String?
     var showAll = false
     var compact = false
     var pinned = false
@@ -472,12 +478,34 @@ final class PulseView: NSView {
 
     override var isFlipped: Bool { true }
 
+    var countersUnavailable: Bool {
+        guard !connectionLost, let p = payload, p.poller_error == nil, let ms = p.updated, ms > 0 else { return true }
+        return Date().timeIntervalSince1970 - Double(ms) / 1000 > (p.stale_after_seconds ?? 180)
+    }
+
+    var statusMessage: String? {
+        if connectionLost { return "本机服务连接中断" }
+        guard let p = payload else { return "正在连接本机服务…" }
+        if p.poller_error != nil { return "上游取数失败，显示上次快照" }
+        if p.updated == nil { return "等待首次采样…" }
+        if countersUnavailable { return "取数暂未更新，显示上次快照" }
+        if let actionMessage { return actionMessage }
+        if let n = p.stale_count, n > 0 { return "\(n) 个会话状态待确认" }
+        return nil
+    }
+
+    var statusDetail: String? {
+        guard let message = statusMessage else { return nil }
+        if let error = payload?.poller_error { return message + "\n" + error }
+        return message
+    }
+
     func visibleItems() -> [TaskItem] {
         guard let p = payload else { return [] }
         let base = showAll ? p.all : p.active
         guard let f = filter else { return Array(base.prefix(p.window_limit ?? 10)) }
         let hit = base.filter { it in
-            if it.status == f { return true }
+            if it.status == f { return it.stale != true || f == "attention" }
             // 已查看的归入它原来的状态（暗色）。但「进行中」是产能口径：
             // 只列此刻真的在跑的行，保证数字与列表一致
             if it.status == "seen" { return f != "running" && (it.prev ?? "running") == f }
@@ -526,8 +554,7 @@ final class PulseView: NSView {
 
     func layoutHeight() -> CGFloat {
         if compact { return 3 * 24 + 12 }
-        guard let p = payload else { return 80 }
-        let h0 = HEADER_H + (isStale(p) ? 22 : 0)
+        let h0 = HEADER_H + (statusMessage == nil ? 0 : 22)
         let items = visibleItems()
         let gs = groups()
         if gs.isEmpty { return h0 + 34 }
@@ -544,78 +571,50 @@ final class PulseView: NSView {
 
     func rebuild() {
         subviews.forEach { $0.removeFromSuperview() }
+        toolTip = compact ? statusDetail : nil
         compact ? rebuildCompact() : rebuildList()
     }
 
     private func rebuildCompact() {
-        guard let p = payload else { return }
-        // 取数停摆时数字是旧快照，不能再按「进行中 / 待处理 / 卡住」上色，
-        // 否则用户会以为那是此刻的实况。全部转灰 + 顶部一条警示。
-        let stale = isStale(p)
-        let items = [("running", p.counts.running), ("attention", p.counts.attention), ("stuck", p.counts.stuck)]
+        let unavailable = countersUnavailable
+        let counts = payload?.counts
+        let items = [("running", counts?.running), ("attention", counts?.attention), ("stuck", counts?.stuck)]
         for (i, pair) in items.enumerated() {
-            let on = pair.1 > 0 && !stale
-            let color = palette[pair.0] ?? .gray
             let y = CGFloat(6 + i * 24)
-            let pill = NSView(frame: NSRect(x: 5, y: y, width: COMPACT_W - 10, height: 20))
-            pill.wantsLayer = true
-            pill.layer?.cornerRadius = 6
-            pill.layer?.backgroundColor = stale
-                ? NSColor.white.withAlphaComponent(0.10).cgColor
-                : (on ? color.withAlphaComponent(0.92).cgColor
-                      : NSColor.white.withAlphaComponent(0.06).cgColor)
-            addSubview(pill)
-            let label = NSTextField(labelWithString: stale ? "–" : "\(pair.1)")
-            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .bold)
-            label.textColor = on
-                ? NSColor(srgbRed: 0.06, green: 0.07, blue: 0.09, alpha: 1)
-                : NSColor.white.withAlphaComponent(stale ? 0.45 : 0.36)
-            label.alignment = .center
-            label.frame = NSRect(x: 5, y: y + 2.5, width: COMPACT_W - 10, height: 15)
-            label.toolTip = stale ? staleTip(p) : nil
-            addSubview(label)
+            let badge = BadgeView(frame: NSRect(x: 5, y: y, width: COMPACT_W - 10, height: 20))
+            badge.kind = pair.0
+            badge.value = unavailable ? nil : pair.1
+            badge.toolTip = statusDetail
+            addSubview(badge)
         }
 
-        if stale {
+        if statusMessage != nil {
             let bar = NSView(frame: NSRect(x: 0, y: 0, width: COMPACT_W, height: 3))
             bar.wantsLayer = true
-            bar.layer?.backgroundColor = NSColor(srgbRed: 1.0, green: 0.72, blue: 0.2, alpha: 1).cgColor
+            bar.layer?.backgroundColor = palette["attention"]?.cgColor
             addSubview(bar)
         }
     }
 
-    /// 「96 分钟没更新」这类给人看的话
-    private func staleTip(_ p: Payload) -> String {
-        let mins = Int(((staleness(p) ?? 0) / 60).rounded())
-        let span = mins >= 60 ? "\(mins / 60) 小时 \(mins % 60) 分钟" : "\(mins) 分钟"
-        if let err = p.poller_error, !err.isEmpty {
-            return "取数已停 \(span)，数字是当时的快照\n\(err)"
-        }
-        return "取数已停 \(span)，数字是当时的快照"
-    }
-
     private func rebuildList() {
-        guard let p = payload else { return }
-        addHeader(counters: p.counts)
+        let unavailable = countersUnavailable
+        addHeader(counters: payload?.counts)
 
         let gs = groups()
         var y = HEADER_H
 
-        // 数据停更时先说明「下面这些是旧快照」，否则列表看起来像实况
-        if isStale(p) {
-            let mins = Int(((staleness(p) ?? 0) / 60).rounded())
-            let span = mins >= 60 ? "\(mins / 60) 小时 \(mins % 60) 分钟" : "\(mins) 分钟"
-            let text = "取数已停 \(span)，下面是当时的快照"
-            let label = NSTextField(labelWithString: "⚠ " + text)
+        if let message = statusMessage {
+            let label = NSTextField(labelWithString: message)
             label.font = .systemFont(ofSize: 11, weight: .medium)
-            label.textColor = NSColor(srgbRed: 1.0, green: 0.72, blue: 0.2, alpha: 1)
+            label.textColor = palette["attention"]
             label.frame = NSRect(x: 12, y: y + 6, width: bounds.width - 24, height: 16)
-            label.toolTip = p.poller_error
+            label.toolTip = statusDetail
             addSubview(label)
             y += 22
         }
 
         if gs.isEmpty {
+            guard !unavailable else { return }
             let text: String = {
                 switch filter {
                 case "stuck": return "没有卡住的任务"
@@ -626,7 +625,7 @@ final class PulseView: NSView {
             }()
             let label = NSTextField(labelWithString: text)
             label.font = .systemFont(ofSize: 11)
-            label.textColor = NSColor.white.withAlphaComponent(0.35)
+            label.textColor = secondaryText
             label.frame = NSRect(x: 12, y: y + 8, width: bounds.width - 24, height: 16)
             addSubview(label)
             return
@@ -634,7 +633,8 @@ final class PulseView: NSView {
 
         if flattened {
             for item in gs[0].tasks {
-                let t = TaskRowView(item: item, width: bounds.width, checked: item.muted == true)
+                let t = TaskRowView(item: item, width: bounds.width, checked: item.muted == true,
+                                    snapshotStale: unavailable)
                 t.frame = NSRect(x: 0, y: y, width: bounds.width, height: TASK_ROW_H)
                 t.onClick = { [weak self] it in self?.onOpen?(it) }
                 t.onCheck = { [weak self] it, on in self?.onCheck?(it, on) }
@@ -655,7 +655,8 @@ final class PulseView: NSView {
 
             guard isOpen else { continue }
             for item in tasksFor(g) {
-                let t = TaskRowView(item: item, width: bounds.width, checked: item.muted == true)
+                let t = TaskRowView(item: item, width: bounds.width, checked: item.muted == true,
+                                    snapshotStale: unavailable)
                 t.frame = NSRect(x: 0, y: y, width: bounds.width, height: TASK_ROW_H)
                 t.onClick = { [weak self] it in self?.onOpen?(it) }
                 t.onCheck = { [weak self] it, on in self?.onCheck?(it, on) }
@@ -689,7 +690,7 @@ final class PulseView: NSView {
 
         let chevron = NSTextField(labelWithString: showAll ? "⌃" : "⌄")
         chevron.font = .systemFont(ofSize: 11, weight: .semibold)
-        chevron.textColor = NSColor.white.withAlphaComponent(0.3)
+        chevron.textColor = secondaryText.withAlphaComponent(0.6)
         chevron.alignment = .center
         chevron.frame = NSRect(x: bounds.width - 24, y: 6, width: 14, height: 14)
         addSubview(chevron)
@@ -706,7 +707,7 @@ final class PulseView: NSView {
         addSubview(sep)
     }
 
-    /// 三枚计数胶囊：有值时实心彩底 + 白字，0 值时低透明度底 + 暗字；点击按该状态筛选
+    /// 点击计数胶囊按该状态筛选
     private func addBadge(key: String, value: Int, tip: String, x: CGFloat) -> CGFloat {
         let w: CGFloat = value > 99 ? 30 : 24
         let h: CGFloat = 18
@@ -714,7 +715,7 @@ final class PulseView: NSView {
 
         let badge = BadgeView(frame: NSRect(x: x, y: y, width: w, height: h))
         badge.kind = key
-        badge.value = value
+        badge.value = countersUnavailable ? nil : value
         badge.active = (filter == key)
         badge.toolTip = filter == key ? "再点一次显示全部" : "只看\(tip)"
         badge.onClick = { [weak self] in self?.toggleFilter(key) }
@@ -786,9 +787,9 @@ final class ToastView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let r = bounds.insetBy(dx: 0.5, dy: 0.5)
         let shape = NSBezierPath(roundedRect: r, xRadius: 12, yRadius: 12)
-        NSColor(srgbRed: 0.055, green: 0.06, blue: 0.075, alpha: 0.97).setFill()
+        rgb(0x182337, alpha: 0.98).setFill()
         shape.fill()
-        NSColor.white.withAlphaComponent(0.10).setStroke()
+        rgb(0x506684, alpha: 0.85).setStroke()
         shape.lineWidth = 0.5
         shape.stroke()
 
@@ -810,7 +811,7 @@ final class ToastView: NSView {
 
         let bAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12, weight: .regular),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.9),
+            .foregroundColor: mainText,
         ]
         let avail = bounds.width - 28
         let text = (self.body as NSString).size(withAttributes: bAttrs).width > avail
@@ -821,7 +822,7 @@ final class ToastView: NSView {
         let hint = "点我跳转" as NSString
         let hAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 9),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.34),
+            .foregroundColor: secondaryText,
         ]
         let hs = hint.size(withAttributes: hAttrs)
         hint.draw(at: NSPoint(x: bounds.width - hs.width - 12, y: 5), withAttributes: hAttrs)
@@ -856,6 +857,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var panel: NSPanel!
     var view: PulseView!
     var dataTimer: Timer?
+    var dataRequestInFlight = false
+    var consecutiveReadFailures = 0
+    var nextReadAt: TimeInterval = 0
+    var drawnStatusDetail: String?
     var hoverTimer: Timer?
     var dragTimer: Timer?
     var dragging = false
@@ -880,10 +885,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         buildPanel()
+        applyLayout()
         refresh()
         dataTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        dataTimer?.tolerance = 0.2
         let ht = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in self?.hoverTick() }
         hoverTimer = ht
         RunLoop.main.add(ht, forMode: .common)
@@ -941,12 +948,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bg.layer?.cornerRadius = 12
         bg.layer?.masksToBounds = true
         bg.layer?.borderWidth = 0.5
-        bg.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        bg.layer?.borderColor = rgb(0x7894BD, alpha: 0.32).cgColor
         panel.contentView = bg
 
         let tint = NSView(frame: bg.bounds)
         tint.wantsLayer = true
-        tint.layer?.backgroundColor = NSColor(srgbRed: 0.045, green: 0.05, blue: 0.065, alpha: 0.72).cgColor
+        tint.layer?.backgroundColor = panelTint.cgColor
         tint.autoresizingMask = [.width, .height]
         bg.addSubview(tint)
 
@@ -1300,33 +1307,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         })
     }
 
-    /// 只对「刚变成待我处理」的会话弹提示，避免重启时把历史一次性刷出来
+    /// 同一会话的新回复也能提示，启动时已有的回复只作为基准。
     func detectReplies(_ payload: Payload) {
-        if !statusSeeded {
-            statusSeeded = true
-            for it in payload.all { lastStatus[it.id] = it }
-            return
-        }
-        for it in payload.all {
-            let prev = lastStatus[it.id]?.status
-            lastStatus[it.id] = it
-            if it.status == "attention", prev != "attention" {
-                dbg("reply transition id=\(it.id) prev=\(prev ?? "nil")")
-                showToast(it)
+        if statusSeeded {
+            for item in payload.all where item.status == "attention" && item.stale != true {
+                let previous = lastStatus[item.id]
+                let newReply = item.reply_version.map { $0 != previous?.reply_version } ?? false
+                if previous?.status != "attention" || newReply {
+                    showToast(item)
+                }
             }
         }
+        lastStatus = Dictionary(payload.all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        statusSeeded = true
     }
 
     func refresh() {
-        guard let url = URL(string: endpoint + "/state") else { return }
+        guard !dataRequestInFlight, ProcessInfo.processInfo.systemUptime >= nextReadAt,
+              let url = URL(string: endpoint + "/state") else { return }
+        dataRequestInFlight = true
         var req = URLRequest(url: url)
         req.timeoutInterval = 4
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            guard let self, let data, let payload = try? JSONDecoder().decode(Payload.self, from: data) else { return }
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, _ in
+            let payload: Payload?
+            if (response as? HTTPURLResponse)?.statusCode == 200, let data {
+                payload = try? JSONDecoder().decode(Payload.self, from: data)
+            } else {
+                payload = nil
+            }
             DispatchQueue.main.async {
-                self.view.payload = payload
-                self.applyLayout()
-                self.detectReplies(payload)
+                guard let self else { return }
+                self.dataRequestInFlight = false
+                let counts = self.view.payload?.counts
+                let items = self.view.compact ? [] : self.view.visibleItems()
+                self.view.connectionLost = payload == nil
+                if let payload {
+                    self.view.payload = payload
+                    self.consecutiveReadFailures = 0
+                    self.nextReadAt = 0
+                    if !self.view.countersUnavailable { self.detectReplies(payload) }
+                } else {
+                    self.consecutiveReadFailures = min(self.consecutiveReadFailures + 1, 3)
+                    self.nextReadAt = ProcessInfo.processInfo.systemUptime + Double(1 << self.consecutiveReadFailures)
+                }
+                let detail = self.view.statusDetail
+                if detail != self.drawnStatusDetail || counts != self.view.payload?.counts
+                    || (!self.view.compact && items != self.view.visibleItems()) {
+                    self.drawnStatusDetail = detail
+                    self.applyLayout()
+                }
             }
         }.resume()
     }
@@ -1372,34 +1401,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 10
-        URLSession.shared.dataTask(with: req) { _, _, _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.refresh() }
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, _ in
+            let result = data.flatMap { try? JSONDecoder().decode(ActionResult.self, from: $0) }
+            let ok = (response as? HTTPURLResponse)?.statusCode == 200 && result?.ok == true
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.view.actionMessage = ok ? nil : "操作未确认，请重试"
+                self.applyLayout()
+                self.nextReadAt = 0
+                self.refresh()
+            }
         }.resume()
     }
 
     func setDeadline(_ item: TaskItem, minutes: Int?) {
-        var s = endpoint + "/deadline?id=\(item.id)"
-        if let m = minutes { s += "&minutes=\(m)" }
-        guard let url = URL(string: s) else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 8
-        URLSession.shared.dataTask(with: req) { _, _, _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.refresh() }
-        }.resume()
+        let duration = minutes.map { "&minutes=\($0)" } ?? ""
+        post("/deadline?id=\(item.id)" + duration)
     }
 }
 
+private struct ActionResult: Decodable {
+    let ok: Bool
+}
+
 // 单实例
+try? FileManager.default.createDirectory(atPath: NSHomeDirectory() + "/.taskpulse",
+                                         withIntermediateDirectories: true)
 let lockPath = NSHomeDirectory() + "/.taskpulse/ui.lock"
 if !FileManager.default.fileExists(atPath: lockPath) {
     FileManager.default.createFile(atPath: lockPath, contents: nil)
 }
-if let lh = try? FileHandle(forWritingTo: URL(fileURLWithPath: lockPath)) {
-    if flock(lh.fileDescriptor, LOCK_EX | LOCK_NB) != 0 { exit(0) }
+let appLock = try? FileHandle(forWritingTo: URL(fileURLWithPath: lockPath))
+if let appLock, flock(appLock.fileDescriptor, LOCK_EX | LOCK_NB) != 0 {
+    exit(0)
 }
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.run()
+withExtendedLifetime(appLock) { app.run() }
