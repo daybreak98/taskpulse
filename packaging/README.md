@@ -86,6 +86,7 @@ launchctl kickstart -k gui/$UID/com.taskpulse.poller
 | `platform.messages_list_key` | 消息接口返回里存放消息数组的字段名 |
 | `auth.provider` | `none` / `token_file` / `module` |
 | `auth.token_file` | `token_file` 时读这个文件的首行当令牌，每次请求重读 |
+| `auth.env` | `module` 时在建会话前注入的环境变量（有些 SDK 靠环境变量决定去哪换凭据）；留空即可 |
 | `poll.interval_seconds` | 取数间隔，默认 60 |
 | `poll.stuck_seconds` | 同一轮跑过多久算「卡住」，默认 600 |
 | `poll.window_limit` | 窄条最多显示几条，默认 10 |

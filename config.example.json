@@ -31,7 +31,8 @@
     "ctor_kwargs": {},
     "token_file": "~/.taskpulse/token",
     "token_header": "Authorization",
-    "token_prefix": "Bearer "
+    "token_prefix": "Bearer ",
+    "env": {}
   },
   "poll": {
     "interval_seconds": 60,

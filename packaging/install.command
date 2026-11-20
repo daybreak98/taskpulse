@@ -203,6 +203,7 @@ fi
 # ---------- 5. 写入 launchd 配置 ----------
 # 团队内部包可能带 uv-args.txt（每行一个额外参数，如 --with 内部包 --index 私有源）
 UV_EXTRA_XML=""
+
 if [ -f "./uv-args.txt" ]; then
   while IFS= read -r ARG; do
     [ -z "$ARG" ] && continue

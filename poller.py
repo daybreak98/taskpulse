@@ -65,6 +65,7 @@ DEFAULTS = {
         "factory": "Session",        # 模块里负责建会话的可调用对象
         "extra_config": {},          # 每次请求透传给 SDK 的额外参数
         "ctor_kwargs": {},           # 建会话对象时的构造参数
+        "env": {},                   # 建会话前注入的环境变量（SDK 要求的开关/路径）
         "token_file": "",            # provider=token_file 时读哪个文件
         "token_header": "Authorization",
         "token_prefix": "Bearer ",
@@ -246,6 +247,9 @@ class _ModuleSession:
 
 def make_session():
     a = CFG.get("auth") or {}
+    # 有些 SDK 靠环境变量决定去哪换凭据；在导入模块之前注入，配置优先于继承来的环境
+    for k, v in (a.get("env") or {}).items():
+        os.environ[str(k)] = str(v)
     provider = (a.get("provider") or "none").lower()
     if provider == "module":
         module = a.get("module") or ""
@@ -1019,8 +1023,11 @@ def poll_loop() -> None:
             name, msg = type(exc).__name__, str(exc)
             auth = name == "SystemExit" or "token" in msg.lower() or "auth" in msg.lower()
             backoff = min(60 * (2 ** (_fail_count - 1)), 1800) if auth else 60
-            log("取数线程中断: %s: %s；%d 秒后重启%s"
-                % (name, msg, backoff, "（认证问题，请在浏览器完成一次设备授权）" if auth else ""))
+            hint = ""
+            if auth:
+                hint = ("（认证失败：先按日志提示完成一次授权；若授权页没有反应，"
+                        "检查 auth.env 与 auth.provider 配置）")
+            log("取数线程中断: %s: %s；%d 秒后重启%s" % (name, msg, backoff, hint))
             _mark_error("%s: %s" % (name, msg))
             time.sleep(backoff)
 
