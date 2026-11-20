@@ -1,0 +1,50 @@
+{
+  "platform": {
+    "base_url": "https://your-agent-service.example.com",
+    "api_prefix": "/api/v1",
+    "agent_ids": [],
+    "conversation_url": "{host}/chat?agentId={agent}&conversationId={cid}",
+    "endpoints": {
+      "conversations": "/conversations/list",
+      "queue": "/conversations/{cid}/queue",
+      "messages": "/conversations/{cid}/messages?pageNo=1&pageSize=1"
+    },
+    "conversations_body": {
+      "session_list": "{agent_ids}",
+      "page": 1,
+      "size": 60
+    },
+    "queue_fields": {
+      "state": "state",
+      "pending": "pending",
+      "idle": [
+        "IDLE"
+      ]
+    },
+    "messages_list_key": "list"
+  },
+  "auth": {
+    "provider": "token_file",
+    "module": "",
+    "factory": "Session",
+    "extra_config": {},
+    "ctor_kwargs": {},
+    "token_file": "~/.taskpulse/token",
+    "token_header": "Authorization",
+    "token_prefix": "Bearer "
+  },
+  "poll": {
+    "interval_seconds": 60,
+    "watch_limit": 20,
+    "stuck_seconds": 600,
+    "window_limit": 10,
+    "archive_hours": 48
+  },
+  "ui": {
+    "port": 8899
+  },
+  "extension": {
+    "scope": ""
+  },
+  "failure_marks": []
+}
