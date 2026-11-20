@@ -68,10 +68,16 @@ async function notifyActive(tabId) {
   try {
     const t = await chrome.tabs.get(tabId);
     if (!t || !t.url || !ORIGIN || !t.url.startsWith(ORIGIN + "/")) return;
+    // 后台窗口里的程序化切标签不该算「用户在看」→ 带上窗口是否聚焦
+    let focused = false;
+    try {
+      const w = await chrome.windows.get(t.windowId);
+      focused = !!(w && w.focused);
+    } catch (_) {}
     await fetch(ACTIVE_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: t.url, at: Date.now() })
+      body: JSON.stringify({ url: t.url, focused, at: Date.now() })
     });
   } catch (_) {}
 }
@@ -149,31 +155,18 @@ chrome.alarms.onAlarm.addListener((a) => {
   }
 });
 
-// 每个窗口上一次的活跃标签：切走时也要把它补记成已读
-const lastActive = new Map();
-
+// 只在上报「切到」这个标签时记已读。
+// 曾经这里还会补记「被切走的那个标签」，但它会把用户没看的会话误标已读：
+// 从 TaskPulse 点任务跳转时，扩展切走的上一个标签会被当成「看过了」，
+// 于是另一个待处理任务的计数凭空消失。切到某标签的那次上报已经覆盖了
+// 「看了再切走」的场景（进入即已读），补记是冗余且有害的。
 chrome.tabs.onActivated.addListener((info) => {
-  const prev = lastActive.get(info.windowId);
-  lastActive.set(info.windowId, info.tabId);
-  // 切出也算已读：先补记被切走的那个标签页
-  if (typeof prev === "number" && prev !== info.tabId) notifyActive(prev);
   notifyActive(info.tabId);
   push();
 });
 
 // 窗口失焦/回焦时同步「是否正在看」，避免在别的 App 里时把回复误判为已读
 chrome.windows.onFocusChanged.addListener(() => push());
-
-// 冷启动时先把各窗口的活跃标签记下来
-(async () => {
-  try {
-    const wins = await chrome.windows.getAll({});
-    for (const w of wins) {
-      const tabs = await chrome.tabs.query({ active: true, windowId: w.id });
-      if (tabs && tabs[0] && typeof tabs[0].id === "number") lastActive.set(w.id, tabs[0].id);
-    }
-  } catch (_) {}
-})();
 
 for (const ev of [
   chrome.tabs.onUpdated,

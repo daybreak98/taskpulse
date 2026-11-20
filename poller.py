@@ -1207,12 +1207,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "result": result})
             return
 
+        focused = True           # 旧版扩展不带这个字段，按「在前台」处理
         if parsed.path == "/active":
-            # 切入、切出都视为读过；读请求体时不占状态锁。
+            # 只认「切到某个标签」这一次上报；读请求体时不占状态锁。
             try:
                 ln = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(ln)) if ln > 0 else {}
                 match = re.search(r"[?&]conversationId=(\d+)", payload.get("url") or "")
+                focused = payload.get("focused", True) is not False
             except (AttributeError, TypeError, ValueError):
                 match = None
             cid = match.group(1) if match else ""
@@ -1242,7 +1244,9 @@ class Handler(BaseHTTPRequestHandler):
                         task.update(muted=False, archived=False, status="seen",
                                     seen_ms=now_ms(), running_since=0, queue_error=True)
                 elif parsed.path == "/active":
-                    changed = not task.get("muted") and task.get("status") in ("attention", "stuck")
+                    # 后台窗口里的程序化切标签不算「用户在看」
+                    changed = (focused and not task.get("muted")
+                               and task.get("status") in ("attention", "stuck"))
                     if changed:
                         mark_seen(task)
                 else:
