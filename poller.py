@@ -73,7 +73,8 @@ DEFAULTS = {
     },
     "poll": {
         "interval_seconds": 60,
-        "active_interval_seconds": 10,
+        "discovery_interval_seconds": 5,
+        "active_interval_seconds": 5,
         "active_watch_limit": 2,
         "watch_limit": 20,
         "stuck_seconds": 600,
@@ -135,6 +136,7 @@ POLL_SECONDS = max(1, int(CFG["poll"]["interval_seconds"]))
 TP_DEBUG = os.environ.get("TP_DEBUG") == "1"
 WATCH_LIMIT = max(0, int(CFG["poll"]["watch_limit"]))
 ACTIVE_POLL_SECONDS = max(0, int(CFG["poll"]["active_interval_seconds"]))
+DISCOVERY_POLL_SECONDS = max(0, int(CFG["poll"].get("discovery_interval_seconds", 5)))
 ACTIVE_WATCH_LIMIT = min(WATCH_LIMIT, max(0, int(CFG["poll"]["active_watch_limit"])))
 ROUND_BUDGET_SECONDS = 10
 DEFAULT_STUCK_SECONDS = int(CFG["poll"]["stuck_seconds"])
@@ -544,15 +546,25 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
         mark_seen(task)
 
 
-def poll_tick(agent: AgentClient, *, full: bool) -> dict:
+def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dict:
     deadline = time.monotonic() + ROUND_BUDGET_SECONDS
     base = load_state()
     tasks = base.get("tasks") or {}
     stamp = now_ms()
+    listed: list[dict] = []
+    if full or discovery:
+        listed = agent.conversations(request_timeout(deadline))[:WATCH_LIMIT]
+        if full:
+            # 慢请求耗尽预算时，下轮先补最久未检查的会话。
+            listed.sort(key=lambda conv: tasks.get(str(conv["id"]), {}).get("queue_checked_at") or 0)
     if full:
-        conversations = agent.conversations(request_timeout(deadline))[:WATCH_LIMIT]
-        # 慢请求耗尽预算时，下轮先补最久未检查的会话。
-        conversations.sort(key=lambda conv: tasks.get(str(conv["id"]), {}).get("queue_checked_at") or 0)
+        conversations = listed
+    elif discovery:
+        # 秒级发现：列表已经拿到了，新会话顺带取队列，运行中的照旧复查两个。
+        fresh = [conv for conv in listed if str(conv["id"]) not in tasks]
+        known = {str(conv["id"]) for conv in fresh}
+        conversations = fresh + [conv for conv in fast_candidates(tasks, stamp)
+                                 if str(conv["id"]) not in known]
     else:
         conversations = fast_candidates(tasks, stamp)
     samples = sample_queues(agent, conversations, tasks, deadline)
@@ -565,28 +577,54 @@ def poll_tick(agent: AgentClient, *, full: bool) -> dict:
         tasks = state.setdefault("tasks", {})
         act = load_active()
         stamp = now_ms()
+        # 启动回填的分界线：这之前建的会话属于历史，一次性记成已看过，免得刷屏；
+        # 这之后新建的会话是真·新任务，照常计入运行中。
+        baseline = int(state.get("baseline_at") or 0)
+        if not baseline:
+            baseline = state["baseline_at"] = stamp
+        fresh: set[str] = set()
+        for conv in listed:
+            cid = str(conv["id"])
+            update = conv["updateTime"]
+            created = int(conv.get("createTime") or 0)
+            task = tasks.get(cid)
+            if task is None:
+                fresh.add(cid)
+                if created and created >= baseline:
+                    task = tasks[cid] = {"status": "running", "prev": "running", "acked_update": 0}
+                else:
+                    task = tasks[cid] = {"status": "seen", "prev": "running", "acked_update": update}
+            task.setdefault("queue_observed_at", task.get("seen_ms") or 0)
+            task.update(id=conv["id"], name=conv.get("name") or f"会话 {cid}",
+                        agent_id=conv.get("agentId") or (AGENT_IDS[0] if AGENT_IDS else ""),
+                        update_ms=update, seen_ms=stamp)
+            task["url"] = conv_url(task["agent_id"], cid)
+            if task.get("archived") and update > (task.get("acked_update") or 0):
+                task.update(archived=False, muted=False, auto_archived=0, prev="running", status="seen")
+
         for conv in conversations:
             cid = str(conv["id"])
             update = conv["updateTime"]
             task = tasks.get(cid)
-            if full:
-                if task is None:
-                    task = tasks[cid] = {"status": "seen", "prev": "running", "acked_update": update}
-                task.setdefault("queue_observed_at", task.get("seen_ms") or 0)
-                task.update(id=conv["id"], name=conv.get("name") or f"会话 {cid}",
-                            agent_id=conv.get("agentId") or (AGENT_IDS[0] if AGENT_IDS else ""),
-                            update_ms=update, seen_ms=stamp)
-                task["url"] = conv_url(task["agent_id"], cid)
-                if task.get("archived") and update > (task.get("acked_update") or 0):
-                    task.update(archived=False, muted=False, auto_archived=0, prev="running", status="seen")
             if not task:
                 continue
             if task.get("muted"):
                 task["status"] = "done"
                 continue
             sample = samples.get(cid)
-            if sample is not None and (full or running(task)):
+            if sample is None:
+                continue
+            if (cid in fresh and sample.busy is False and not task.get("acked_update")
+                    and update <= int(conv.get("createTime") or 0)):
+                # 刚建好、还没跑过任何一轮的空会话，没有「等你处理」这回事
+                task["acked_update"] = update
+            if full or cid in fresh or running(task):
                 apply_queue_sample(task, sample, act, notifications)
+
+        if fresh:
+            busy = sum(1 for cid in fresh
+                       if tasks.get(cid, {}).get("status") in ("running", "stuck"))
+            log(f"新会话 {len(fresh)} 个已纳入统计（{busy} 个在运行）")
 
         for task in tasks.values():
             deadline_ms = task.get("deadline")
@@ -1284,24 +1322,31 @@ def _poll_forever() -> None:
     agent = None
     failures = 0
     next_full = next_fast = time.monotonic()
+    next_discovery = next_full if DISCOVERY_POLL_SECONDS else float("inf")
     log(f"取数循环已启动：每 {POLL_SECONDS} 秒全量检查，"
+        f"每 {DISCOVERY_POLL_SECONDS} 秒发现新会话，"
         f"运行中每 {ACTIVE_POLL_SECONDS} 秒最多复查 {ACTIVE_WATCH_LIMIT} 个")
     while True:
         started = time.monotonic()
         full = started >= next_full
+        discovery = (not full) and bool(DISCOVERY_POLL_SECONDS) and started >= next_discovery
         try:
             if agent is None:
                 agent = AgentClient()
-            state = poll_tick(agent, full=full)
+            state = poll_tick(agent, full=full, discovery=discovery)
             failures = 0
             if full:
                 next_full = started + POLL_SECONDS
+            if DISCOVERY_POLL_SECONDS:
+                if full or discovery:
+                    next_discovery = started + DISCOVERY_POLL_SECONDS
             next_fast = float("inf")
             if ACTIVE_POLL_SECONDS and ACTIVE_WATCH_LIMIT and any(
                     running(task) for task in (state.get("tasks") or {}).values()):
                 next_fast = started + ACTIVE_POLL_SECONDS
             if TP_DEBUG:
-                log("poll %s ok %.1fs" % ("full" if full else "active", time.monotonic() - started))
+                kind = "full" if full else ("discovery" if discovery else "active")
+                log("poll %s ok %.1fs" % (kind, time.monotonic() - started))
         except (Exception, SystemExit) as exc:
             failures += 1
             message = f"{type(exc).__name__}: {exc}"
@@ -1310,8 +1355,9 @@ def _poll_forever() -> None:
             _mark_error(message)
             agent = None
             next_full = time.monotonic() + backoff
+            next_discovery = next_full if DISCOVERY_POLL_SECONDS else float("inf")
             next_fast = float("inf")
-        time.sleep(max(0.05, min(next_full, next_fast) - time.monotonic()))
+        time.sleep(max(0.05, min(next_full, next_discovery, next_fast) - time.monotonic()))
 
 
 DEMO_TASKS = [

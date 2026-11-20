@@ -64,6 +64,7 @@ class PollingTests(unittest.TestCase):
             CONV_URL="https://agent.example.com/chat?conversationId={cid}",
             POLL_SECONDS=60,
             ACTIVE_POLL_SECONDS=10,
+            DISCOVERY_POLL_SECONDS=5,
             ACTIVE_WATCH_LIMIT=2,
             WATCH_LIMIT=20,
             FAIL_MARKS=(),
@@ -99,8 +100,10 @@ class PollingTests(unittest.TestCase):
         self.assertEqual(agent.queue_calls, [1, 2, 3, 4])
         self.assertEqual(poller.view(poller.load_state())["counts"]["running"], 4)
 
-    def test_default_schedule_keeps_idle_list_cadence_and_caps_extra_queues(self):
-        for busy, expected_checks in [((), 20), (range(1, 21), 30)]:
+    def test_default_schedule_discovers_every_interval_and_caps_extra_queues(self):
+        # 60 秒一轮全量，外加每 5 秒一次发现 → 60 秒里拉 12 次列表；
+        # 空闲时队列只随全量走（20 个会话各一次），全部在跑时每次发现额外复查 2 个。
+        for busy, expected_checks in [((), 20), (range(1, 21), 42)]:
             with self.subTest(expected_checks=expected_checks):
                 agent = FakeAgent([conversation(i) for i in range(1, 21)], busy=busy)
                 poller.save_state({})
@@ -118,8 +121,28 @@ class PollingTests(unittest.TestCase):
                 with patch.multiple(poller, time=clock, AgentClient=lambda: agent):
                     with self.assertRaises(StopLoop):
                         poller._poll_forever()
-                self.assertEqual(agent.list_calls, 1)
+                self.assertEqual(agent.list_calls, 12)
                 self.assertEqual(len(agent.queue_calls), expected_checks)
+
+    def test_new_conversations_are_counted_and_empty_ones_stay_seen(self):
+        agent = FakeAgent([conversation(1)])
+        poller.poll_tick(agent, full=True)          # 首次全量：建立回填分界线
+        created = self.stamp
+        agent.items = [
+            {**conversation(2, updated=created), "createTime": created},   # 新会话，正在跑
+            {**conversation(3, updated=created), "createTime": created},   # 刚建好，还没跑
+            conversation(1),                                               # 分界线之前的历史会话
+        ]
+        agent.busy.add(2)
+        self.stamp += 5_000
+
+        state = poller.poll_tick(agent, full=False, discovery=True)
+
+        self.assertEqual(state["tasks"]["2"]["status"], "running")
+        self.assertEqual(state["tasks"]["2"]["running_since"], self.stamp)
+        self.assertEqual(state["tasks"]["3"]["status"], "seen")
+        self.assertEqual(state["tasks"]["1"]["status"], "seen")
+        self.assertEqual(poller.view(state)["counts"]["running"], 1)
 
     def test_time_budget_allows_later_full_candidates_to_get_a_turn(self):
         agent = FakeAgent([conversation(i) for i in range(1, 4)])

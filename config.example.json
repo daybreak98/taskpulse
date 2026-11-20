@@ -36,7 +36,8 @@
   },
   "poll": {
     "interval_seconds": 60,
-    "active_interval_seconds": 10,
+    "discovery_interval_seconds": 5,
+    "active_interval_seconds": 5,
     "active_watch_limit": 2,
     "watch_limit": 20,
     "stuck_seconds": 600,
