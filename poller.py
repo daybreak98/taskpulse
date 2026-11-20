@@ -466,6 +466,7 @@ def refresh(state: dict, agent: AgentClient) -> dict:
             task["prev"] = "attention"
             task["status"] = "seen"
             task["acked_update"] = task.get("update_ms") or 0
+            task["acked_at"] = stamp
             log("auto seen id=%s (正在看的标签页)" % cid)
 
         deadline = task.get("deadline")
@@ -978,14 +979,17 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     ln = 0
                 raw = self.rfile.read(ln) if ln > 0 else b"{}"
-                url = ""
+                url, focused = "", True
                 try:
-                    url = (json.loads(raw or b"{}").get("url") or "")
+                    body = json.loads(raw or b"{}")
+                    url = body.get("url") or ""
+                    focused = body.get("focused", True)
                 except Exception:
                     pass
                 m = re.search(r"[?&]conversationId=(\d+)", url)
                 hit = False
-                if m:
+                # 浏览器在后台时，扩展里的「切标签」不该算用户读过
+                if m and focused:
                     task = tasks.get(m.group(1))
                     if task and not task.get("muted") and task.get("status") in ("attention", "stuck"):
                         task["acked_update"] = task.get("update_ms") or 0
