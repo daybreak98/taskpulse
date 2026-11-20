@@ -1028,7 +1028,7 @@ function render(data, disconnected = false) {
       : status === "running" || (status === "stuck" && !task.failed)
       ? Math.floor(task.elapsed / 60) + "分" + task.elapsed % 60 + "秒"
       : task.failed ? "限流"
-      : status === "done" ? "已完成" : task.idle_minutes + " 分钟前";
+      : status === "done" ? "" : task.idle_minutes + " 分钟前";
     nodes.progress.style.width = Math.round(task.progress * 100) + "%";
   }
   for (const [id, nodes] of rows) {
