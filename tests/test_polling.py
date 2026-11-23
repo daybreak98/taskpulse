@@ -221,6 +221,25 @@ class PollingTests(unittest.TestCase):
         self.assertEqual(task["status"], "stuck")
         self.assertEqual(agent.message_calls, [1])
 
+    def test_late_rate_limit_text_flips_attention_to_stuck(self):
+        agent = FakeAgent([conversation()], busy=(1,))
+        poller.poll_tick(agent, full=True)               # 起跑
+        self.stamp += 30_000
+        agent.busy = set()                                # 这一轮结束，先判成待回复
+        poller.poll_tick(agent, full=True)
+        self.assertEqual(poller.load_state()["tasks"]["1"]["status"], "attention")
+
+        # 限流提示比消息本体晚落地：第一次翻没翻到，过一会儿再翻才看得到
+        agent.last_message = lambda cid, timeout: {
+            "sender": "assistant", "content": "当前服务繁忙，本次回答未能完成"}
+        self.stamp += 40_000
+        with patch.object(poller, "FAIL_MARKS", ("当前服务繁忙",)):
+            poller.poll_tick(agent, full=True)
+
+        task = poller.load_state()["tasks"]["1"]
+        self.assertTrue(task["failed"])
+        self.assertEqual(task["status"], "stuck")
+
     def test_time_budget_allows_later_full_candidates_to_get_a_turn(self):
         agent = FakeAgent([conversation(i) for i in range(1, 4)])
         clock = Mock(return_value=0.0)
@@ -330,10 +349,11 @@ class PollingTests(unittest.TestCase):
         agent.busy.clear()
         self.stamp += 30_000
         with patch.object(poller, "FAIL_MARKS", ("已知的错误模板",)):
-            for _ in range(4):
+            for _ in range(12):
                 state = poller.poll_tick(agent, full=True)
-                self.stamp += 10_000
-        self.assertEqual(agent.message_calls, [1, 1])
+                self.stamp += 20_000
+        # 拿不到内容时不急着定死：留出复查窗口，但总次数封顶在 REPROBE_ATTEMPTS
+        self.assertEqual(len(agent.message_calls), poller.REPROBE_ATTEMPTS)
         self.assertEqual(state["tasks"]["1"]["status"], "attention")
 
     def test_http_rate_limit_aborts_queue_batch_and_backs_off(self):

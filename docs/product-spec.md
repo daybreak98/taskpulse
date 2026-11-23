@@ -111,8 +111,10 @@ seen 且 48 小时内没有任何新进展（update_ms/acked_update 都不变）
 「服务繁忙，本轮回答未能完成」。若只看状态字段，这会被误判成 attention（橙色），
 用户以为有结果可读，实际要重试。
 
-识别方式（低成本）：**只在会话刚出现新回复时**（`update_ms` 变化，每个 update 只做一次）
-请求 `GET /conversations/{cid}/messages?pageNo=1&pageSize=1`，取最后一条：
+识别方式（低成本）：会话刚出现新回复时（`update_ms` 变化）请求
+`GET /conversations/{cid}/messages?pageNo=1&pageSize=1`，取最后一条。
+**结论不一次定死**：限流文案可能比消息本体晚落地，第一次翻没命中时，
+在 5 分钟窗口内每隔 30 秒再翻一次（最多 4 次），期间标 attention；任一次命中即转 stuck。
 
 ```
 命中条件（任一出现于 content，来自配置项 failure_marks，默认空表示不判定）：

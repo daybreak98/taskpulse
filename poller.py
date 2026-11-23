@@ -150,6 +150,11 @@ RESUME_PROBE_LIMIT = max(0, int(CFG["poll"].get("resume_probe_limit", 1)))
 RATE_LIMIT_PROBE_SECONDS = max(0, int(CFG["poll"].get("rate_limit_probe_seconds", 60)))
 RATE_LIMIT_PROBE_GAP_SECONDS = max(30, RATE_LIMIT_PROBE_SECONDS * 2)
 RATE_LIMIT_PROBE_ATTEMPTS = 3
+# 待回复的结论是「翻最后一条消息」得出的，而限流提示可能比消息本身晚落地：
+# 允许在窗口内隔一会儿再看一次，别把「第一次没翻到」当成「没有限流」永久定死。
+REPROBE_GAP_SECONDS = max(30, min(60, RATE_LIMIT_PROBE_GAP_SECONDS // 4))
+REPROBE_WINDOW_SECONDS = 300
+REPROBE_ATTEMPTS = 4
 ROUND_BUDGET_SECONDS = 10
 DEFAULT_STUCK_SECONDS = int(CFG["poll"]["stuck_seconds"])
 DEFAULT_WINDOW_LIMIT = int(CFG["poll"]["window_limit"])
@@ -449,6 +454,29 @@ def resuming_candidates(listed: list[dict], tasks: dict, limit: int) -> list[dic
     return out
 
 
+def reprobe_candidates(tasks: dict, stamp: int, limit: int = 1) -> list[dict]:
+    """待回复里「翻过一次、结论可能还没落地」的会话：发现周期顺带复查一个，
+    免得限流提示晚到、还要等下一分钟的全量轮询才翻成卡住。"""
+    if limit <= 0 or not FAIL_MARKS:
+        return []
+    out = []
+    gap = REPROBE_GAP_SECONDS * 1000
+    for task in tasks.values():
+        if task.get("muted") or task.get("status") != "attention":
+            continue
+        if not task.get("classified_reply") or task.get("failed"):
+            continue
+        last = task.get("message_checked_at") or 0
+        if stamp - last < gap:
+            continue
+        if stamp - (task.get("reply_completed_at") or 0) > REPROBE_WINDOW_SECONDS * 1000:
+            continue
+        out.append({"id": task["id"], "updateTime": task.get("update_ms") or 0})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def pending_reply(task: dict, update: int, stamp: int) -> str | None:
     started = task.get("running_since") or 0
     is_newer = update > (task.get("acked_update") or 0)
@@ -527,9 +555,16 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
             if not reply:
                 continue
         if task.get("classified_reply") == reply:
-            continue
-        # 运行中多给一次机会（3 次，间隔翻倍）；已转空闲的沿用原来的 2 次上限。
-        limit = RATE_LIMIT_PROBE_ATTEMPTS if sample.busy else 2
+            # 已确认限流就不用再翻；结论是「没限流」的，消息体可能还没写完，窗口内再看一次
+            if task.get("failed") or sample.busy:
+                continue
+            last = task.get("message_checked_at") or 0
+            if sample.at - last < REPROBE_GAP_SECONDS * 1000:
+                continue
+            if sample.at - (task.get("reply_completed_at") or 0) > REPROBE_WINDOW_SECONDS * 1000:
+                continue
+        # 运行中多给几次机会；待回复要留出复查窗口
+        limit = RATE_LIMIT_PROBE_ATTEMPTS if sample.busy else REPROBE_ATTEMPTS
         if task.get("message_reply") == reply and task.get("message_attempts", 0) >= limit:
             continue
         timeout = request_timeout(deadline)
@@ -619,6 +654,7 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
         attempts = task.get("message_attempts", 0) if task.get("message_reply") == reply else 0
         task["message_reply"] = reply
         task["message_attempts"] = attempts + 1
+        task["message_checked_at"] = sample.at
         if sample.failed is not None:
             task["classified_reply"] = reply
             task["failed"] = sample.failed
@@ -660,8 +696,11 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
         resuming = [conv for conv in resuming_candidates(listed, tasks, RESUME_PROBE_LIMIT)
                     if str(conv["id"]) not in picked]
         picked |= {str(conv["id"]) for conv in resuming}
-        conversations = fresh + resuming + [conv for conv in fast_candidates(tasks, stamp)
-                                            if str(conv["id"]) not in picked]
+        reprobe = [conv for conv in reprobe_candidates(tasks, stamp)
+                   if str(conv["id"]) not in picked]
+        picked |= {str(conv["id"]) for conv in reprobe}
+        conversations = fresh + resuming + reprobe + [
+            conv for conv in fast_candidates(tasks, stamp) if str(conv["id"]) not in picked]
     else:
         conversations = fast_candidates(tasks, stamp)
     samples = sample_queues(agent, conversations, tasks, deadline)
