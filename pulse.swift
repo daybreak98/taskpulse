@@ -233,8 +233,9 @@ final class CapsuleView: NSView {
 
         // 外框是深蓝灰圆角矩形，色块缩在里面——不做成整条椭圆，
         // 这样竖排时像「一节电池」，横排时像参考里那条药丸。
-        let pad: CGFloat = vertical ? 4 : 2
-        let outerRadius: CGFloat = vertical ? glassRadius : 9
+        // 深蓝外框只留一条贴着数字色块的细边（原来 4pt，显得像厚边框）
+        let pad: CGFloat = 2
+        let outerRadius: CGFloat = vertical ? glassRadius : 10
         let shellRect = bounds.insetBy(dx: 0.25, dy: 0.25)
         let shell = NSBezierPath(roundedRect: shellRect, xRadius: outerRadius, yRadius: outerRadius)
         rgb(0x324451, alpha: 0.96).setFill()
@@ -274,7 +275,7 @@ final class CapsuleView: NSView {
                 }
             }
             let text = seg.value.map { String($0) } ?? "–"
-            let fontSize: CGFloat = vertical ? 14 : 10.5
+            let fontSize: CGFloat = vertical ? 14 : 12
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .bold),
                 .foregroundColor: countInk,
@@ -287,11 +288,12 @@ final class CapsuleView: NSView {
         NSGraphicsContext.restoreGraphicsState()
 
         // 色块外的一圈细亮边 + 外框描边
-        rgb(0xD6EBF5, alpha: 0.38).setStroke()
-        inner.lineWidth = 0.75
+        // 两条亮边都压淡：边框只有 2pt 时，亮边一重就把深蓝抢没了
+        rgb(0xD6EBF5, alpha: 0.30).setStroke()
+        inner.lineWidth = 0.6
         inner.stroke()
-        rgb(0xBBD5E4, alpha: 0.40).setStroke()
-        shell.lineWidth = 0.75
+        rgb(0xBBD5E4, alpha: 0.26).setStroke()
+        shell.lineWidth = 0.6
         shell.stroke()
 
         // 选中的那一段加一圈内亮边
@@ -827,10 +829,10 @@ final class PulseView: NSView {
     private func addHeader(counters: Counts?) {
         // 计数胶囊：横排三段，占原来三个徽章的位置；点哪段就按该状态筛选
         if let c = counters {
-            let capH: CGFloat = 18
-            let capW: CGFloat = 78
-            let cap = CapsuleView(frame: NSRect(x: 10, y: (HEADER_H - capH) / 2,
-                                                width: capW, height: capH))
+            // 高度贴到表头上下边（28pt 里留 2pt），形状与竖排一致
+            let capH: CGFloat = HEADER_H - 4
+            let capW: CGFloat = 96
+            let cap = CapsuleView(frame: NSRect(x: 10, y: 2, width: capW, height: capH))
             cap.segments = [("running", countersUnavailable ? nil : c.running),
                             ("attention", countersUnavailable ? nil : c.attention),
                             ("stuck", countersUnavailable ? nil : c.stuck)]
@@ -1223,6 +1225,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let mouse = NSEvent.mouseLocation
         let inside = panel.frame.contains(mouse)
 
+        // 细条一旦不在屏幕边上（拖到中间、换分辨率、被系统挪走），自动展开成小窗
+        if view.compact, !view.pinned, !nearAnyEdge(panel.frame) {
+            expanded = true
+            view.compact = false
+            dbg("auto expand (not on edge)")
+            applyLayout()
+            wasInside = inside
+            return
+        }
+
         if inside {
             lastNear = now
             // 必须是从窗口外「移入」的那一下才展开；
@@ -1234,7 +1246,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 applyLayout()
             }
         } else {
-            if !view.pinned && expanded && now - lastNear > 0.15 {
+            // 只有贴着屏幕边才允许收起；悬在中间时保持展开（否则会和下面的自动展开互踢）
+            if !view.pinned && expanded && now - lastNear > 0.15 && nearAnyEdge(panel.frame) {
                 expanded = false
                 view.compact = true
                 hoverArmed = true
@@ -1296,6 +1309,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             bg.layer?.borderColor = glassBorder.cgColor
         }
         view.rebuild()
+    }
+
+    /// 窗口是否贴着任意一条屏幕边（贴边才允许保持细条形态）
+    func nearAnyEdge(_ f: NSRect) -> Bool {
+        let v = visibleFrame()
+        return f.maxX >= v.maxX - EDGE_SNAP || f.minX <= v.minX + EDGE_SNAP
+            || f.maxY >= v.maxY - EDGE_SNAP || f.minY <= v.minY + EDGE_SNAP
     }
 
     func sameRect(_ a: NSRect, _ b: NSRect) -> Bool {
@@ -1384,8 +1404,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         if !view.pinned {
-            // 拖动不改变原有展开状态：本来是细条就保持细条
-            expanded = wasCompactAtDragStart ? false : f.contains(NSEvent.mouseLocation)
+            // 细条只在贴边时有意义：松手后离开了边缘，就展开成小窗
+            if !nearEdge {
+                expanded = true
+            } else {
+                expanded = wasCompactAtDragStart ? false : f.contains(NSEvent.mouseLocation)
+            }
             view.compact = !expanded
         }
         applyLayout(force: true)
