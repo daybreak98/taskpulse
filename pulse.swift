@@ -1014,14 +1014,6 @@ final class ToastView: NSView {
             ? middleEllipsis(self.body, maxWidth: avail, attrs: bAttrs)
             : self.body
         (text as NSString).draw(at: NSPoint(x: 20, y: 31), withAttributes: bAttrs)
-
-        let hint = "点我跳转" as NSString
-        let hAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9.5),
-            .foregroundColor: secondaryText.withAlphaComponent(0.85),
-        ]
-        let hs = hint.size(withAttributes: hAttrs)
-        hint.draw(at: NSPoint(x: bounds.width - hs.width - 14, y: bounds.height - 17), withAttributes: hAttrs)
     }
 
     override func mouseDown(with event: NSEvent) {
