@@ -94,10 +94,10 @@ func rgb(_ value: UInt32, alpha: CGFloat = 1) -> NSColor {
 // 色值与图层顺序取自 AgentPulse-glass 参考：底板 --glass-rgb 51 77 95，
 // --glass-transparency .10（即底板不透明度 90%），再叠一层高光渐变与 20px 背后的模糊。
 
-// 比参考再压一档：底色整体加深 25%（#334D5F × 0.75），
-// 同时把底板透明度从 10% 提到 35%，能透出背后的内容。
+// 底色在参考基础上加深 25%（#334D5F × 0.75）；透明度先回到 10% 那一档。
+// 想更透就改 glassTransparency（0.2 左右还能看清字，0.35 会明显发白）。
 let glassRGB: UInt32 = 0x263A47
-let glassTransparency: CGFloat = 0.35
+let glassTransparency: CGFloat = 0.10
 let glassRadius: CGFloat = 16
 /// 面板/提示条的边框与内高光（参考里的 --glass-border 与 inset shadow）
 let glassBorder = rgb(0xD2E8F4, alpha: 0.49)
@@ -233,9 +233,9 @@ final class CapsuleView: NSView {
 
         // 外框是深蓝灰圆角矩形，色块缩在里面——不做成整条椭圆，
         // 这样竖排时像「一节电池」，横排时像参考里那条药丸。
-        let pad: CGFloat = vertical ? 3.5 : 2
-        let outerRadius: CGFloat = vertical ? 13 : 9
-        let shellRect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let pad: CGFloat = vertical ? 4 : 2
+        let outerRadius: CGFloat = vertical ? glassRadius : 9
+        let shellRect = bounds.insetBy(dx: 0.25, dy: 0.25)
         let shell = NSBezierPath(roundedRect: shellRect, xRadius: outerRadius, yRadius: outerRadius)
         rgb(0x324451, alpha: 0.96).setFill()
         shell.fill()
@@ -724,9 +724,9 @@ final class PulseView: NSView {
         let segments = [("running", counts?.running), ("attention", counts?.attention), ("stuck", counts?.stuck)]
             .map { (key: $0.0, value: unavailable ? nil : $0.1) }
 
-        // 三段计数块：外框是深蓝灰圆角矩形，色块缩在里面
-        let capsule = CapsuleView(frame: NSRect(x: 2, y: 2, width: COMPACT_W - 4,
-                                                height: layoutHeight() - 4))
+        // 三段计数块：外框直接铺满小窗、圆角与小窗一致，
+        // 否则圆角处会露出一条更亮的底板（看起来像"边角发白"）
+        let capsule = CapsuleView(frame: NSRect(x: 0, y: 0, width: COMPACT_W, height: layoutHeight()))
         capsule.segments = segments
         capsule.vertical = true
         capsule.activeKind = filter
@@ -1090,17 +1090,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // 冷蓝灰磨砂底板：背后实时模糊 + 90% 底板（参考的 --glass-transparency .10）
         // + 一层高光渐变 + 细描边 + 内高光，四层叠出「玻璃」而不是「灰块」。
+        // 先套一层圆角容器：NSVisualEffectView 的背景模糊不吃自己的 masksToBounds，
+        // 只给它设 cornerRadius 会在四角露出一圈没被裁掉的浅色（看起来就是"边角白色"）。
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: w0, height: h0))
+        container.wantsLayer = true
+        container.layer?.cornerRadius = glassRadius
+        container.layer?.masksToBounds = true
+        // 外框描边交给内容自己画（收起态是胶囊外壳、展开态是视图边缘），
+        // 容器再加一圈 1pt 会在圆角处叠成一条白边
+        panel.contentView = container
+
         let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w0, height: h0))
         bg.material = .hudWindow
         bg.blendingMode = .behindWindow
         bg.state = .active
         bg.appearance = NSAppearance(named: .darkAqua)
-        bg.wantsLayer = true
-        bg.layer?.cornerRadius = glassRadius
-        bg.layer?.masksToBounds = true
-        bg.layer?.borderWidth = 1
-        bg.layer?.borderColor = glassBorder.cgColor
-        panel.contentView = bg
+        bg.autoresizingMask = [.width, .height]
+        container.addSubview(bg)
 
         let tint = NSView(frame: bg.bounds)
         tint.wantsLayer = true
@@ -1151,7 +1157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.onDragEnd = { [weak self] in self?.endDrag("mouseUp") }
         view.onToggleGroup = { [weak self] _ in self?.applyLayout() }
         view.onFilterChange = { [weak self] _ in self?.applyLayout() }
-        bg.addSubview(view)
+        container.addSubview(view)
         panel.orderFrontRegardless()
         applyLayout(force: true)
     }
@@ -1283,9 +1289,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if abs(view.frame.width - w) > 0.5 || abs(view.frame.height - h) > 0.5 {
             view.frame = NSRect(x: 0, y: 0, width: w, height: h)
         }
-        // 两种形态都用同一套圆角，收起态不再拉成椭圆
+        // 圆角常驻；描边只在展开态由容器画（收起态那条是胶囊自己的外壳）
         if let bg = panel.contentView {
             bg.layer?.cornerRadius = glassRadius
+            bg.layer?.borderWidth = view.compact ? 0 : 1
+            bg.layer?.borderColor = glassBorder.cgColor
         }
         view.rebuild()
     }
@@ -1423,19 +1431,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         np.hidesOnDeactivate = false
         np.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-        // 与主面板同一套毛玻璃：背后实时模糊 + 25% 蒙层
+        // 与主面板同一套毛玻璃：同样要套圆角容器，否则四角会露出一圈没裁掉的浅色
+        let tcontainer = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        tcontainer.wantsLayer = true
+        tcontainer.layer?.cornerRadius = glassRadius
+        tcontainer.layer?.masksToBounds = true
+        np.contentView = tcontainer
+
         let tbg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w, height: h))
         tbg.material = .hudWindow
         tbg.blendingMode = .behindWindow
         tbg.state = .active
         tbg.appearance = NSAppearance(named: .darkAqua)
-        tbg.wantsLayer = true
-        tbg.layer?.cornerRadius = glassRadius
-        tbg.layer?.masksToBounds = true
+        tbg.autoresizingMask = [.width, .height]
+        tcontainer.addSubview(tbg)
+
         tv.frame = tbg.bounds
         tv.autoresizingMask = [.width, .height]
         tbg.addSubview(tv)
-        np.contentView = tbg
 
         print("[TaskPulse] toast \(item.name)")
         dbg("toast show id=\(item.id) stack=\(toasts.count + 1)")
