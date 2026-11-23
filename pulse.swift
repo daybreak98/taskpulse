@@ -432,8 +432,8 @@ final class TaskRowView: NSView {
             onCheck?(item, checked)
             return
         }
-        // 只有双击才跳转；单击不做任何事，保证双击零延迟
-        if event.clickCount == 2 {
+        // 单击即跳转。双击的第二次点击不再触发（clickCount==2 时直接忽略）
+        if event.clickCount == 1 {
             onClick?(item)
         }
     }
