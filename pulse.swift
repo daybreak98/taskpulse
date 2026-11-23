@@ -160,6 +160,8 @@ struct GroupVM {
     let worst: String
     let open: Int
     let progress: Double
+    /// 命中当前筛选的会话数（无筛选时等于 tasks.count）
+    var matched: Int = 0
 }
 
 func middleEllipsis(_ s: String, maxWidth: CGFloat, attrs: [NSAttributedString.Key: Any]) -> String {
@@ -182,7 +184,7 @@ func middleEllipsis(_ s: String, maxWidth: CGFloat, attrs: [NSAttributedString.K
     return best
 }
 
-func makeGroups(_ items: [TaskItem]) -> [GroupVM] {
+func makeGroups(_ items: [TaskItem], matching: ((TaskItem) -> Bool)? = nil) -> [GroupVM] {
     var buckets: [String: [TaskItem]] = [:]
     for t in items {
         let key = (t.group?.isEmpty == false) ? t.group! : "未分组"
@@ -194,7 +196,9 @@ func makeGroups(_ items: [TaskItem]) -> [GroupVM] {
         let worst = confirmed.max { (severity[$0.status] ?? 0) < (severity[$1.status] ?? 0) }?.status ?? "seen"
         let open = confirmed.filter { (severity[$0.status] ?? 0) > 0 }.count
         let prog = tasks.isEmpty ? 0 : tasks.reduce(0.0) { $0 + $1.progress } / Double(tasks.count)
-        out.append(GroupVM(name: name, tasks: tasks, worst: worst, open: open, progress: prog))
+        let hit = matching.map { m in tasks.filter(m).count } ?? tasks.count
+        out.append(GroupVM(name: name, tasks: tasks, worst: worst, open: open,
+                           progress: prog, matched: hit))
     }
     return out.sorted { a, b in
         let sa = severity[a.worst] ?? 0, sb = severity[b.worst] ?? 0
@@ -365,12 +369,15 @@ final class PinView: NSView {
 
 final class GroupRowView: NSView {
     let vm: GroupVM
+    /// 头部计数的筛选态（running/stuck/attention）；nil = 全部显示
+    let highlight: String?
     var expanded: Bool = false
     var onToggle: ((GroupVM) -> Void)?
     private var hovered = false
 
-    init(vm: GroupVM, width: CGFloat, expanded: Bool) {
+    init(vm: GroupVM, width: CGFloat, expanded: Bool, highlight: String? = nil) {
         self.vm = vm
+        self.highlight = highlight
         self.expanded = expanded
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: GROUP_ROW_H))
     }
@@ -379,7 +386,10 @@ final class GroupRowView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let w = bounds.width
-        let color = palette[vm.worst] ?? .gray
+        // 筛选态：组头的色与右侧数字都换成「被选中的那个状态」的命中情况，
+        // 没命中的组整体压暗，一眼能看出它跟当前筛选无关
+        let color = palette[highlight ?? vm.worst] ?? .gray
+        let badge = highlight == nil ? vm.open : vm.matched
 
         if hovered {
             rgb(0xC5DCFF, alpha: 0.10).setFill()
@@ -401,19 +411,19 @@ final class GroupRowView: NSView {
             chevron.line(to: NSPoint(x: cx + 1.5, y: cy))
             chevron.line(to: NSPoint(x: cx - 1.5, y: cy - 3))
         }
-        secondaryText.withAlphaComponent(vm.open > 0 ? 0.85 : 0.5).setStroke()
+        secondaryText.withAlphaComponent(badge > 0 ? 0.85 : 0.5).setStroke()
         chevron.stroke()
 
         // 组名 + 会话数（参考的 h3 样式：粗体标题 + 淡色计数）
         let name = vm.name.count > 10 ? String(vm.name.prefix(10)) + "…" : vm.name
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: mainText.withAlphaComponent(vm.open > 0 ? 0.95 : 0.55),
+            .foregroundColor: mainText.withAlphaComponent(badge > 0 ? 0.95 : 0.55),
         ]
         let nameSize = (name as NSString).size(withAttributes: attrs)
         (name as NSString).draw(at: NSPoint(x: 21, y: (GROUP_ROW_H - nameSize.height) / 2), withAttributes: attrs)
 
-        let countText = "\(vm.tasks.count) 个会话"
+        let countText = highlight == nil ? "\(vm.tasks.count) 个会话" : "\(vm.matched)/\(vm.tasks.count) 个会话"
         let cAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 10, weight: .regular),
             .foregroundColor: secondaryText.withAlphaComponent(0.75),
@@ -422,15 +432,15 @@ final class GroupRowView: NSView {
         (countText as NSString).draw(at: NSPoint(x: 21 + nameSize.width + 7, y: (GROUP_ROW_H - 11) / 2 + 1),
                                      withAttributes: cAttrs)
 
-        // 未处理数（在右侧，带状态色圆点）
-        let openText = "\(vm.open)"
+        // 未处理数 / 筛选命中数（在右侧，带状态色圆点）
+        let openText = "\(badge)"
         let oAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .bold),
-            .foregroundColor: color.withAlphaComponent(vm.open > 0 ? 1 : 0.35),
+            .foregroundColor: color.withAlphaComponent(badge > 0 ? 1 : 0.35),
         ]
         let ow = (openText as NSString).size(withAttributes: oAttrs).width
         (openText as NSString).draw(at: NSPoint(x: w - 14 - ow, y: (GROUP_ROW_H - 12) / 2 + 1), withAttributes: oAttrs)
-        color.withAlphaComponent(vm.open > 0 ? 1 : 0.35).setFill()
+        color.withAlphaComponent(badge > 0 ? 1 : 0.35).setFill()
         NSBezierPath(ovalIn: NSRect(x: w - 14 - ow - 8, y: GROUP_ROW_H / 2 - 2.5, width: 5, height: 5)).fill()
 
         // 组底部细线（参考的 --line），比进度条更贴近新皮肤
@@ -462,15 +472,18 @@ final class GroupRowView: NSView {
 final class TaskRowView: NSView {
     let item: TaskItem
     let unconfirmed: Bool
+    /// 当前筛选没命中它：按「已查看」的暗色画，但仍列出来（组内历史/其它状态）
+    let dimmed: Bool
     var checked: Bool
     var onClick: ((TaskItem) -> Void)?
     var onCheck: ((TaskItem, Bool) -> Void)?
     var onDeadline: ((TaskItem, Int?) -> Void)?
     private var hovered = false
 
-    init(item: TaskItem, width: CGFloat, checked: Bool, snapshotStale: Bool) {
+    init(item: TaskItem, width: CGFloat, checked: Bool, snapshotStale: Bool, dimmed: Bool = false) {
         self.item = item
         self.unconfirmed = item.stale == true || (snapshotStale && (item.status == "running" || item.status == "stuck"))
+        self.dimmed = dimmed
         self.checked = checked
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: TASK_ROW_H))
         self.toolTip = item.name
@@ -483,9 +496,9 @@ final class TaskRowView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let w = bounds.width
         let done = checked || item.status == "done"
-        let tone = unconfirmed ? "seen" : item.status
+        let tone = (unconfirmed || dimmed) ? "seen" : item.status
         let color = palette[tone] ?? secondaryText
-        let alpha: CGFloat = done || unconfirmed || item.status == "seen" ? 0.7 : 1
+        let alpha: CGFloat = done || unconfirmed || dimmed || item.status == "seen" ? 0.7 : 1
 
         // 一行 = 一块状态色玻璃板（参考里 .row 的 tint + 顶部高光 + 细边）
         let plate = NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 8, yRadius: 8)
@@ -646,21 +659,29 @@ final class PulseView: NSView {
         return message
     }
 
-    func visibleItems() -> [TaskItem] {
+    func baseItems() -> [TaskItem] {
         guard let p = payload else { return [] }
-        let base = showAll ? p.all : p.active
-        guard let f = filter else { return Array(base.prefix(p.window_limit ?? 10)) }
-        let hit = base.filter { it in
-            if it.status == f { return it.stale != true || f == "attention" }
-            // 已查看的归入它原来的状态（暗色）。但「进行中」是产能口径：
-            // 只列此刻真的在跑的行，保证数字与列表一致
-            if it.status == "seen" { return f != "running" && (it.prev ?? "running") == f }
-            return false
-        }
-        return Array(hit.prefix(16))
+        return showAll ? p.all : p.active
     }
 
-    func groups() -> [GroupVM] { makeGroups(visibleItems()) }
+    /// 真·处于该状态（有色行）。「已查看」只是暗色历史，不算命中
+    func isLive(_ it: TaskItem, _ f: String) -> Bool {
+        it.status == f && (it.stale != true || f == "attention")
+    }
+
+    /// 筛选时列表不再裁到命中项：全部的组都要留下来，
+    /// 命中与否交给行和组头去分色
+    func visibleItems() -> [TaskItem] {
+        let base = baseItems()
+        guard filter != nil else { return Array(base.prefix(payload?.window_limit ?? 10)) }
+        return base
+    }
+
+    func groups() -> [GroupVM] {
+        let items = visibleItems()
+        guard let f = filter else { return makeGroups(items) }
+        return makeGroups(items, matching: { self.isLive($0, f) })
+    }
 
     /// 没有任何真实分组时退化为平铺，避免整行只写「未分组」
     var flattened: Bool {
@@ -674,19 +695,23 @@ final class PulseView: NSView {
     /// 组默认只显示一行；有阻塞/待响应的组自动展开，突出需要关注的标签页
     func isOpenNamed(_ name: String) -> Bool {
         if closedGroups.contains(name) { return false }
-        // 按状态筛选时，命中的组一律展开，直接看到具体任务
-        if filter != nil { return true }
         if openGroups.contains(name) { return true }
         guard let g = groups().first(where: { $0.name == name }) else { return false }
+        // 筛选态：只展开真有会话处于该状态的组，其余组保持折叠但照样列出
+        if filter != nil { return g.matched > 0 }
         return g.worst == "stuck" || g.worst == "attention"
     }
 
     /// 手动展开的组显示全部任务；自动展开只显示卡住/待处理
     func tasksFor(_ g: GroupVM) -> [TaskItem] {
-        if filter != nil { return g.tasks }
-        if openGroups.contains(g.name) { return g.tasks }
-        // 自动展开：卡住/待处理为主，进行中与已查看也一并列出（已查看是暗色）
-        return g.tasks.filter { $0.status != "done" }
+        guard let f = filter else {
+            if openGroups.contains(g.name) { return g.tasks }
+            // 自动展开：卡住/待处理为主，进行中与已查看也一并列出（已查看是暗色）
+            return g.tasks.filter { $0.status != "done" }
+        }
+        // 筛选态：命中的组只漏出处于该状态的会话；手动展开的空组列全部（暗色）
+        let hit = g.tasks.filter { isLive($0, f) }
+        return Array((hit.isEmpty ? g.tasks : hit).prefix(16))
     }
 
     /// 点击头部计数：只看该状态的标签组与任务；再点一次恢复全部
@@ -701,10 +726,9 @@ final class PulseView: NSView {
     func layoutHeight() -> CGFloat {
         if compact { return COMPACT_CAPSULE_H + 12 }
         let h0 = HEADER_H + (statusMessage == nil ? 0 : 22)
-        let items = visibleItems()
         let gs = groups()
         if gs.isEmpty { return h0 + 34 }
-        if flattened { return h0 + CGFloat(items.count) * TASK_ROW_H + 8 }
+        if flattened { return h0 + CGFloat(gs[0].tasks.count) * TASK_ROW_H + 8 }
         var h = h0
         for g in gs {
             h += GROUP_ROW_H
@@ -781,9 +805,11 @@ final class PulseView: NSView {
         }
 
         if flattened {
+            // 没组的就是单独 agent 一行；筛选时没命中的行保持暗色但仍列出
             for item in gs[0].tasks {
                 let t = TaskRowView(item: item, width: bounds.width, checked: item.muted == true,
-                                    snapshotStale: unavailable)
+                                    snapshotStale: unavailable,
+                                    dimmed: filter.map { !isLive(item, $0) } ?? false)
                 t.frame = NSRect(x: 0, y: y, width: bounds.width, height: TASK_ROW_H)
                 t.onClick = { [weak self] it in self?.onOpen?(it) }
                 t.onCheck = { [weak self] it, on in self?.onCheck?(it, on) }
@@ -796,7 +822,7 @@ final class PulseView: NSView {
 
         for g in gs {
             let isOpen = isOpenNamed(g.name)
-            let row = GroupRowView(vm: g, width: bounds.width, expanded: isOpen)
+            let row = GroupRowView(vm: g, width: bounds.width, expanded: isOpen, highlight: filter)
             row.frame = NSRect(x: 0, y: y, width: bounds.width, height: GROUP_ROW_H)
             row.onToggle = { [weak self] vm in self?.toggle(group: vm.name) }
             addSubview(row)
@@ -805,7 +831,8 @@ final class PulseView: NSView {
             guard isOpen else { continue }
             for item in tasksFor(g) {
                 let t = TaskRowView(item: item, width: bounds.width, checked: item.muted == true,
-                                    snapshotStale: unavailable)
+                                    snapshotStale: unavailable,
+                                    dimmed: filter.map { !isLive(item, $0) } ?? false)
                 t.frame = NSRect(x: 0, y: y, width: bounds.width, height: TASK_ROW_H)
                 t.onClick = { [weak self] it in self?.onOpen?(it) }
                 t.onCheck = { [weak self] it, on in self?.onCheck?(it, on) }
