@@ -863,6 +863,8 @@ def view(state: dict) -> dict:
         "events": list(_events),
         "stuck_seconds": stuck,
         "window_limit": limit,
+        "extension": {"at": _tab_report_at,
+                      "ok": bool(_tab_report_at) and stamp - _tab_report_at < 180_000},
         "tasks": active[:limit],
         "active": active,
         "all": rows,
@@ -880,6 +882,8 @@ _tab_groups: dict[str, str] = {}
 _tab_ids: dict[str, int] = {}       # conversationId -> 扩展给的 tabId，切标签时免查询
 # 用户此刻正停留在哪个会话的标签页上（窗口聚焦才算）
 _active_tab = {"cid": None, "focused": False, "ts": 0}
+# 扩展最近一次上报的时刻：初装引导靠它判断「装好了没有」
+_tab_report_at = 0
 
 
 def watching(cid: str, act: dict) -> bool:
@@ -913,6 +917,8 @@ def save_active(act: dict) -> None:
 
 def ingest_tabs(payload: dict) -> int:
     """payload.tabs = [{url, group, tabId}]，按 URL 里的 conversationId 建映射。"""
+    global _tab_report_at
+    _tab_report_at = now_ms()
     act = payload.get("active") or {}
     aurl = act.get("url") or ""
     am = re.search(r"[?&]conversationId=(\d+)", aurl)

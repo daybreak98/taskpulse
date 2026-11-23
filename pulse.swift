@@ -203,12 +203,6 @@ func drawRowPlate(_ path: NSBezierPath, _ status: String?, progress: Double = 0)
             (glow.withAlphaComponent(0.34), 1.0)) {
             g.draw(in: bar, angle: 0)
         }
-        // 前沿压一条亮边，位置一眼可读
-        if pct < 1 {
-            rgb(0xF4FCFF, alpha: 0.7).setFill()
-            NSBezierPath(rect: NSRect(x: bar.maxX - 1.5, y: b.minY,
-                                      width: 1.5, height: b.height)).fill()
-        }
     }
     // 明暗扩散：左上提亮、右下压暗，斜向拉一层，避免每行像一块平涂色卡
     if let g = NSGradient(colorsAndLocations:
@@ -1132,6 +1126,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] e in
             self?.endDrag("mouseUp")
             return e
+        }
+        // 全新安装首次启动：先带一遍扩展安装引导
+        if OnboardingController.shouldShow {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                OnboardingController.shared.show()
+            }
         }
     }
 

@@ -28,12 +28,16 @@ if [ -z "$UV_BIN" ]; then
 fi
 echo "-- uv: $UV_BIN"
 
-# ---------- 2. 配置：包内带配置就沿用，否则问三个问题 ----------
+# ---------- 2. 配置：包内自带就直接用，不再提问 ----------
 mkdir -p "$HOME/.taskpulse"
 
 # 团队内部包会把 config.json 放在安装包根目录（该文件不入库）
 CFG_READY=0
-if [ ! -f "$CONFIG" ] && [ -f "./config.json" ]; then
+if [ -f "./config.json" ]; then
+  if [ -f "$CONFIG" ]; then
+    BAK="$CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$CONFIG" "$BAK" && echo "-- 旧配置已备份：$BAK"
+  fi
   cp "./config.json" "$CONFIG"
   echo "-- 使用安装包内自带的配置：$CONFIG"
   CFG_READY=1
@@ -250,11 +254,24 @@ cat > "$AGENTS/com.taskpulse.ui.plist" <<PLIST
 </plist>
 PLIST
 
-# ---------- 6. 启动 ----------
+# ---------- 6. 预热依赖（首次要联网装一次，提前跑完更省心）----------
+echo "-- 检查运行依赖（首次会联网安装，约 30 秒）..."
+UV_PREHEAT=()
+while IFS= read -r ARG; do
+  [ -n "$ARG" ] && UV_PREHEAT+=("$ARG")
+done < <( [ -f "./uv-args.txt" ] && cat ./uv-args.txt )
+"$UV_BIN" run --quiet --no-project "${UV_PREHEAT[@]}" python -c "print('   -> 依赖就绪')" || {
+  echo "!! 依赖安装失败（多见于公司网络未连内网）。装好后重跑本脚本即可。"
+}
+
+# ---------- 7. 启动 ----------
 if [ "${TP_DRY:-}" = "1" ]; then
   echo "-- 干跑模式：跳过 launchctl / open"
   exit 0
 fi
+
+# 全新安装要让 App 弹一次浏览器扩展引导
+defaults delete com.hyj.taskpulse onboarded 2>/dev/null || true
 
 launchctl bootout "gui/$(id -u)/com.taskpulse.poller" 2>/dev/null
 launchctl bootout "gui/$(id -u)/com.taskpulse.ui" 2>/dev/null
@@ -270,19 +287,20 @@ else
   echo "-- 后台服务还没起来，看日志: $LOGS/taskpulse.poll.err"
 fi
 
-open -R "$HOME/Applications/$APP_NAME.app" 2>/dev/null
-
 cat <<TIPS
 
-===== 还需要手动完成的 2 步 =====
-1) 浏览器扩展
-   打开 Edge -> edge://extensions -> 打开「开发人员模式」-> 「加载解压缩的扩展」
-   选择目录：$DEST/edge-ext
-   （扩展只上报标签页标题与组名，只允许访问 127.0.0.1；页面访问范围：${TP_SCOPE:-未配置}）
+===== 接下来只需 2 步（窗口里会带你走）=====
+1) 右上角小窗会弹一个「装浏览器扩展」的引导：选 Edge 或 Chrome，
+   它会把扩展页打开、把目录递给你，点「检查一下」自动确认。
 
-2) 首次授权
-   第一次点任务行跳转时，系统会弹「TaskPulse 想要控制 Microsoft Edge」，点「允许」。
-   若服务需要登录，按日志提示完成一次即可。
+2) 首次点任务行跳转时，系统会弹「TaskPulse 想要控制浏览器」，点「允许」。
+   数据服务用的是你浏览器里已登录的账号，不用另填 token。
+
+扩展只读标签页标题与标签组名，只发 127.0.0.1；页面访问范围：${TP_SCOPE:-未配置}
+扩展目录：$DEST/edge-ext
+
+想重新走一遍引导：
+  defaults delete com.hyj.taskpulse onboarded; launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 
 想要卸载：运行 uninstall.command
 TIPS
