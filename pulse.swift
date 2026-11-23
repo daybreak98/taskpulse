@@ -120,7 +120,7 @@ struct CapsuleTone {
     let highlight: NSColor
 }
 /// 色块默认亮度与高光亮度统一的提亮倍数（1 = 原样，2 = 视觉亮度翻倍）
-let capsuleBrightness: CGFloat = 2
+let capsuleBrightness: CGFloat = 1.2
 
 /// 线性光空间里按倍数提亮：感知亮度真的翻倍，同时保住色相
 /// （直接在 sRGB 上乘系数会偏色、往白里塌）
@@ -146,7 +146,8 @@ func capsuleTone(_ fill: NSColor, _ highlight: NSColor) -> CapsuleTone {
 }
 
 let capsuleTones: [String: CapsuleTone] = [
-    "running": capsuleTone(rgb(0x4E8BAC), rgb(0x76BADE, alpha: 0xA8 / 255.0)),
+    // 运行中偏蓝（色相约 211°），别被提亮带成青色；蓝相亮度天然偏低，底色配高一档
+    "running": capsuleTone(rgb(0x4C83BB), rgb(0x78B2F0, alpha: 0xA8 / 255.0)),
     "attention": capsuleTone(rgb(0x9B926F), rgb(0xE5BD69, alpha: 0xCC / 255.0)),
     "stuck": capsuleTone(rgb(0xA5707A), rgb(0xEFA8AF, alpha: 0xA8 / 255.0)),
 ]
