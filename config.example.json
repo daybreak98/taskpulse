@@ -50,6 +50,7 @@
   "ui": {
     "port": 8899
   },
+  "source": "api",
   "extension": {
     "scope": ""
   },

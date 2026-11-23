@@ -62,11 +62,24 @@ defaults delete com.taskpulse.ui onboarded
 launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 ```
 
-扩展只做两件事：上报目标站点标签页的标题 / 分组名 / 标签 id，以及执行「切到某个标签」的命令。
-它只允许访问 `127.0.0.1`，不读取页面内容、不外传数据。
-站点范围由安装脚本按 `config.json` 里的 `extension.scope` 写进 `edge-ext/config.js`，
-`manifest.json` 的 `host_permissions` 也只放 `127.0.0.1`——不声明 `<all_urls>`。
+扩展做两件事：上报目标站点标签页的标题 / 分组名 / 标签 id、执行「切到某个标签」的命令；
+另外可选地在页面里用**你自己的登录态**读一次会话状态（见下方「取数来源」）。
+它只允许访问 `127.0.0.1` 和你配置的那个站点，不读取页面内容、不外传数据。
+站点范围由安装脚本按 `config.json` 里的 `extension.scope` 生成 `edge-ext/config.js` 与
+`edge-ext/manifest.json`（仓库里只有中性的 `manifest.template.json`，不含任何域名）。
 **所以改完配置要重新运行一次 `install.command`，然后在扩展页点一次 ⟳。**
+
+### 取数来源：API / WEB
+
+展开面板顶部计数行右侧有个 `API` / `WEB` 开关，也可以改 `config.json` 的 `source`：
+
+| 来源 | 怎么取数 | 什么时候选它 |
+| --- | --- | --- |
+| `api` | 本机用 `auth` 配置直连接口 | 默认。机器上有可用凭据时最省事 |
+| `web` | 浏览器里开着的页面用自己的 cookie 取，扩展把结果报给本机 | 本机凭据过期 / 不想配凭据时 |
+
+`web` 模式依赖至少一个目标站点标签页开着（扩展不保活，也不会替你开页面）；
+页面关掉后界面会显示「浏览器里的页面没有上报数据」。
 
 > 为什么不做成全自动？macOS 上的 Chromium 只接受商店来源的静默安装
 > （本地 crx 的 External Extensions 通道实测不生效），装解压缩目录必须由人点一次。
