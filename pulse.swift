@@ -34,6 +34,8 @@ let GROUP_ROW_H: CGFloat = 26
 let TASK_ROW_H: CGFloat = 28
 let HEADER_H: CGFloat = 28
 let COMPACT_W: CGFloat = 44
+/// 收起态三段计数胶囊的总高（与原来三个徽章占的高度一致）
+let COMPACT_CAPSULE_H: CGFloat = 72
 let EDGE_SNAP: CGFloat = 26
 let ANIM = 0.06
 
@@ -88,20 +90,64 @@ func rgb(_ value: UInt32, alpha: CGFloat = 1) -> NSColor {
             blue: CGFloat(value & 0xff) / 255, alpha: alpha)
 }
 
+// ── 冷蓝灰磨砂皮肤 ────────────────────────────────────────────────
+// 色值与图层顺序取自 AgentPulse-glass 参考：底板 --glass-rgb 51 77 95，
+// --glass-transparency .10（即底板不透明度 90%），再叠一层高光渐变与 20px 背后的模糊。
+
+let glassRGB: UInt32 = 0x334D5F
+let glassTransparency: CGFloat = 0.10
+let glassRadius: CGFloat = 16
+/// 面板/提示条的边框与内高光（参考里的 --glass-border 与 inset shadow）
+let glassBorder = rgb(0xD2E8F4, alpha: 0.49)
+let glassInset = rgb(0xE7F7FF, alpha: 0.21)
+/// 分隔线（--line #d5effc42）
+let hairline = rgb(0xD5EFFC, alpha: 0.26)
+
 let palette: [String: NSColor] = [
-    "running": rgb(0x74AEFF),
-    "attention": rgb(0xF6BD68),
-    "stuck": rgb(0xFF8580),
-    "seen": rgb(0x93A9C6),
-    "done": rgb(0x62D8AD),
+    "running": rgb(0x66A7CC),
+    "attention": rgb(0xD6B675),
+    "stuck": rgb(0xDF9A9D),
+    "seen": rgb(0x8EA5B3),
+    "done": rgb(0x64BC9D),
 ]
-/// 毛玻璃蒙层的不透明度：0.84 是原来「几乎实心」的观感，每减小 0.05 就更透一档。
-/// 0.60 = 在原基础上多透 25 个百分点，模糊还在，字也不会发白。
-let glassAlpha: CGFloat = 0.60
-let panelTint = rgb(0x101726, alpha: glassAlpha)
-let toastTint = rgb(0x182337, alpha: glassAlpha)
-let mainText = rgb(0xEDF3FC)
-let secondaryText = rgb(0xA7B8D1)
+/// 计数胶囊里「0」用的低饱和色（参考的 --pulse-blue-zero / --pulse-zero）
+let paletteZero: [String: NSColor] = ["running": rgb(0x8EABBD), "zero": rgb(0x8EA5B3)]
+/// 胶囊数字的墨色
+let countInk = rgb(0x142B3A)
+
+let panelTint = rgb(glassRGB, alpha: 1 - glassTransparency)
+let toastTint = rgb(glassRGB, alpha: 1 - glassTransparency)
+let mainText = rgb(0xF6FBFF)
+let secondaryText = rgb(0xC2CEE0)
+
+/// 行底色按状态：蓝=运行、琥珀=待处理、珊瑚=阻塞、青绿=完成、灰蓝=未知
+func rowTint(_ status: String?) -> NSColor {
+    switch status {
+    case "running": return rgb(0x4D9ACF, alpha: 0.33)
+    case "attention": return rgb(0xCDA766, alpha: 0.33)
+    case "stuck": return rgb(0xD97E8A, alpha: 0.34)
+    case "done": return rgb(0x64BC9D, alpha: 0.27)
+    default: return rgb(0xAEBDCA, alpha: 0.23)
+    }
+}
+
+/// 一行底色：状态色 + 顶部一层极淡的高光（参考里的 linear-gradient(174deg, …)）
+func drawRowPlate(_ path: NSBezierPath, _ status: String?) {
+    rowTint(status).setFill()
+    path.fill()
+    NSGraphicsContext.saveGraphicsState()
+    path.setClip()
+    if let g = NSGradient(starting: rgb(0xE3F5FF, alpha: 0.07),
+                          ending: rgb(0xE3F5FF, alpha: 0.0)) {
+        g.draw(in: NSRect(x: path.bounds.minX, y: path.bounds.minY,
+                          width: path.bounds.width, height: path.bounds.height * 0.72),
+               angle: -90)
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    rgb(0xD8F1FC, alpha: 0.16).setStroke()
+    path.lineWidth = 0.5
+    path.stroke()
+}
 // 越靠前越严重
 let severity: [String: Int] = ["stuck": 3, "attention": 2, "running": 1, "seen": 0, "done": 0]
 
@@ -156,50 +202,118 @@ func makeGroups(_ items: [TaskItem]) -> [GroupVM] {
 
 // MARK: - 计数胶囊（可点击筛选）
 
-final class BadgeView: NSView {
-    var kind = "running"
-    var value: Int? = 0 { didSet { needsDisplay = true } }
-    /// 当前正在按这个状态筛选
-    var active = false { didSet { needsDisplay = true } }
-    var onClick: (() -> Void)?
+/// 参考皮肤的 2 / 1 / 0 胶囊：一整条圆角药丸，按段上色，数字用深墨色。
+/// 收起态竖着排（贴屏幕边缘的细条），展开态横着排在标题行里；点某一段按该状态筛选。
+final class CapsuleView: NSView {
+    /// 每段：(状态 key, 数值)，数值 nil 表示取数不可用
+    var segments: [(key: String, value: Int?)] = [] { didSet { needsDisplay = true } }
+    var vertical = true { didSet { needsDisplay = true } }
+    /// 正在按哪个状态筛选（该段描边加亮）
+    var activeKind: String? { didSet { needsDisplay = true } }
+    var onPick: ((String) -> Void)?
 
     override var isFlipped: Bool { true }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        onClick == nil ? nil : super.hitTest(point)
+        onPick == nil ? nil : super.hitTest(point)
+    }
+
+    private func segmentRect(_ i: Int) -> NSRect {
+        let n = max(1, segments.count)
+        let h = bounds.height / CGFloat(n)
+        let w = bounds.width / CGFloat(n)
+        return vertical ? NSRect(x: 0, y: CGFloat(i) * h, width: bounds.width, height: h)
+                        : NSRect(x: CGFloat(i) * w, y: 0, width: w, height: bounds.height)
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let hasData = (value ?? 0) > 0
-        let color = palette[kind] ?? .gray
-        let r = NSRect(x: 0.75, y: 0.75, width: bounds.width - 1.5, height: bounds.height - 1.5)
-        let path = NSBezierPath(roundedRect: r, xRadius: 5, yRadius: 5)
+        guard !segments.isEmpty else { return }
 
-        let emphasized = active && value != nil
-        let tinted = emphasized || hasData
-        let fill = tinted ? color.withAlphaComponent(emphasized ? 0.23 : 0.15)
-                          : secondaryText.withAlphaComponent(0.09)
-        fill.setFill()
-        path.fill()
-        if tinted {
-            color.withAlphaComponent(emphasized ? 0.95 : 0.45).setStroke()
-            path.lineWidth = emphasized ? 1.2 : 0.65
+        // 外框是深蓝灰圆角矩形，色块缩在里面——不做成整条椭圆，
+        // 这样竖排时像「一节电池」，横排时像参考里那条药丸。
+        let pad: CGFloat = vertical ? 3.5 : 2
+        let outerRadius: CGFloat = vertical ? 13 : 9
+        let shellRect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let shell = NSBezierPath(roundedRect: shellRect, xRadius: outerRadius, yRadius: outerRadius)
+        rgb(0x435B6C, alpha: 0.96).setFill()
+        shell.fill()
+
+        // 内圈：状态色块都画在这一块里，自动获得圆角
+        let innerRect = bounds.insetBy(dx: pad, dy: pad)
+        let innerRadius = max(2, outerRadius - pad)
+        let inner = NSBezierPath(roundedRect: innerRect, xRadius: innerRadius, yRadius: innerRadius)
+
+        NSGraphicsContext.saveGraphicsState()
+        inner.setClip()
+        let n = max(1, segments.count)
+        let cellH = innerRect.height / CGFloat(n)
+        let cellW = innerRect.width / CGFloat(n)
+        for (i, seg) in segments.enumerated() {
+            let cell = vertical
+                ? NSRect(x: innerRect.minX, y: innerRect.minY + CGFloat(i) * cellH,
+                         width: innerRect.width, height: cellH)
+                : NSRect(x: innerRect.minX + CGFloat(i) * cellW, y: innerRect.minY,
+                         width: cellW, height: innerRect.height)
+            let zero = (seg.value ?? 0) == 0
+            let base = (zero ? paletteZero[seg.key] : palette[seg.key]) ?? paletteZero["zero"]!
+            base.setFill()
+            NSBezierPath(rect: cell).fill()
+            // 每格一层柔光，做出玻璃泡的厚度
+            if let g = NSGradient(starting: rgb(0xFFFFFF, alpha: 0.18),
+                                  ending: rgb(0x20475B, alpha: 0.12)) {
+                g.draw(in: cell, angle: vertical ? 90 : -90)
+            }
+            if i > 0 {
+                rgb(0xD7EAF3, alpha: 0.20).setFill()
+                if vertical {
+                    NSBezierPath(rect: NSRect(x: cell.minX, y: cell.minY, width: cell.width, height: 0.75)).fill()
+                } else {
+                    NSBezierPath(rect: NSRect(x: cell.minX, y: cell.minY, width: 0.75, height: cell.height)).fill()
+                }
+            }
+            let text = seg.value.map { String($0) } ?? "–"
+            let fontSize: CGFloat = vertical ? 14 : 10.5
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .bold),
+                .foregroundColor: countInk,
+            ]
+            let size = (text as NSString).size(withAttributes: attrs)
+            (text as NSString).draw(at: NSPoint(x: cell.midX - size.width / 2,
+                                                y: cell.midY - size.height / 2),
+                                    withAttributes: attrs)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        // 色块外的一圈细亮边 + 外框描边
+        rgb(0xD6EBF5, alpha: 0.38).setStroke()
+        inner.lineWidth = 0.75
+        inner.stroke()
+        rgb(0xBBD5E4, alpha: 0.40).setStroke()
+        shell.lineWidth = 0.75
+        shell.stroke()
+
+        // 选中的那一段加一圈内亮边
+        if let kind = activeKind, let i = segments.firstIndex(where: { $0.key == kind }) {
+            let cell = (vertical
+                ? NSRect(x: innerRect.minX, y: innerRect.minY + CGFloat(i) * cellH,
+                         width: innerRect.width, height: cellH)
+                : NSRect(x: innerRect.minX + CGFloat(i) * cellW, y: innerRect.minY,
+                         width: cellW, height: innerRect.height)).insetBy(dx: 1, dy: 1)
+            let path = NSBezierPath(roundedRect: cell, xRadius: 6, yRadius: 6)
+            rgb(0xF1FBFF, alpha: 0.75).setStroke()
+            path.lineWidth = 1
             path.stroke()
         }
-
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .bold),
-            .foregroundColor: tinted ? color : secondaryText.withAlphaComponent(0.75),
-        ]
-        let s = (value.map { String($0) } ?? "–") as NSString
-        let size = s.size(withAttributes: attrs)
-        s.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2),
-               withAttributes: attrs)
     }
 
     override func mouseDown(with event: NSEvent) {
-        guard event.clickCount == 1 else { return }
-        onClick?()
+        guard event.clickCount == 1, let onPick else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        for (i, seg) in segments.enumerated() where segmentRect(i).contains(p) {
+            onPick(seg.key)
+            return
+        }
+        if let first = segments.first { onPick(first.key) }
     }
 
     /// 非激活面板上首次点击也要能响应
@@ -263,53 +377,64 @@ final class GroupRowView: NSView {
         let color = palette[vm.worst] ?? .gray
 
         if hovered {
-            NSColor.white.withAlphaComponent(0.07).setFill()
-            NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 5, yRadius: 5).fill()
+            rgb(0xC5DCFF, alpha: 0.10).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 6, dy: 1.5), xRadius: 7, yRadius: 7).fill()
         }
 
-        // 展开三角
-        let tri = NSBezierPath()
+        // 展开箭头（参考里 .chevron 的细线条，不用实心三角）
         let cx: CGFloat = 12, cy = GROUP_ROW_H / 2
+        let chevron = NSBezierPath()
+        chevron.lineWidth = 1.3
+        chevron.lineCapStyle = .round
+        chevron.lineJoinStyle = .round
         if expanded {
-            tri.move(to: NSPoint(x: cx - 3.5, y: cy - 2))
-            tri.line(to: NSPoint(x: cx + 3.5, y: cy - 2))
-            tri.line(to: NSPoint(x: cx, y: cy + 2.5))
+            chevron.move(to: NSPoint(x: cx - 3, y: cy + 1))
+            chevron.line(to: NSPoint(x: cx, y: cy - 2))
+            chevron.line(to: NSPoint(x: cx + 3, y: cy + 1))
         } else {
-            tri.move(to: NSPoint(x: cx - 2, y: cy - 3.5))
-            tri.line(to: NSPoint(x: cx - 2, y: cy + 3.5))
-            tri.line(to: NSPoint(x: cx + 2.5, y: cy))
+            chevron.move(to: NSPoint(x: cx - 1.5, y: cy + 3))
+            chevron.line(to: NSPoint(x: cx + 1.5, y: cy))
+            chevron.line(to: NSPoint(x: cx - 1.5, y: cy - 3))
         }
-        tri.close()
-        NSColor.white.withAlphaComponent(0.4).setFill()
-        tri.fill()
+        secondaryText.withAlphaComponent(vm.open > 0 ? 0.85 : 0.5).setStroke()
+        chevron.stroke()
 
-        // 组名
+        // 组名 + 会话数（参考的 h3 样式：粗体标题 + 淡色计数）
+        let name = vm.name.count > 10 ? String(vm.name.prefix(10)) + "…" : vm.name
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: NSColor.white.withAlphaComponent(vm.open > 0 ? 0.88 : 0.45),
+            .foregroundColor: mainText.withAlphaComponent(vm.open > 0 ? 0.95 : 0.55),
         ]
-        let name = vm.name.count > 12 ? String(vm.name.prefix(12)) + "…" : vm.name
         let nameSize = (name as NSString).size(withAttributes: attrs)
-        (name as NSString).draw(at: NSPoint(x: 22, y: (GROUP_ROW_H - nameSize.height) / 2), withAttributes: attrs)
+        (name as NSString).draw(at: NSPoint(x: 21, y: (GROUP_ROW_H - nameSize.height) / 2), withAttributes: attrs)
 
-        // 组状态点 + 未处理数
-        let countText = "\(vm.open)"
+        let countText = "\(vm.tasks.count) 个会话"
         let cAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .bold),
-            .foregroundColor: color.withAlphaComponent(vm.open > 0 ? 1 : 0.3),
+            .font: NSFont.systemFont(ofSize: 10, weight: .regular),
+            .foregroundColor: secondaryText.withAlphaComponent(0.75),
         ]
         let cw = (countText as NSString).size(withAttributes: cAttrs).width
-        (countText as NSString).draw(at: NSPoint(x: w - 14 - cw, y: (GROUP_ROW_H - 12) / 2 + 1), withAttributes: cAttrs)
-        color.withAlphaComponent(vm.open > 0 ? 1 : 0.3).setFill()
-        NSBezierPath(ovalIn: NSRect(x: w - 14 - cw - 9, y: GROUP_ROW_H / 2 - 2.5, width: 5, height: 5)).fill()
+        (countText as NSString).draw(at: NSPoint(x: 21 + nameSize.width + 7, y: (GROUP_ROW_H - 11) / 2 + 1),
+                                     withAttributes: cAttrs)
 
-        // 聚合进度条（细，贴底）
-        NSColor.white.withAlphaComponent(0.07).setFill()
-        NSBezierPath(roundedRect: NSRect(x: 22, y: GROUP_ROW_H - 3, width: w - 44, height: 1.5), xRadius: 0.75, yRadius: 0.75).fill()
+        // 未处理数（在右侧，带状态色圆点）
+        let openText = "\(vm.open)"
+        let oAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .bold),
+            .foregroundColor: color.withAlphaComponent(vm.open > 0 ? 1 : 0.35),
+        ]
+        let ow = (openText as NSString).size(withAttributes: oAttrs).width
+        (openText as NSString).draw(at: NSPoint(x: w - 14 - ow, y: (GROUP_ROW_H - 12) / 2 + 1), withAttributes: oAttrs)
+        color.withAlphaComponent(vm.open > 0 ? 1 : 0.35).setFill()
+        NSBezierPath(ovalIn: NSRect(x: w - 14 - ow - 8, y: GROUP_ROW_H / 2 - 2.5, width: 5, height: 5)).fill()
+
+        // 组底部细线（参考的 --line），比进度条更贴近新皮肤
+        hairline.withAlphaComponent(0.5).setFill()
+        NSBezierPath(rect: NSRect(x: 21, y: GROUP_ROW_H - 0.5, width: w - 42, height: 0.5)).fill()
         let pct = CGFloat(min(max(vm.progress, 0), 1))
         if pct > 0 {
-            color.withAlphaComponent(0.55).setFill()
-            NSBezierPath(roundedRect: NSRect(x: 22, y: GROUP_ROW_H - 3, width: max((w - 44) * pct, 1.5), height: 1.5),
+            color.withAlphaComponent(0.75).setFill()
+            NSBezierPath(roundedRect: NSRect(x: 21, y: GROUP_ROW_H - 1.5, width: max((w - 42) * pct, 1.5), height: 1.5),
                          xRadius: 0.75, yRadius: 0.75).fill()
         }
     }
@@ -353,27 +478,31 @@ final class TaskRowView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let w = bounds.width
         let done = checked || item.status == "done"
-        let color = palette[unconfirmed ? "seen" : item.status] ?? secondaryText
-        let alpha: CGFloat = done || unconfirmed || item.status == "seen" ? 0.68 : 1
+        let tone = unconfirmed ? "seen" : item.status
+        let color = palette[tone] ?? secondaryText
+        let alpha: CGFloat = done || unconfirmed || item.status == "seen" ? 0.7 : 1
 
+        // 一行 = 一块状态色玻璃板（参考里 .row 的 tint + 顶部高光 + 细边）
+        let plate = NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 8, yRadius: 8)
+        drawRowPlate(plate, tone)
         if hovered {
-            NSColor.white.withAlphaComponent(0.075).setFill()
-            NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 5, yRadius: 5).fill()
+            rgb(0xF4FAFF, alpha: 0.10).setFill()
+            plate.fill()
         }
 
         color.withAlphaComponent(alpha).setFill()
-        NSBezierPath(ovalIn: NSRect(x: 26, y: TASK_ROW_H / 2 - 3, width: 6, height: 6)).fill()
+        NSBezierPath(ovalIn: NSRect(x: 13, y: TASK_ROW_H / 2 - 3, width: 6, height: 6)).fill()
 
         let meta = metaText()
         let metaAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular),
-            .foregroundColor: item.overdue ? palette["stuck"]! : secondaryText.withAlphaComponent(0.9 * alpha),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium),
+            .foregroundColor: item.overdue ? palette["stuck"]! : secondaryText.withAlphaComponent(0.92 * alpha),
         ]
         let metaW = (meta as NSString).size(withAttributes: metaAttrs).width
         (meta as NSString).draw(at: NSPoint(x: w - 34 - metaW, y: TASK_ROW_H / 2 - 5.5), withAttributes: metaAttrs)
 
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
+            .font: NSFont.systemFont(ofSize: 11.5, weight: .medium),
             .foregroundColor: mainText.withAlphaComponent(alpha),
             .strikethroughStyle: done ? 1 : 0,
         ]
@@ -384,13 +513,13 @@ final class TaskRowView: NSView {
             title = middleEllipsis(title, maxWidth: avail, attrs: attrs)
             size = (title as NSString).size(withAttributes: attrs)
         }
-        (title as NSString).draw(at: NSPoint(x: 34, y: (TASK_ROW_H - size.height) / 2), withAttributes: attrs)
+        (title as NSString).draw(at: NSPoint(x: 24, y: (TASK_ROW_H - size.height) / 2), withAttributes: attrs)
 
         // 勾选框
         let r = checkboxRect
         let path = NSBezierPath(roundedRect: r, xRadius: 3.5, yRadius: 3.5)
         if done {
-            (item.status == "done" ? palette["done"]! : color).withAlphaComponent(0.75).setStroke()
+            (item.status == "done" ? palette["done"]! : color).withAlphaComponent(0.85).setStroke()
             path.lineWidth = 1.2
             path.stroke()
             let check = NSBezierPath()
@@ -402,18 +531,16 @@ final class TaskRowView: NSView {
             (item.status == "done" ? palette["done"]! : color).setStroke()
             check.stroke()
         } else {
-            NSColor.white.withAlphaComponent(0.28).setStroke()
+            rgb(0xE6F4FF, alpha: 0.32).setStroke()
             path.lineWidth = 1.1
             path.stroke()
         }
 
-        // 进度条
+        // 进度条：贴着玻璃板下沿
         let pct = CGFloat(min(max(item.progress, 0), 1))
-        NSColor.white.withAlphaComponent(0.07).setFill()
-        NSBezierPath(roundedRect: NSRect(x: 35, y: TASK_ROW_H - 4, width: w - 62, height: 1.5), xRadius: 0.75, yRadius: 0.75).fill()
         if pct > 0 {
-            color.withAlphaComponent(0.7 * alpha).setFill()
-            NSBezierPath(roundedRect: NSRect(x: 35, y: TASK_ROW_H - 4, width: max((w - 62) * pct, 1.5), height: 1.5),
+            color.withAlphaComponent(0.75 * alpha).setFill()
+            NSBezierPath(roundedRect: NSRect(x: 13, y: bounds.height - 3.5, width: (w - 30) * pct, height: 1.5),
                          xRadius: 0.75, yRadius: 0.75).fill()
         }
     }
@@ -567,7 +694,7 @@ final class PulseView: NSView {
     }
 
     func layoutHeight() -> CGFloat {
-        if compact { return 3 * 24 + 12 }
+        if compact { return COMPACT_CAPSULE_H + 12 }
         let h0 = HEADER_H + (statusMessage == nil ? 0 : 22)
         let items = visibleItems()
         let gs = groups()
@@ -592,15 +719,18 @@ final class PulseView: NSView {
     private func rebuildCompact() {
         let unavailable = countersUnavailable
         let counts = payload?.counts
-        let items = [("running", counts?.running), ("attention", counts?.attention), ("stuck", counts?.stuck)]
-        for (i, pair) in items.enumerated() {
-            let y = CGFloat(6 + i * 24)
-            let badge = BadgeView(frame: NSRect(x: 5, y: y, width: COMPACT_W - 10, height: 20))
-            badge.kind = pair.0
-            badge.value = unavailable ? nil : pair.1
-            badge.toolTip = statusDetail
-            addSubview(badge)
-        }
+        let segments = [("running", counts?.running), ("attention", counts?.attention), ("stuck", counts?.stuck)]
+            .map { (key: $0.0, value: unavailable ? nil : $0.1) }
+
+        // 三段计数块：外框是深蓝灰圆角矩形，色块缩在里面
+        let capsule = CapsuleView(frame: NSRect(x: 2, y: 2, width: COMPACT_W - 4,
+                                                height: layoutHeight() - 4))
+        capsule.segments = segments
+        capsule.vertical = true
+        capsule.activeKind = filter
+        capsule.toolTip = statusDetail
+        capsule.onPick = { [weak self] kind in self?.toggleFilter(kind) }
+        addSubview(capsule)
 
         if statusMessage != nil {
             let bar = NSView(frame: NSRect(x: 0, y: 0, width: COMPACT_W, height: 3))
@@ -693,18 +823,25 @@ final class PulseView: NSView {
     }
 
     private func addHeader(counters: Counts?) {
-        var x: CGFloat = 10
+        // 计数胶囊：横排三段，占原来三个徽章的位置；点哪段就按该状态筛选
         if let c = counters {
-            for (key, value, tip) in [("running", c.running, "进行中"),
-                                      ("attention", c.attention, "待我处理"),
-                                      ("stuck", c.stuck, "卡住")] {
-                x = addBadge(key: key, value: value, tip: tip, x: x)
-            }
+            let capH: CGFloat = 18
+            let capW: CGFloat = 78
+            let cap = CapsuleView(frame: NSRect(x: 10, y: (HEADER_H - capH) / 2,
+                                                width: capW, height: capH))
+            cap.segments = [("running", countersUnavailable ? nil : c.running),
+                            ("attention", countersUnavailable ? nil : c.attention),
+                            ("stuck", countersUnavailable ? nil : c.stuck)]
+            cap.vertical = false
+            cap.activeKind = filter
+            cap.toolTip = filter == nil ? "点数字只看该类任务" : "再点一次显示全部"
+            cap.onPick = { [weak self] kind in self?.toggleFilter(kind) }
+            addSubview(cap)
         }
 
         let chevron = NSTextField(labelWithString: showAll ? "⌃" : "⌄")
         chevron.font = .systemFont(ofSize: 11, weight: .semibold)
-        chevron.textColor = secondaryText.withAlphaComponent(0.6)
+        chevron.textColor = secondaryText.withAlphaComponent(0.75)
         chevron.alignment = .center
         chevron.frame = NSRect(x: bounds.width - 24, y: 6, width: 14, height: 14)
         addSubview(chevron)
@@ -717,24 +854,8 @@ final class PulseView: NSView {
 
         let sep = NSView(frame: NSRect(x: 10, y: HEADER_H - 0.5, width: bounds.width - 20, height: 0.5))
         sep.wantsLayer = true
-        sep.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.07).cgColor
+        sep.layer?.backgroundColor = hairline.cgColor
         addSubview(sep)
-    }
-
-    /// 点击计数胶囊按该状态筛选
-    private func addBadge(key: String, value: Int, tip: String, x: CGFloat) -> CGFloat {
-        let w: CGFloat = value > 99 ? 30 : 24
-        let h: CGFloat = 18
-        let y = (HEADER_H - h) / 2
-
-        let badge = BadgeView(frame: NSRect(x: x, y: y, width: w, height: h))
-        badge.kind = key
-        badge.value = countersUnavailable ? nil : value
-        badge.active = (filter == key)
-        badge.toolTip = filter == key ? "再点一次显示全部" : "只看\(tip)"
-        badge.onClick = { [weak self] in self?.toggleFilter(key) }
-        addSubview(badge)
-        return x + w + 6
     }
 
     // 自绘拖拽：不用系统窗口拖动会话
@@ -799,57 +920,57 @@ final class ToastView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
-        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
-        let shape = NSBezierPath(roundedRect: r, xRadius: 12, yRadius: 12)
+        let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
+                                 xRadius: glassRadius, yRadius: glassRadius)
+        // 和主面板同一套底板：磨砂层由外层 NSVisualEffectView 提供，这里只叠蒙层 + 高光
         toastTint.setFill()
         shape.fill()
-        // 顶部微高光，和主面板一致
-        if let sheen = NSGradient(starting: NSColor.white.withAlphaComponent(0.10),
-                                  ending: NSColor.white.withAlphaComponent(0.0)) {
-            NSGraphicsContext.saveGraphicsState()
-            shape.setClip()
-            sheen.draw(in: NSRect(x: 0, y: bounds.height * 0.55,
-                                  width: bounds.width, height: bounds.height * 0.45),
-                       angle: -90)
-            NSGraphicsContext.restoreGraphicsState()
+        NSGraphicsContext.saveGraphicsState()
+        shape.setClip()
+        if let g = NSGradient(starting: rgb(0xCBE3F1, alpha: 0.16),
+                              ending: rgb(0xCBE3F1, alpha: 0.0)) {
+            g.draw(in: NSRect(x: 0, y: bounds.height * 0.45,
+                              width: bounds.width, height: bounds.height * 0.55), angle: -90)
         }
-        rgb(0x506684, alpha: 0.85).setStroke()
-        shape.lineWidth = 0.5
+        NSGraphicsContext.restoreGraphicsState()
+
+        glassBorder.setStroke()
+        shape.lineWidth = 1
         shape.stroke()
 
         if highlighted {
-            NSColor.white.withAlphaComponent(0.14).setFill()
+            rgb(0xF4FAFF, alpha: 0.14).setFill()
             shape.fill()
         }
 
-        // 左侧强调条
-        accent.withAlphaComponent(0.9).setFill()
-        NSBezierPath(roundedRect: NSRect(x: 0, y: 11, width: 2.5, height: bounds.height - 22),
-                     xRadius: 1.25, yRadius: 1.25).fill()
+        // 左侧强调条：按事件类型给色（卡住/限流=珊瑚、其它=琥珀）
+        accent.withAlphaComponent(0.95).setFill()
+        NSBezierPath(roundedRect: NSRect(x: 9, y: 12, width: 3, height: bounds.height - 24),
+                     xRadius: 1.5, yRadius: 1.5).fill()
 
         let tAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
             .foregroundColor: accent,
         ]
-        (title as NSString).draw(at: NSPoint(x: 14, y: 24), withAttributes: tAttrs)
+        (title as NSString).draw(at: NSPoint(x: 20, y: 13), withAttributes: tAttrs)
 
         let bAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .regular),
+            .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
             .foregroundColor: mainText,
         ]
-        let avail = bounds.width - 28
+        let avail = bounds.width - 34
         let text = (self.body as NSString).size(withAttributes: bAttrs).width > avail
             ? middleEllipsis(self.body, maxWidth: avail, attrs: bAttrs)
             : self.body
-        (text as NSString).draw(at: NSPoint(x: 14, y: 38), withAttributes: bAttrs)
+        (text as NSString).draw(at: NSPoint(x: 20, y: 31), withAttributes: bAttrs)
 
         let hint = "点我跳转" as NSString
         let hAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9),
-            .foregroundColor: secondaryText,
+            .font: NSFont.systemFont(ofSize: 9.5),
+            .foregroundColor: secondaryText.withAlphaComponent(0.85),
         ]
         let hs = hint.size(withAttributes: hAttrs)
-        hint.draw(at: NSPoint(x: bounds.width - hs.width - 12, y: 5), withAttributes: hAttrs)
+        hint.draw(at: NSPoint(x: bounds.width - hs.width - 14, y: bounds.height - 17), withAttributes: hAttrs)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -965,32 +1086,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.hidesOnDeactivate = false
         panel.delegate = self
 
-        // 毛玻璃底 + 半透明蒙层：比纯色更有质感，同时保证文字对比度
+        // 冷蓝灰磨砂底板：背后实时模糊 + 90% 底板（参考的 --glass-transparency .10）
+        // + 一层高光渐变 + 细描边 + 内高光，四层叠出「玻璃」而不是「灰块」。
         let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w0, height: h0))
         bg.material = .hudWindow
         bg.blendingMode = .behindWindow
         bg.state = .active
         bg.appearance = NSAppearance(named: .darkAqua)
         bg.wantsLayer = true
-        bg.layer?.cornerRadius = 12
+        bg.layer?.cornerRadius = glassRadius
         bg.layer?.masksToBounds = true
-        bg.layer?.borderWidth = 0.5
-        bg.layer?.borderColor = rgb(0x7894BD, alpha: 0.32).cgColor
+        bg.layer?.borderWidth = 1
+        bg.layer?.borderColor = glassBorder.cgColor
         panel.contentView = bg
 
         let tint = NSView(frame: bg.bounds)
         tint.wantsLayer = true
         tint.layer?.backgroundColor = panelTint.cgColor
         tint.autoresizingMask = [.width, .height]
-        // 顶部微高光：玻璃厚度感，比纯色蒙层更像「一块玻璃」而不是「一层灰」
+        // 两层高光：左上角一团柔光（参考的 radial-gradient）+ 斜向渐变，
+        // 再压一条顶部 1px 亮边当作玻璃厚度。
+        let glow = CAGradientLayer()
+        glow.type = .radial
+        glow.frame = tint.bounds
+        glow.startPoint = CGPoint(x: 0.9, y: 1.0)
+        glow.endPoint = CGPoint(x: 0.2, y: 0.1)
+        glow.colors = [rgb(0xCBE3F1, alpha: 0.17).cgColor,
+                       rgb(0xCBE3F1, alpha: 0.0).cgColor]
+        glow.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        tint.layer?.addSublayer(glow)
+
         let sheen = CAGradientLayer()
         sheen.frame = tint.bounds
         sheen.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        sheen.colors = [NSColor.white.withAlphaComponent(0.10).cgColor,
-                        NSColor.white.withAlphaComponent(0.0).cgColor]
-        sheen.startPoint = CGPoint(x: 0.5, y: 1.0)
-        sheen.endPoint = CGPoint(x: 0.5, y: 0.45)
+        sheen.colors = [rgb(0xB6D6E5, alpha: 0.10).cgColor,
+                        rgb(0x8FB6CE, alpha: 0.02).cgColor,
+                        rgb(0x9DC1D0, alpha: 0.11).cgColor]
+        sheen.locations = [0, 0.62, 1]
+        sheen.startPoint = CGPoint(x: 0.15, y: 1.0)
+        sheen.endPoint = CGPoint(x: 0.85, y: 0.0)
         tint.layer?.addSublayer(sheen)
+
+        let edge = CAGradientLayer()
+        edge.frame = tint.bounds
+        edge.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        edge.colors = [glassInset.cgColor, rgb(0xE7F7FF, alpha: 0.0).cgColor]
+        edge.startPoint = CGPoint(x: 0.5, y: 1.0)
+        edge.endPoint = CGPoint(x: 0.5, y: 0.94)
+        tint.layer?.addSublayer(edge)
         bg.addSubview(tint)
 
         view = PulseView(frame: bg.bounds)
@@ -1138,6 +1281,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if abs(view.frame.width - w) > 0.5 || abs(view.frame.height - h) > 0.5 {
             view.frame = NSRect(x: 0, y: 0, width: w, height: h)
         }
+        // 两种形态都用同一套圆角，收起态不再拉成椭圆
+        if let bg = panel.contentView {
+            bg.layer?.cornerRadius = glassRadius
+        }
         view.rebuild()
     }
 
@@ -1281,7 +1428,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         tbg.state = .active
         tbg.appearance = NSAppearance(named: .darkAqua)
         tbg.wantsLayer = true
-        tbg.layer?.cornerRadius = 12
+        tbg.layer?.cornerRadius = glassRadius
         tbg.layer?.masksToBounds = true
         tv.frame = tbg.bounds
         tv.autoresizingMask = [.width, .height]
