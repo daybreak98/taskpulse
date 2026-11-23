@@ -565,9 +565,7 @@ final class TaskRowView: NSView {
         let plate = NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 8, yRadius: 8)
         // 定时进度画在底色里：只有运行中/待回复/卡住这三类在做倒计时
         let timed = !done && ["running", "attention", "stuck"].contains(item.status)
-        // TEMP-VERIFY
-        let forced = ProcessInfo.processInfo.environment["TP_UI_PROGRESS"].flatMap(Double.init)
-        drawRowPlate(plate, tone, progress: timed ? (forced ?? item.progress) : 0)
+        drawRowPlate(plate, tone, progress: timed ? item.progress : 0)
         if hovered {
             rgb(0xF4FAFF, alpha: 0.10).setFill()
             plate.fill()
@@ -752,8 +750,6 @@ final class PulseView: NSView {
 
     /// 组默认只显示一行；有阻塞/待响应的组自动展开，突出需要关注的标签页
     func isOpenNamed(_ name: String) -> Bool {
-        // TEMP-VERIFY
-        if ProcessInfo.processInfo.environment["TP_UI_OPEN"] != nil { return true }
         if closedGroups.contains(name) { return false }
         if openGroups.contains(name) { return true }
         guard let g = groups().first(where: { $0.name == name }) else { return false }

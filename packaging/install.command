@@ -257,12 +257,21 @@ PLIST
 # ---------- 6. 预热依赖（首次要联网装一次，提前跑完更省心）----------
 echo "-- 检查运行依赖（首次会联网安装，约 30 秒）..."
 UV_PREHEAT=()
-while IFS= read -r ARG; do
-  [ -n "$ARG" ] && UV_PREHEAT+=("$ARG")
-done < <( [ -f "./uv-args.txt" ] && cat ./uv-args.txt )
-"$UV_BIN" run --quiet --no-project "${UV_PREHEAT[@]}" python -c "print('   -> 依赖就绪')" || {
-  echo "!! 依赖安装失败（多见于公司网络未连内网）。装好后重跑本脚本即可。"
-}
+if [ -f "./uv-args.txt" ]; then
+  while IFS= read -r ARG; do
+    [ -n "$ARG" ] && UV_PREHEAT+=("$ARG")
+  done < ./uv-args.txt
+fi
+# bash 3.2（macOS 自带）在 set -u 下展开空数组会报错，分两条写
+if [ ${#UV_PREHEAT[@]} -gt 0 ]; then
+  "$UV_BIN" run --quiet --no-project "${UV_PREHEAT[@]}" python -c "print('   -> 依赖就绪')" || {
+    echo "!! 依赖安装失败（多见于公司网络未连内网）。装好后重跑本脚本即可。"
+  }
+else
+  "$UV_BIN" run --quiet --no-project python -c "print('   -> 依赖就绪')" || {
+    echo "!! 依赖安装失败。装好后重跑本脚本即可。"
+  }
+fi
 
 # ---------- 7. 启动 ----------
 if [ "${TP_DRY:-}" = "1" ]; then
