@@ -755,6 +755,8 @@ final class PulseView: NSView {
     var onFilterChange: ((String?) -> Void)?
     var onTogglePin: (() -> Void)?
     var onSetSource: ((String) -> Void)?
+    /// 刚点下去的来源：后端还没确认，先照它画，免得多等一个轮询周期
+    var pendingSource: String?
     var onOpen: ((TaskItem) -> Void)?
     var onCheck: ((TaskItem, Bool) -> Void)?
     var onDeadline: ((TaskItem, Int?) -> Void)?
@@ -1006,7 +1008,7 @@ final class PulseView: NSView {
 
         let src = SourceToggleView(frame: NSRect(x: bounds.width - 100, y: (HEADER_H - 18) / 2,
                                                  width: 46, height: 18))
-        let current = payload?.source ?? "api"
+        let current = pendingSource ?? payload?.source ?? "api"
         src.source = current
         if let age = payload?.source_age {
             src.toolTip = "取数来源：\(current == "web" ? "浏览器内 cookie" : "本机 token")，缓存 \(Int(age)) 秒"
@@ -1749,11 +1751,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard let self else { return }
                 self.dataRequestInFlight = false
                 let counts = self.view.payload?.counts
-                let shownSource = self.view.payload?.source
+                let prevSource = self.view.payload?.source
                 let items = self.view.compact ? [] : self.view.visibleItems()
                 self.view.connectionLost = payload == nil
                 if let payload {
                     self.view.payload = payload
+                    // 后端确认切换到位后，清掉点击时的乐观标记
+                    if self.view.pendingSource == payload.source { self.view.pendingSource = nil }
                     self.consecutiveReadFailures = 0
                     self.nextReadAt = 0
                     if !self.view.countersUnavailable { self.detectReplies(payload) }
@@ -1764,7 +1768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
                 let detail = self.view.statusDetail
                 if detail != self.drawnStatusDetail || counts != self.view.payload?.counts
-                    || shownSource != self.view.payload?.source
+                    || prevSource != self.view.payload?.source
                     || (!self.view.compact && items != self.view.visibleItems()) {
                     self.drawnStatusDetail = detail
                     self.applyLayout()
@@ -1811,6 +1815,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 切换取数来源：api = 本机 token，web = 浏览器里用 cookie 取数
     func setSource(_ mode: String) {
+        view.pendingSource = mode
+        applyLayout()
         post("/mode?value=\(mode)")
     }
 

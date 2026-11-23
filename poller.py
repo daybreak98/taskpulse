@@ -1583,6 +1583,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": str(exc)}, 500)
                 return
             log("数据来源切换为 %s" % mode)
+            # 别让用户干等一个轮询周期：立刻按新来源重算一次（后台跑，不卡这次请求）
+            def _refresh() -> None:
+                try:
+                    save_state(poll_tick(make_agent(), full=True))
+                except Exception as exc:  # noqa: BLE001
+                    log(f"切换来源后刷新失败: {exc}")
+            threading.Thread(target=_refresh, name="mode-switch", daemon=True).start()
             self._json({"ok": True, "source": mode})
             return
 
