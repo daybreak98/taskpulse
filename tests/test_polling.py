@@ -144,6 +144,59 @@ class PollingTests(unittest.TestCase):
         self.assertEqual(state["tasks"]["1"]["status"], "seen")
         self.assertEqual(poller.view(state)["counts"]["running"], 1)
 
+    def test_seen_session_starting_a_new_round_is_probed_on_discovery_tick(self):
+        agent = FakeAgent([conversation(1)])
+        poller.poll_tick(agent, full=True)
+        self.assertEqual(poller.load_state()["tasks"]["1"]["status"], "seen")
+
+        # 用户又起了新一轮：列表 updateTime 跳变，队列转忙
+        agent.items = [conversation(1, updated=self.stamp + 4_000)]
+        agent.busy.add(1)
+        agent.queue_calls.clear()
+        self.stamp += 5_000
+
+        state = poller.poll_tick(agent, full=False, discovery=True)
+
+        self.assertEqual(agent.queue_calls, [1])          # 不等下一分钟全量就查了
+        self.assertEqual(state["tasks"]["1"]["status"], "running")
+
+    def test_stuck_task_is_rescanned_at_stuck_interval(self):
+        agent = FakeAgent([conversation(1)], busy=(1,))
+        poller.poll_tick(agent, full=True)
+        self.stamp += 601_000
+        poller.poll_tick(agent, full=False)
+        self.assertEqual(poller.load_state()["tasks"]["1"]["status"], "stuck")
+
+        agent.queue_calls.clear()
+        for _ in range(3):                                # 15 秒内不再复查
+            self.stamp += 5_000
+            poller.poll_tick(agent, full=False)
+        self.assertEqual(agent.queue_calls, [])
+
+        self.stamp += 60_000                              # 满 60 秒才复查一次
+        poller.poll_tick(agent, full=False)
+        self.assertEqual(agent.queue_calls, [1])
+
+    def test_rate_limit_message_is_detected_while_still_running(self):
+        agent = FakeAgent([conversation(1)], busy=(1,))
+        poller.poll_tick(agent, full=True)
+        original = agent.last_message
+
+        def busy_message(cid, timeout):
+            original(cid, timeout)        # 保留调用计数
+            return {"sender": "assistant", "content": "当前服务繁忙，请稍后再试"}
+
+        agent.last_message = busy_message
+        self.stamp += 65_000
+
+        with patch.object(poller, "FAIL_MARKS", ("当前服务繁忙",)):
+            state = poller.poll_tick(agent, full=False)
+
+        task = state["tasks"]["1"]
+        self.assertTrue(task["failed"])
+        self.assertEqual(task["status"], "stuck")
+        self.assertEqual(agent.message_calls, [1])
+
     def test_time_budget_allows_later_full_candidates_to_get_a_turn(self):
         agent = FakeAgent([conversation(i) for i in range(1, 4)])
         clock = Mock(return_value=0.0)

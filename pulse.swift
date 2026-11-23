@@ -85,9 +85,9 @@ let palette: [String: NSColor] = [
     "seen": rgb(0x93A9C6),
     "done": rgb(0x62D8AD),
 ]
-/// 毛玻璃蒙层的不透明度：只留 25%，其余交给窗口背后的实时模糊。
-/// 想让文字更实就把这个值调大（0.45 左右是可读性与通透感的折中）。
-let glassAlpha: CGFloat = 0.25
+/// 毛玻璃蒙层的不透明度：0.84 是原来「几乎实心」的观感，每减小 0.05 就更透一档。
+/// 0.60 = 在原基础上多透 25 个百分点，模糊还在，字也不会发白。
+let glassAlpha: CGFloat = 0.60
 let panelTint = rgb(0x101726, alpha: glassAlpha)
 let toastTint = rgb(0x182337, alpha: glassAlpha)
 let mainText = rgb(0xEDF3FC)
@@ -793,6 +793,16 @@ final class ToastView: NSView {
         let shape = NSBezierPath(roundedRect: r, xRadius: 12, yRadius: 12)
         toastTint.setFill()
         shape.fill()
+        // 顶部微高光，和主面板一致
+        if let sheen = NSGradient(starting: NSColor.white.withAlphaComponent(0.10),
+                                  ending: NSColor.white.withAlphaComponent(0.0)) {
+            NSGraphicsContext.saveGraphicsState()
+            shape.setClip()
+            sheen.draw(in: NSRect(x: 0, y: bounds.height * 0.55,
+                                  width: bounds.width, height: bounds.height * 0.45),
+                       angle: -90)
+            NSGraphicsContext.restoreGraphicsState()
+        }
         rgb(0x506684, alpha: 0.85).setStroke()
         shape.lineWidth = 0.5
         shape.stroke()
@@ -959,6 +969,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         tint.wantsLayer = true
         tint.layer?.backgroundColor = panelTint.cgColor
         tint.autoresizingMask = [.width, .height]
+        // 顶部微高光：玻璃厚度感，比纯色蒙层更像「一块玻璃」而不是「一层灰」
+        let sheen = CAGradientLayer()
+        sheen.frame = tint.bounds
+        sheen.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        sheen.colors = [NSColor.white.withAlphaComponent(0.10).cgColor,
+                        NSColor.white.withAlphaComponent(0.0).cgColor]
+        sheen.startPoint = CGPoint(x: 0.5, y: 1.0)
+        sheen.endPoint = CGPoint(x: 0.5, y: 0.45)
+        tint.layer?.addSublayer(sheen)
         bg.addSubview(tint)
 
         view = PulseView(frame: bg.bounds)

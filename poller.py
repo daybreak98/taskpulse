@@ -76,6 +76,9 @@ DEFAULTS = {
         "discovery_interval_seconds": 5,
         "active_interval_seconds": 5,
         "active_watch_limit": 2,
+        "resume_probe_limit": 1,
+        "stuck_interval_seconds": 60,
+        "rate_limit_probe_seconds": 60,
         "watch_limit": 20,
         "stuck_seconds": 600,
         "window_limit": 10,
@@ -138,6 +141,15 @@ WATCH_LIMIT = max(0, int(CFG["poll"]["watch_limit"]))
 ACTIVE_POLL_SECONDS = max(0, int(CFG["poll"]["active_interval_seconds"]))
 DISCOVERY_POLL_SECONDS = max(0, int(CFG["poll"].get("discovery_interval_seconds", 5)))
 ACTIVE_WATCH_LIMIT = min(WATCH_LIMIT, max(0, int(CFG["poll"]["active_watch_limit"])))
+# 已经判定「卡住」的会话放慢复查节奏（分钟级），把 5 秒档留给真正在跑的
+STUCK_POLL_SECONDS = max(ACTIVE_POLL_SECONDS,
+                         min(POLL_SECONDS, int(CFG["poll"].get("stuck_interval_seconds", 60))))
+# 「已查看」的会话又起了新一轮：发现周期顺带查几个，别等到下一分钟
+RESUME_PROBE_LIMIT = max(0, int(CFG["poll"].get("resume_probe_limit", 1)))
+# 运行中多久没结束就翻一次最后一条消息，看是不是被限流停住了
+RATE_LIMIT_PROBE_SECONDS = max(0, int(CFG["poll"].get("rate_limit_probe_seconds", 60)))
+RATE_LIMIT_PROBE_GAP_SECONDS = max(30, RATE_LIMIT_PROBE_SECONDS * 2)
+RATE_LIMIT_PROBE_ATTEMPTS = 3
 ROUND_BUDGET_SECONDS = 10
 DEFAULT_STUCK_SECONDS = int(CFG["poll"]["stuck_seconds"])
 DEFAULT_WINDOW_LIMIT = int(CFG["poll"]["window_limit"])
@@ -395,12 +407,40 @@ def fast_candidates(tasks: dict, stamp: int) -> list[dict]:
     if not ACTIVE_POLL_SECONDS or not ACTIVE_WATCH_LIMIT:
         return []
     retry_ms = max(ACTIVE_POLL_SECONDS, min(POLL_SECONDS, 60)) * 1000
-    eligible = [task for task in tasks.values() if running(task)
-                and (not task.get("queue_error") or stamp - (task.get("queue_checked_at") or 0) >= retry_ms)]
+    stuck_ms = STUCK_POLL_SECONDS * 1000
+    eligible = []
+    for task in tasks.values():
+        if not running(task):
+            continue
+        checked = task.get("queue_checked_at") or 0
+        # 已经判定卡住的，没必要每 5 秒再看一次；按 stuck_interval_seconds 放慢。
+        if task.get("status") == "stuck" and stamp - checked < stuck_ms:
+            continue
+        if task.get("queue_error") and stamp - checked < retry_ms:
+            continue
+        eligible.append(task)
     # 最久没检查的先查，避免同一批任务一直占满快速复查的名额。
     eligible.sort(key=lambda task: task.get("queue_checked_at") or 0)
     return [{"id": task["id"], "updateTime": task.get("update_ms") or 0}
             for task in eligible[:ACTIVE_WATCH_LIMIT]]
+
+
+def resuming_candidates(listed: list[dict], tasks: dict, limit: int) -> list[dict]:
+    """列表里 updateTime 已经跳变、状态却还停在「已查看」的会话：用户又起了新一轮，
+    只是还没人取过队列。发现周期顺带查一个，把这段 60 秒的长尾压到 5 秒级。"""
+    if limit <= 0:
+        return []
+    out = []
+    for conv in listed:
+        task = tasks.get(str(conv["id"]))
+        if not task or task.get("muted") or task.get("status") != "seen":
+            continue
+        if conv["updateTime"] <= (task.get("acked_update") or 0):
+            continue
+        out.append({"id": conv["id"], "updateTime": conv["updateTime"]})
+        if len(out) >= limit:
+            break
+    return out
 
 
 def pending_reply(task: dict, update: int, stamp: int) -> str | None:
@@ -464,12 +504,26 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
         cid = str(conv["id"])
         sample = samples.get(cid)
         task = tasks.get(cid)
-        if not sample or sample.busy is not False or not task:
+        if not sample or not task or sample.busy is None:
             continue
-        reply = pending_reply(task, conv["updateTime"], sample.at)
-        if not reply or task.get("classified_reply") == reply:
+        if sample.busy:
+            # 跑够一段时间还不结束，先怀疑限流：翻最后一条消息确认，别等它转空闲。
+            started = task.get("running_since") or sample.at
+            if sample.at - started < RATE_LIMIT_PROBE_SECONDS * 1000:
+                continue
+            last = task.get("message_checked_at") or 0
+            if last and sample.at - last < RATE_LIMIT_PROBE_GAP_SECONDS * 1000:
+                continue
+            reply = f"run:{started}"
+        else:
+            reply = pending_reply(task, conv["updateTime"], sample.at)
+            if not reply:
+                continue
+        if task.get("classified_reply") == reply:
             continue
-        if task.get("message_reply") == reply and task.get("message_attempts", 0) >= 2:
+        # 运行中多给一次机会（3 次，间隔翻倍）；已转空闲的沿用原来的 2 次上限。
+        limit = RATE_LIMIT_PROBE_ATTEMPTS if sample.busy else 2
+        if task.get("message_reply") == reply and task.get("message_attempts", 0) >= limit:
             continue
         timeout = request_timeout(deadline)
         if timeout < 0.25:
@@ -503,10 +557,25 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
         if not started:
             started = sample.at
             task["running_since"] = started
-        task["failed"] = False
+        # 运行中也可能被限流卡住：这一轮翻过消息就把结论落在状态上，别等它转空闲。
+        run_reply = f"run:{started}"
+        checked = sample.checked_reply == run_reply
+        if checked:
+            seen_before = task.get("message_reply") == run_reply
+            task["message_reply"] = run_reply
+            task["message_attempts"] = (task.get("message_attempts", 0) if seen_before else 0) + 1
+            task["message_checked_at"] = sample.at
+            if sample.failed is not None:
+                task["classified_reply"] = run_reply
+        task["failed"] = bool(sample.failed) if checked else False
         task["reply_pending"] = False
         elapsed = (sample.at - started) // 1000
-        task["status"] = "stuck" if elapsed >= DEFAULT_STUCK_SECONDS else "running"
+        task["status"] = "stuck" if (elapsed >= DEFAULT_STUCK_SECONDS or task["failed"]) else "running"
+        if task["failed"] and task.get("failed_notified") != started:
+            task["failed_notified"] = started
+            notifications.append(("疑似被限流",
+                                  f"{task['name']} 已运行 {max(1, elapsed // 60)} 分钟仍未结束，"
+                                  "最后一条回复里提到了繁忙/限流"))
         if task["status"] == "stuck" and task.get("stuck_notified") != started:
             task["stuck_notified"] = started
             notifications.append(("任务疑似卡住", f"{task['name']} 已运行 {elapsed // 60} 分钟，去看看"))
@@ -560,11 +629,14 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
     if full:
         conversations = listed
     elif discovery:
-        # 秒级发现：列表已经拿到了，新会话顺带取队列，运行中的照旧复查两个。
+        # 秒级发现：列表已经拿到了，新会话、刚起新一轮的会话顺带取队列，运行中的照旧复查两个。
         fresh = [conv for conv in listed if str(conv["id"]) not in tasks]
-        known = {str(conv["id"]) for conv in fresh}
-        conversations = fresh + [conv for conv in fast_candidates(tasks, stamp)
-                                 if str(conv["id"]) not in known]
+        picked = {str(conv["id"]) for conv in fresh}
+        resuming = [conv for conv in resuming_candidates(listed, tasks, RESUME_PROBE_LIMIT)
+                    if str(conv["id"]) not in picked]
+        picked |= {str(conv["id"]) for conv in resuming}
+        conversations = fresh + resuming + [conv for conv in fast_candidates(tasks, stamp)
+                                            if str(conv["id"]) not in picked]
     else:
         conversations = fast_candidates(tasks, stamp)
     samples = sample_queues(agent, conversations, tasks, deadline)
@@ -618,8 +690,8 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                     and update <= int(conv.get("createTime") or 0)):
                 # 刚建好、还没跑过任何一轮的空会话，没有「等你处理」这回事
                 task["acked_update"] = update
-            if full or cid in fresh or running(task):
-                apply_queue_sample(task, sample, act, notifications)
+            # samples 里只有本轮真的问过的会话，所以拿到就能直接落状态
+            apply_queue_sample(task, sample, act, notifications)
 
         if fresh:
             busy = sum(1 for cid in fresh
@@ -1324,8 +1396,9 @@ def _poll_forever() -> None:
     next_full = next_fast = time.monotonic()
     next_discovery = next_full if DISCOVERY_POLL_SECONDS else float("inf")
     log(f"取数循环已启动：每 {POLL_SECONDS} 秒全量检查，"
-        f"每 {DISCOVERY_POLL_SECONDS} 秒发现新会话，"
-        f"运行中每 {ACTIVE_POLL_SECONDS} 秒最多复查 {ACTIVE_WATCH_LIMIT} 个")
+        f"每 {DISCOVERY_POLL_SECONDS} 秒发现新会话/新一轮，"
+        f"运行中每 {ACTIVE_POLL_SECONDS} 秒最多复查 {ACTIVE_WATCH_LIMIT} 个，"
+        f"已卡住每 {STUCK_POLL_SECONDS} 秒复查一次")
     while True:
         started = time.monotonic()
         full = started >= next_full
