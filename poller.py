@@ -175,13 +175,19 @@ def log(msg: str) -> None:
         pass
 
 
-def notify(title: str, body: str) -> None:
-    script = 'display notification %s with title %s' % (
-        json.dumps(body, ensure_ascii=False), json.dumps(title, ensure_ascii=False))
-    try:
-        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
-    except Exception:
-        pass
+# 通知不再走 osascript：macOS 会把 `display notification` 记在「脚本编辑器」名下，
+# 点通知打开的是脚本编辑器而不是会话。改成把事件塞进 /state，由 App 自己的提示条弹出，
+# 点一下就直接跳到对应标签页。
+_STARTED_AT = int(time.time())
+_events: list[dict] = []
+_events_seq = 0
+
+
+def notify(title: str, body: str, cid: str | None = None) -> None:
+    global _events_seq
+    _events_seq += 1
+    _events.append({"seq": _events_seq, "title": title, "body": body, "cid": cid})
+    del _events[:-20]
 
 
 # ── 存储 ────────────────────────────────────────────────────────────
@@ -544,7 +550,7 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
 
 
 def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
-                       notifications: list[tuple[str, str]]) -> None:
+                       notifications: list[tuple[str, str, str]]) -> None:
     task["queue_checked_at"] = sample.at
     task["queue_error"] = sample.busy is None
     if sample.busy is None:
@@ -575,10 +581,10 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
             task["failed_notified"] = started
             notifications.append(("疑似被限流",
                                   f"{task['name']} 已运行 {max(1, elapsed // 60)} 分钟仍未结束，"
-                                  "最后一条回复里提到了繁忙/限流"))
+                                  "最后一条回复里提到了繁忙/限流", str(task["id"])))
         if task["status"] == "stuck" and task.get("stuck_notified") != started:
             task["stuck_notified"] = started
-            notifications.append(("任务疑似卡住", f"{task['name']} 已运行 {elapsed // 60} 分钟，去看看"))
+            notifications.append(("任务疑似卡住", f"{task['name']} 已运行 {elapsed // 60} 分钟，去看看", str(task["id"])))
         return
 
     update = task["update_ms"]
@@ -643,7 +649,7 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
     if not full and not samples:
         return base
 
-    notifications: list[tuple[str, str]] = []
+    notifications: list[tuple[str, str, str]] = []
     with _lock:
         state = load_state()
         tasks = state.setdefault("tasks", {})
@@ -704,7 +710,7 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                 continue
             if stamp - (task.get("deadline_notified") or 0) >= DEADLINE_REMIND_SECONDS * 1000:
                 task["deadline_notified"] = stamp
-                notifications.append(("任务已超时", f"{task['name']} 超过你设定的时间"))
+                notifications.append(("任务已超时", f"{task['name']} 超过你设定的时间", str(task["id"])))
 
         if full:
             for cid, task in list(tasks.items()):
@@ -720,8 +726,8 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             state["updated"] = stamp
         save_state(state)
 
-    for title, body in notifications:
-        notify(title, body)
+    for title, body, cid in notifications:
+        notify(title, body, cid)
     if full and sys.platform == "darwin":
         snapshot_edge_tabs(timeout=2)
     return state
@@ -792,6 +798,9 @@ def view(state: dict) -> dict:
         "poller_error_at": state.get("poller_error_at"),
         "stale_after_seconds": stale_after_seconds,
         "stale_count": sum(1 for r in rows if r["stale"]),
+        # 提示事件（卡住/限流/超时）：App 拿着自己弹提示条，点了就能直接跳转
+        "event_run": _STARTED_AT,
+        "events": list(_events),
         "stuck_seconds": stuck,
         "window_limit": limit,
         "tasks": active[:limit],

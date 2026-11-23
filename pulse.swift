@@ -66,10 +66,20 @@ struct Payload: Decodable {
     let poller_error: String?
     let stale_after_seconds: Double?
     let stale_count: Int?
+    let event_run: Int?
+    let events: [NoticeEvent]?
     let tasks: [TaskItem]
     let active: [TaskItem]
     let all: [TaskItem]
     let counts: Counts
+}
+
+/// 后端推过来的提示事件（卡住 / 疑似限流 / 超时）：App 自己弹提示条，点了直接跳会话。
+struct NoticeEvent: Decodable {
+    let seq: Int
+    let title: String
+    let body: String
+    let cid: String?
 }
 
 func rgb(_ value: UInt32, alpha: CGFloat = 1) -> NSColor {
@@ -895,6 +905,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var toasts: [ToastHandle] = []
     var lastStatus: [Int: TaskItem] = [:]
     var statusSeeded = false
+    /// 提示事件的游标：后端重启（event_run 变化）时只记基准，不补弹历史
+    var eventRun = 0
+    var lastEventSeq = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -1242,13 +1255,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 右上角提示条：Agent 回话时弹出，点一下直接跳到对应标签页。
     /// 多条同时到来时往下堆叠，叠压 20pt，保证每条的标题和正文都露出来。
-    func showToast(_ item: TaskItem) {
+    func showToast(_ item: TaskItem, title: String = "Agent 回话了", body: String? = nil,
+                   accent: NSColor? = nil) {
         let w: CGFloat = 288, h: CGFloat = 64
 
         let tv = ToastView(frame: NSRect(x: 0, y: 0, width: w, height: h))
-        tv.title = "Agent 回话了"
-        tv.body = item.name
-        tv.accent = palette["attention"] ?? .systemOrange
+        tv.title = title
+        tv.body = body ?? item.name
+        tv.accent = accent ?? palette["attention"] ?? .systemOrange
 
         let np = ToastPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
                             styleMask: [.borderless, .nonactivatingPanel],
@@ -1358,6 +1372,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusSeeded = true
     }
 
+    /// 后端推来的提示事件（卡住 / 疑似限流 / 超时）：用自己的提示条弹，点一下直接跳会话。
+    /// 之前走 osascript 的系统通知会被 macOS 记在「脚本编辑器」名下，点了只会打开编辑器。
+    func detectEvents(_ payload: Payload) {
+        guard let events = payload.events else { return }
+        let run = payload.event_run ?? 0
+        if eventRun != run {          // 后端重启过：跳过积压，别一次性把历史事件全弹出来
+            eventRun = run
+            lastEventSeq = events.map { $0.seq }.max() ?? 0
+            return
+        }
+        for event in events where event.seq > lastEventSeq {
+            lastEventSeq = max(lastEventSeq, event.seq)
+            guard let cid = event.cid, let id = Int(cid),
+                  let item = payload.all.first(where: { $0.id == id }) else { continue }
+            let accent = event.title.contains("限流") || event.title.contains("卡住")
+                ? palette["stuck"] : palette["attention"]
+            showToast(item, title: event.title, body: event.body, accent: accent)
+        }
+    }
+
     func refresh() {
         guard !dataRequestInFlight, ProcessInfo.processInfo.systemUptime >= nextReadAt,
               let url = URL(string: endpoint + "/state") else { return }
@@ -1382,6 +1416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self.consecutiveReadFailures = 0
                     self.nextReadAt = 0
                     if !self.view.countersUnavailable { self.detectReplies(payload) }
+                    self.detectEvents(payload)
                 } else {
                     self.consecutiveReadFailures = min(self.consecutiveReadFailures + 1, 3)
                     self.nextReadAt = ProcessInfo.processInfo.systemUptime + Double(1 << self.consecutiveReadFailures)
