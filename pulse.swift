@@ -85,7 +85,11 @@ let palette: [String: NSColor] = [
     "seen": rgb(0x93A9C6),
     "done": rgb(0x62D8AD),
 ]
-let panelTint = rgb(0x101726, alpha: 0.84)
+/// 毛玻璃蒙层的不透明度：只留 25%，其余交给窗口背后的实时模糊。
+/// 想让文字更实就把这个值调大（0.45 左右是可读性与通透感的折中）。
+let glassAlpha: CGFloat = 0.25
+let panelTint = rgb(0x101726, alpha: glassAlpha)
+let toastTint = rgb(0x182337, alpha: glassAlpha)
 let mainText = rgb(0xEDF3FC)
 let secondaryText = rgb(0xA7B8D1)
 // 越靠前越严重
@@ -787,7 +791,7 @@ final class ToastView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let r = bounds.insetBy(dx: 0.5, dy: 0.5)
         let shape = NSBezierPath(roundedRect: r, xRadius: 12, yRadius: 12)
-        rgb(0x182337, alpha: 0.98).setFill()
+        toastTint.setFill()
         shape.fill()
         rgb(0x506684, alpha: 0.85).setStroke()
         shape.lineWidth = 0.5
@@ -1236,7 +1240,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         np.hasShadow = true
         np.hidesOnDeactivate = false
         np.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        np.contentView = tv
+
+        // 与主面板同一套毛玻璃：背后实时模糊 + 25% 蒙层
+        let tbg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        tbg.material = .hudWindow
+        tbg.blendingMode = .behindWindow
+        tbg.state = .active
+        tbg.appearance = NSAppearance(named: .darkAqua)
+        tbg.wantsLayer = true
+        tbg.layer?.cornerRadius = 12
+        tbg.layer?.masksToBounds = true
+        tv.frame = tbg.bounds
+        tv.autoresizingMask = [.width, .height]
+        tbg.addSubview(tv)
+        np.contentView = tbg
 
         print("[TaskPulse] toast \(item.name)")
         dbg("toast show id=\(item.id) stack=\(toasts.count + 1)")
