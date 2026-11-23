@@ -24,20 +24,39 @@ final class OnboardingController {
     private var body: NSStackView?
     private var pollTimer: Timer?
     private var browser: String?
-    private var checking = false
 
-    /// 扩展目录：安装脚本会放到 ~/Applications/TaskPulse/edge-ext
+    /// 扩展目录：安装脚本放在 ~/Applications/TaskPulse/edge-ext；
+    /// 直接跑源码调试时，用 App 包同级的 TaskPulse/edge-ext 或当前目录的 edge-ext。
     private var extDir: String {
-        let app = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Applications/TaskPulse/edge-ext")
-        if FileManager.default.fileExists(atPath: app.path) { return app.path }
-        // 直接跑源码调试时退回仓库里的目录
-        return FileManager.default.currentDirectoryPath + "/edge-ext"
+        let fm = FileManager.default
+        var candidates: [URL] = [
+            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications/TaskPulse/edge-ext"),
+            Bundle.main.bundleURL.deletingLastPathComponent()
+                .appendingPathComponent("TaskPulse/edge-ext"),
+            URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("edge-ext"),
+        ]
+        if let res = Bundle.main.resourceURL { candidates.append(res.appendingPathComponent("edge-ext")) }
+        for url in candidates where fm.fileExists(atPath: url.path) { return url.path }
+        return candidates[0].path
+    }
+
+    private var extDirExists: Bool {
+        FileManager.default.fileExists(atPath: extDir)
+    }
+
+    private func appURL(_ app: String) -> URL {
+        let fm = FileManager.default
+        let roots = fm.urls(for: .applicationDirectory, in: .localDomainMask)
+            + fm.urls(for: .applicationDirectory, in: .userDomainMask)
+        for root in roots {
+            let url = root.appendingPathComponent("\(app).app")
+            if fm.fileExists(atPath: url.path) { return url }
+        }
+        return roots[0].appendingPathComponent("\(app).app")
     }
 
     private func installed(_ app: String) -> Bool {
-        let p = "/Applications/\(app).app"
-        return FileManager.default.fileExists(atPath: p)
+        FileManager.default.fileExists(atPath: appURL(app).path)
     }
 
     static var shouldShow: Bool {
@@ -59,11 +78,15 @@ final class OnboardingController {
         let p = OnboardingPanel(contentRect: rect,
                                 styleMask: [.borderless],
                                 backing: .buffered, defer: false)
-        p.level = .floating
+        // 后台常驻 App 的引导窗口必须是「别人都盖不住」的一层：
+        // .floating 会被前台普通窗口压住，用户就完全看不到引导
+        p.level = .statusBar
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = true
         p.isMovableByWindowBackground = true
+        // 从胶囊右键重放引导时前台是别的 App，面板默认会「失活即隐藏」→ 显式关掉
+        p.hidesOnDeactivate = false
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
@@ -101,12 +124,24 @@ final class OnboardingController {
         renderChoice()
         NSApp.activate(ignoringOtherApps: true)
         p.makeKeyAndOrderFront(nil)
+        // 后台常驻 App 的激活随时会被抢走；面板一旦失活就会掉到别的窗口后面，
+        // 所以再无条件抬一次层级，保证看得见
+        p.orderFrontRegardless()
         // 无边框面板要等一轮 runloop 才真正拿到键盘焦点
         DispatchQueue.main.async { [weak self] in
             guard let p = self?.panel else { return }
             NSApp.activate(ignoringOtherApps: true)
             p.makeKeyAndOrderFront(nil)
+            p.orderFrontRegardless()
             dbg("onboarding shown key=\(p.isKeyWindow) visible=\(p.isVisible) f=\(p.frame)")
+            // 排查用：TP_ONBOARDING_PICK=edge|chrome 直接进步骤页
+            // （本机没有辅助功能权限，没法合成点击）
+            if let pick = ProcessInfo.processInfo.environment["TP_ONBOARDING_PICK"] {
+                let name = pick.lowercased() == "chrome" ? "Google Chrome" : "Microsoft Edge"
+                let fake = NSButton()
+                fake.tag = name.contains("Edge") ? 1 : 2
+                self?.pickBrowser(fake)
+            }
         }
     }
 
@@ -199,6 +234,33 @@ final class OnboardingController {
         return b
     }
 
+    /// 已经在往本机上报的浏览器，按钮上直接标「已连接」：
+    /// 否则用户会对着 Edge 装好的结果去 Chrome 里再装一遍。
+    private func markConnected(_ pick: NSStackView) {
+        guard let url = URL(string: endpoint + "/state") else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let d = data,
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  let ext = obj["extension"] as? [String: Any] else { return }
+            let live = (ext["browsers"] as? [String]) ?? []
+            guard !live.isEmpty else { return }
+            DispatchQueue.main.async {
+                for case let b as NSButton in pick.arrangedSubviews {
+                    let key = b.tag == 1 ? "edge" : "chrome"
+                    guard b.isEnabled, live.contains(key) else { continue }
+                    let app = b.tag == 1 ? "Edge" : "Chrome"
+                    b.attributedTitle = NSAttributedString(string: "\(app) 已连接", attributes: [
+                        .foregroundColor: palette["done"] ?? mainText,
+                        .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
+                    ])
+                }
+                self?.resizeToFit()
+            }
+        }.resume()
+    }
+
     private func renderChoice() {
         let s = newBody()
         s.addArrangedSubview(label("TaskPulse 已装好", size: 16, weight: .semibold))
@@ -209,10 +271,12 @@ final class OnboardingController {
             size: 11.5, color: secondaryText))
         s.setCustomSpacing(16, after: s.arrangedSubviews.last!)
 
+        let browsers = [("Microsoft Edge", "Edge"), ("Google Chrome", "Chrome")]
+        let available = browsers.filter { installed($0.0) }
         let pick = NSStackView()
         pick.orientation = .horizontal
         pick.spacing = 10
-        for (name, app) in [("Microsoft Edge", "Edge"), ("Google Chrome", "Chrome")] {
+        for (name, app) in browsers {
             let ok = installed(name)
             let btn = actionButton(ok ? "用 \(app)" : "\(app) 未安装",
                                    #selector(pickBrowser(_:)))
@@ -221,22 +285,51 @@ final class OnboardingController {
             pick.addArrangedSubview(btn)
         }
         s.addArrangedSubview(pick)
+        markConnected(pick)
+
+        if available.isEmpty {
+            // 一个都没有：直接给下载入口，别让人卡在「未安装」上
+            s.addArrangedSubview(label(
+                "这台机器上没找到 Edge 或 Chrome。随便装一个再回来，扩展只支持 Chromium 内核的浏览器。",
+                size: 11.5, color: palette["attention"] ?? secondaryText))
+            let dl = NSStackView()
+            dl.orientation = .horizontal
+            dl.spacing = 10
+            dl.addArrangedSubview(linkButton("下载 Edge", #selector(downloadEdge)))
+            dl.addArrangedSubview(linkButton("下载 Chrome", #selector(downloadChrome)))
+            s.addArrangedSubview(dl)
+        }
 
         s.addArrangedSubview(linkButton("以后再说", #selector(dismissForever)))
         fitHeight()
     }
 
+    /// 用户只做两件事：开「开发人员模式」、把扩展目录拖进去（或选目录）。
+    /// 打开扩展页、选中目录、复制路径、检测上报都由这里自动完成。
     private func renderSteps(_ browserName: String) {
         let s = newBody()
         s.addArrangedSubview(label("在 \(browserName) 里装扩展", size: 16, weight: .semibold))
         let dir = extDir
 
+        if !extDirExists {
+            s.addArrangedSubview(label(
+                "没找到扩展目录（\(dir)）。安装包可能不完整，重新跑一次安装脚本即可。",
+                size: 11.5, color: palette["attention"] ?? secondaryText))
+        } else {
+            s.addArrangedSubview(label(
+                "扩展页已经打开，扩展目录也已经在 Finder 里选中。只剩两步：",
+                size: 11.5, color: secondaryText))
+        }
+
         s.addArrangedSubview(label(
-            "1. 已经在 \(browserName) 打开了扩展页：右上角打开「开发人员模式」。",
+            "1. 在 \(browserName) 扩展页右上角打开「开发人员模式」。",
             size: 11.5, color: secondaryText))
         s.addArrangedSubview(label(
-            "2. 点「加载解压缩的扩展」，选下面这个目录：",
+            "2. 把 Finder 里选中的 edge-ext 文件夹，直接拖到扩展页中间的空区域。",
             size: 11.5, color: secondaryText))
+        s.addArrangedSubview(label(
+            "拖不了就点「加载解压缩的扩展」→ 按 ⌘⇧G 粘贴路径（已复制）→ 回车。",
+            size: 10.5, color: secondaryText))
 
         let pathRow = NSStackView()
         pathRow.orientation = .horizontal
@@ -244,22 +337,13 @@ final class OnboardingController {
         let path = label(dir, size: 11, color: mainText, wrap: false)
         path.lineBreakMode = .byTruncatingMiddle
         pathRow.addArrangedSubview(path)
-        pathRow.addArrangedSubview(linkButton("复制路径", #selector(copyPath)))
-        pathRow.addArrangedSubview(linkButton("打开目录", #selector(revealDir)))
+        pathRow.addArrangedSubview(linkButton("再复制一次", #selector(copyPath)))
+        pathRow.addArrangedSubview(linkButton("在 Finder 里选中", #selector(revealDir)))
+        pathRow.addArrangedSubview(linkButton("重新打开扩展页", #selector(reopenExtensions)))
         s.addArrangedSubview(pathRow)
 
-        s.addArrangedSubview(label("3. 回到这里点「检查一下」。",
-                                   size: 11.5, color: secondaryText))
-
-        s.setCustomSpacing(18, after: s.arrangedSubviews.last!)
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.spacing = 10
-        row.addArrangedSubview(actionButton("检查一下", #selector(check), key: "\r"))
-        row.addArrangedSubview(linkButton("重新打开扩展页", #selector(reopenExtensions)))
-        s.addArrangedSubview(row)
-
-        let hint = label("装好扩展后，这个小窗会自动消失。", size: 10.5, color: secondaryText)
+        let hint = label("正在检测扩展上报…装好后这里会自动跳到「已连接」。",
+                         size: 10.5, color: secondaryText)
         hint.identifier = NSUserInterfaceItemIdentifier("hint")
         s.addArrangedSubview(hint)
 
@@ -290,23 +374,55 @@ final class OnboardingController {
 
     // MARK: - 动作
 
+    /// 进入步骤页后挪到右下角：扩展页中间那块是「拖进来装」的落点，
+    /// 面板一直占着正中间会挡住它。
+    private func moveToCorner() {
+        guard let p = panel else { return }
+        let screen = (NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        var f = p.frame
+        f.origin = NSPoint(x: screen.maxX - f.width - 24, y: screen.minY + 24)
+        p.setFrame(f, display: true)
+    }
+
     @objc private func pickBrowser(_ sender: NSButton) {
         let name = sender.tag == 1 ? "Microsoft Edge" : "Google Chrome"
         browser = name
         open(extensionsURL: name)
         renderSteps(name)
-        let dir = extDir
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            NSWorkspace.shared.open(URL(fileURLWithPath: dir))
+        moveToCorner()
+        // 文案说「已经准备好」，就别让用户再手动复制/找目录：这里真的做掉。
+        // 目录在 Finder 里「选中」而不是只打开，这样可以直接把它拖进扩展页。
+        if extDirExists {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(extDir, forType: .string)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: self.extDir)])
+            }
         }
+        startWatching()
     }
 
+    /// 必须指定 App 打开：edge:// / chrome:// 不是系统级 scheme，
+    /// 直接 NSWorkspace.open(url) 会静默失败，用户就卡在「什么都没打开」。
     private func open(extensionsURL app: String) {
         let scheme = app.contains("Edge") ? "edge" : "chrome"
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        p.arguments = ["-a", app, "\(scheme)://extensions"]
-        try? p.run()
+        guard let url = URL(string: "\(scheme)://extensions") else { return }
+        let target = appURL(app)
+        guard FileManager.default.fileExists(atPath: target.path) else {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        NSWorkspace.shared.open([url], withApplicationAt: target,
+                                configuration: NSWorkspace.OpenConfiguration())
+    }
+
+    @objc private func downloadEdge() {
+        if let url = URL(string: "https://www.microsoft.com/edge") { NSWorkspace.shared.open(url) }
+    }
+
+    @objc private func downloadChrome() {
+        if let url = URL(string: "https://www.google.com/chrome") { NSWorkspace.shared.open(url) }
     }
 
     @objc private func reopenExtensions() {
@@ -321,45 +437,71 @@ final class OnboardingController {
     }
 
     @objc private func revealDir() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: extDir))
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: extDir)])
     }
 
-    @objc private func check() {
-        guard !checking else { return }
-        checking = true
+    /// 进入步骤页后自动轮询：连上就跳「已连接」，不用用户再点按钮。
+    /// 判定必须按「用户刚选的那个浏览器」来做：Edge 装了不代表 Chrome 装了。
+    private func startWatching() {
         pollTimer?.invalidate()
-        // 扩展每 5 秒上报一次；给 20 秒窗口，看到就转成功页
-        var left = 20
+        var left = 180
+        let want = browserKey(browser)
         pollTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] t in
-            guard let self else { return }
+            guard let self else { t.invalidate(); return }
             left -= 2
-            self.fetchExtensionState { ok in
-                if ok {
+            self.probe(for: want) { result in
+                switch result {
+                case .ok:
                     t.invalidate()
-                    self.checking = false
+                    self.pollTimer = nil
                     self.renderDone()
-                } else if left <= 0 {
-                    t.invalidate()
-                    self.checking = false
-                    self.renderFailed("还没收到上报。确认扩展已「启用」，并且 \(self.browser ?? "浏览器") 里至少开着一个会话标签。")
+                case .noBackend:
+                    if left <= 0 {
+                        t.invalidate()
+                        self.pollTimer = nil
+                        self.renderFailed("本机取数服务没起来（端口 \(taskPulsePort())）。在「活动监视器」里结束 TaskPulse 后重新打开 App 即可。")
+                    }
+                case .noExtension:
+                    if left <= 0 {
+                        t.invalidate()
+                        self.pollTimer = nil
+                        self.renderFailed("本机服务正常，但还没收到 \(self.browser ?? "浏览器") 的扩展上报。确认扩展在这个浏览器里已「启用」，并在这个浏览器里开着一个会话标签。")
+                    } else {
+                        self.renderFailed("服务正常，等待 \(self.browser ?? "浏览器") 的扩展上报…（还剩 \(left) 秒）")
+                    }
                 }
             }
         }
     }
 
-    private func fetchExtensionState(_ done: @escaping (Bool) -> Void) {
-        guard let url = URL(string: endpoint + "/state") else { return done(false) }
+    private enum Probe { case ok, noExtension, noBackend }
+
+    /// "Microsoft Edge" -> "edge"，与扩展上报里的 browser 字段对齐
+    private func browserKey(_ name: String?) -> String {
+        guard let n = name else { return "" }
+        return n.contains("Edge") ? "edge" : "chrome"
+    }
+
+    /// want 为空时退回旧的全局判断
+    private func probe(for want: String = "", _ done: @escaping (Probe) -> Void) {
+        guard let url = URL(string: endpoint + "/state") else { return done(.noBackend) }
         var req = URLRequest(url: url)
         req.timeoutInterval = 3
         URLSession.shared.dataTask(with: req) { data, _, _ in
-            var ok = false
+            var result = Probe.noBackend
             if let d = data,
                let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-               let ext = obj["extension"] as? [String: Any],
-               let live = ext["ok"] as? Bool {
-                ok = live
+               let ext = obj["extension"] as? [String: Any] {
+                let live = ext["ok"] as? Bool ?? false
+                let browsers = (ext["browsers"] as? [String]) ?? []
+                if want.isEmpty || browsers.isEmpty {
+                    // 老版本 poller 没有 browsers 字段，只能沿用全局判断
+                    result = live ? .ok : .noExtension
+                } else {
+                    result = browsers.contains(want) ? .ok : .noExtension
+                }
             }
-            DispatchQueue.main.async { done(ok) }
+            DispatchQueue.main.async { done(result) }
         }.resume()
     }
 
@@ -376,7 +518,6 @@ final class OnboardingController {
     @objc private func dismiss() {
         pollTimer?.invalidate()
         pollTimer = nil
-        checking = false
         panel?.orderOut(nil)
         panel = nil
         body = nil

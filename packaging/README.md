@@ -42,15 +42,23 @@
 - **Edge** → 打开 `edge://extensions`
 - **Chrome** → 打开 `chrome://extensions`
 
-然后在扩展页里：打开右上角「开发人员模式」→「加载解压缩的扩展」→
-选 `~/Applications/TaskPulse/edge-ext`（引导窗口可以一键复制路径 / 打开目录）。
+引导会自动做掉三件小事：打开扩展页、把扩展目录路径复制到剪贴板、
+在 Finder 里把 `edge-ext` 文件夹选中，并把引导窗口挪到屏幕右下角让出落点。
 
-回到引导窗口点「检查一下」，收到扩展上报就自动关窗。
+你只需要两步：
+
+1. 在浏览器扩展页右上角打开「开发人员模式」。
+2. 把 Finder 里选中的 `edge-ext` 拖到扩展页中间的空区域。
+
+> 拖拽不生效的版本，点「加载解压缩的扩展」→ 按 ⌘⇧G 粘贴路径（已复制）→ 回车。
+
+装好之后引导会自己轮询到扩展上报，自动变成「已连接」，不用点任何按钮。
+判定按你选的那个浏览器来做——Edge 装了不会被当成 Chrome 也装好了。
 
 想重新走一遍引导：
 
 ```bash
-defaults delete com.hyj.taskpulse onboarded
+defaults delete com.taskpulse.ui onboarded
 launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 ```
 

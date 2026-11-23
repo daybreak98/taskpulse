@@ -182,7 +182,8 @@ import json, os, sys
 d, scope, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
 mpath = os.path.join(d, "manifest.json")
 m = json.load(open(mpath))
-m["host_permissions"] = ["http://127.0.0.1:%d/*" % port]
+# scope 同时给 host 权限：内容脚本（浏览器内取数）需要它才能注入页面
+m["host_permissions"] = ["http://127.0.0.1:%d/*" % port, scope]
 json.dump(m, open(mpath, "w"), ensure_ascii=False, indent=2)
 with open(os.path.join(d, "config.js"), "w") as f:
     f.write("// 由 install.command 按你的配置生成，重新安装会覆盖\n")
@@ -279,7 +280,8 @@ if [ "${TP_DRY:-}" = "1" ]; then
   exit 0
 fi
 
-# 全新安装要让 App 弹一次浏览器扩展引导
+# 全新安装要让 App 弹一次浏览器扩展引导（bundle id 换过一次，两个都清）
+defaults delete com.taskpulse.ui onboarded 2>/dev/null || true
 defaults delete com.hyj.taskpulse onboarded 2>/dev/null || true
 
 launchctl bootout "gui/$(id -u)/com.taskpulse.poller" 2>/dev/null
@@ -299,8 +301,12 @@ fi
 cat <<TIPS
 
 ===== 接下来只需 2 步（窗口里会带你走）=====
-1) 右上角小窗会弹一个「装浏览器扩展」的引导：选 Edge 或 Chrome，
-   它会把扩展页打开、把目录递给你，点「检查一下」自动确认。
+1) 屏幕中间会弹「装浏览器扩展」的引导：选 Edge 或 Chrome 后，它会自动
+   打开扩展页、自动把扩展目录路径复制到剪贴板、自动在 Finder 里打开该目录。
+   你只需要在扩展页里做两件事：
+     a. 右上角打开「开发人员模式」
+     b. 点「加载解压缩的扩展」→ 按 ⌘⇧G 粘贴路径 → 回车 → 选「选择」
+   装好后引导会自己检测到，自动变成「已连接」，不用点任何检查按钮。
 
 2) 首次点任务行跳转时，系统会弹「TaskPulse 想要控制浏览器」，点「允许」。
    数据服务用的是你浏览器里已登录的账号，不用另填 token。
@@ -309,7 +315,7 @@ cat <<TIPS
 扩展目录：$DEST/edge-ext
 
 想重新走一遍引导：
-  defaults delete com.hyj.taskpulse onboarded; launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
+  defaults delete com.taskpulse.ui onboarded; launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 
 想要卸载：运行 uninstall.command
 TIPS

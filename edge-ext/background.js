@@ -11,8 +11,18 @@ const ENDPOINT = BASE + "/tabs";
 const ACTIVE_ENDPOINT = BASE + "/active";
 const CMD_ENDPOINT = BASE + "/cmd";
 const ACK_ENDPOINT = BASE + "/cmd/ack";
+const WEBSTATE_ENDPOINT = BASE + "/webstate";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 上报里带上「我是哪个浏览器」：初装引导要据此判断「用户刚装的那个浏览器连上没有」。
+// 只看 UA，不涉及任何页面内容。
+const BROWSER = (() => {
+  const ua = (self.navigator && self.navigator.userAgent) || "";
+  if (ua.includes("Edg/")) return "edge";
+  if (ua.includes("Chrome/")) return "chrome";
+  return "unknown";
+})();
 
 async function snapshot() {
   if (!SCOPE) return [];
@@ -56,7 +66,7 @@ async function push() {
     await fetch(ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ at: Date.now(), tabs, active })
+      body: JSON.stringify({ at: Date.now(), browser: BROWSER, tabs, active })
     });
   } catch (_) {
     // TaskPulse 没在跑时静默失败
@@ -185,3 +195,44 @@ for (const ev of [
 chrome.alarms.create("tp-sync", { periodInMinutes: 0.5 });
 push();
 listen();
+
+// ── 数据来源二：在开着的 DataAgent 页面里用 cookie 取数 ──────────────
+// 由 config.js 的 scope 决定注入哪些页面，manifest 里不写死域名。
+const API_CFG = CFG.api || null;
+
+async function ensureWebBridge() {
+  if (!SCOPE || !chrome.scripting) return;
+  try {
+    const old = await chrome.scripting.getRegisteredContentScripts({ ids: ["tp-web-bridge"] });
+    if (old.length) await chrome.scripting.unregisterContentScripts({ ids: ["tp-web-bridge"] });
+  } catch (_) {}
+  try {
+    await chrome.scripting.registerContentScripts([{
+      id: "tp-web-bridge",
+      matches: [SCOPE],
+      js: ["web-bridge.js"],
+      runAt: "document_idle",
+      persistAcrossSessions: true
+    }]);
+  } catch (_) {
+    // 页面已打开时需要手动刷新一次才会注入
+  }
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
+  if (!msg) return;
+  if (msg.kind === "get-config") {
+    respond(API_CFG ? { api: API_CFG } : null);
+    return;
+  }
+  if (msg.kind === "webstate" && msg.payload) {
+    fetch(WEBSTATE_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(msg.payload)
+    }).then(() => respond({ ok: true })).catch(() => respond({ ok: false }));
+    return true;
+  }
+});
+
+ensureWebBridge();

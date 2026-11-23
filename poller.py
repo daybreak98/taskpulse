@@ -85,6 +85,8 @@ DEFAULTS = {
         "archive_hours": 48,
     },
     "ui": {"port": 8899},
+    # 数据来源：api=用 auth 配置直连接口；web=用浏览器里开着的页面（cookie 认证）
+    "source": "api",
     "extension": {"scope": ""},
     # 识别「被限流打断」的关键词；留空则不启用该判定
     "failure_marks": [],
@@ -138,6 +140,34 @@ AGENT_IDS = list(PLATFORM.get("agent_ids") or [])
 POLL_SECONDS = max(1, int(CFG["poll"]["interval_seconds"]))
 TP_DEBUG = os.environ.get("TP_DEBUG") == "1"
 WATCH_LIMIT = max(0, int(CFG["poll"]["watch_limit"]))
+# 数据来源可在运行时切换（UI 上那个 API / WEB 按钮）
+WEBSTATE_FILE = os.path.join(HOME, ".taskpulse", "webstate.json")
+# web 模式下缓存超过这么久没更新，就当作「页面关了」，别让旧数字看着像新的
+WEB_STALE_SECONDS = max(90, POLL_SECONDS * 2)
+
+
+def source_mode() -> str:
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            v = (json.load(f).get("source") or "api")
+    except Exception:
+        v = CFG.get("source") or "api"
+    v = str(v).lower()
+    return v if v in ("api", "web") else "api"
+
+
+def set_source_mode(mode: str) -> None:
+    """只在配置文件里改这一项，其余原样写回。"""
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    cfg["source"] = mode
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_FILE)
 ACTIVE_POLL_SECONDS = max(0, int(CFG["poll"]["active_interval_seconds"]))
 DISCOVERY_POLL_SECONDS = max(0, int(CFG["poll"].get("discovery_interval_seconds", 5)))
 ACTIVE_WATCH_LIMIT = min(WATCH_LIMIT, max(0, int(CFG["poll"]["active_watch_limit"])))
@@ -400,6 +430,85 @@ class AgentClient:
         return messages[0] if isinstance(messages, list) and messages and isinstance(messages[0], dict) else {}
 
 
+class NoSample(Exception):
+    """缓存里还没有这个会话的样本。不是错误，只是扩展这一轮没报到它。"""
+
+
+class WebProvider:
+    """数据来自浏览器里开着的 DataAgent 页面（cookie 认证，扩展推送过来）。
+
+    与 AgentClient 同接口，但只读本地缓存：不发起任何 HTTP，也不需要 auth 配置。
+    """
+
+    def __init__(self) -> None:
+        qf = PLATFORM.get("queue_fields") or {}
+        self.f_state = qf.get("state") or "state"
+        self.f_pending = qf.get("pending") or ""
+        self.idle = tuple(qf.get("idle") or ())
+        self._mtime = 0.0
+        self._data: dict = {}
+
+    def _load(self) -> dict:
+        try:
+            mtime = os.path.getmtime(WEBSTATE_FILE)
+        except OSError:
+            return self._data
+        if mtime != self._mtime:
+            try:
+                with open(WEBSTATE_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self._data = data
+                    self._mtime = mtime
+            except (OSError, ValueError):
+                pass
+        return self._data
+
+    def age_seconds(self) -> float | None:
+        """缓存多久没更新了；用于判定「页面都关了」。"""
+        at = self._load().get("at") or 0
+        return None if not at else (now_ms() - int(at)) / 1000
+
+    def conversations(self, timeout: float) -> list[dict]:
+        items = self._load().get("conversations") or []
+        out: list[dict] = []
+        seen = set()
+        for c in items:
+            try:
+                cid = int(c.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            out.append({**c, "id": cid,
+                        "updateTime": int(c.get("updateTime") or 0),
+                        "createTime": int(c.get("createTime") or 0),
+                        "name": c.get("name") or f"会话 {cid}",
+                        "groupName": c.get("groupName") or ""})
+        out.sort(key=lambda c: c["updateTime"], reverse=True)
+        return out
+
+    def queue(self, cid: int, timeout: float) -> tuple[bool, str | int]:
+        q = (self._load().get("queues") or {}).get(str(cid))
+        if not isinstance(q, dict):
+            raise NoSample(str(cid))
+        raw = q.get(self.f_state)
+        if raw in (None, ""):
+            raise NoSample(str(cid))
+        pending = q.get(self.f_pending) if self.f_pending else None
+        return bool(pending) or raw not in self.idle, raw
+
+    def last_message(self, cid: int, timeout: float) -> dict:
+        msg = (self._load().get("lastMessages") or {}).get(str(cid))
+        return msg if isinstance(msg, dict) else {}
+
+
+def make_agent():
+    """按当前数据来源建取数对象。web 模式完全不碰 auth 配置。"""
+    return WebProvider() if source_mode() == "web" else AgentClient()
+
+
 # ── 状态机 ──────────────────────────────────────────────────────────
 
 class QueueSample(NamedTuple):
@@ -526,6 +635,9 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
         try:
             busy, raw = agent.queue(conv["id"], timeout)
             samples[cid] = QueueSample(now_ms(), busy, raw)
+        except NoSample:
+            samples[cid] = QueueSample(now_ms(), None)
+            continue
         except Exception as exc:
             if isinstance(exc, requests.HTTPError) and exc.response is not None:
                 if exc.response.status_code in (401, 403, 429):
@@ -780,6 +892,12 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                     del tasks[cid]
             state.pop("poller_error", None)
             state.pop("poller_error_at", None)
+            if isinstance(agent, WebProvider):
+                age = agent.age_seconds()
+                if age is None or age > WEB_STALE_SECONDS:
+                    state["poller_error"] = ("浏览器里的页面没有上报数据（页面已关或扩展停用），"
+                                             "显示上次缓存")
+                    state["poller_error_at"] = stamp
         if full or any(sample.busy is not None for sample in samples.values()):
             state["updated"] = stamp
         save_state(state)
@@ -792,6 +910,19 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
 
 
 # ── 视图 ────────────────────────────────────────────────────────────
+
+def _view_source() -> tuple[str, float | None]:
+    """当前数据来源，以及 web 模式下缓存有多旧（秒）。"""
+    mode = source_mode()
+    if mode != "web":
+        return mode, None
+    try:
+        with open(WEBSTATE_FILE, encoding="utf-8") as f:
+            at = int(json.load(f).get("at") or 0)
+    except (OSError, ValueError):
+        return mode, None
+    return mode, (now_ms() - at) / 1000 if at else None
+
 
 def view(state: dict) -> dict:
     limit = DEFAULT_WINDOW_LIMIT
@@ -854,6 +985,8 @@ def view(state: dict) -> dict:
     active = [r for r in rows if visible(r)]
     return {
         "updated": state.get("updated"),
+        "source": _view_source()[0],
+        "source_age": _view_source()[1],
         "poller_error": state.get("poller_error"),
         "poller_error_at": state.get("poller_error_at"),
         "stale_after_seconds": stale_after_seconds,
@@ -864,7 +997,11 @@ def view(state: dict) -> dict:
         "stuck_seconds": stuck,
         "window_limit": limit,
         "extension": {"at": _tab_report_at,
-                      "ok": bool(_tab_report_at) and stamp - _tab_report_at < 180_000},
+                      "ok": bool(_tab_report_at) and stamp - _tab_report_at < 180_000,
+                      # 哪些浏览器最近 3 分钟内有上报，例如 ["edge"]。
+                      # 老扩展不带 browser 字段，所以这里可能为空但 ok 为真。
+                      "browsers": [k for k, t in _tab_report_by_browser.items()
+                                   if stamp - t < 180_000]},
         "tasks": active[:limit],
         "active": active,
         "all": rows,
@@ -884,6 +1021,8 @@ _tab_ids: dict[str, int] = {}       # conversationId -> 扩展给的 tabId，切
 _active_tab = {"cid": None, "focused": False, "ts": 0}
 # 扩展最近一次上报的时刻：初装引导靠它判断「装好了没有」
 _tab_report_at = 0
+# 按浏览器分别记：装了 Edge 不代表 Chrome 也装好了，引导要区分
+_tab_report_by_browser: dict = {}
 
 
 def watching(cid: str, act: dict) -> bool:
@@ -915,10 +1054,30 @@ def save_active(act: dict) -> None:
         pass
 
 
-def ingest_tabs(payload: dict) -> int:
+def browser_of(ua: str, declared: str = "") -> str:
+    """这次上报来自哪个浏览器。
+
+    优先用扩展自己报的 browser 字段；已经在浏览器里加载的老版本扩展不报这个字段，
+    就退回看请求的 User-Agent —— 这样不用让用户去扩展页点「重新加载」。
+    """
+    b = (declared or "").strip().lower()
+    if b and b != "unknown":
+        return b
+    ua = ua or ""
+    if "Edg/" in ua:
+        return "edge"
+    if "Chrome/" in ua:
+        return "chrome"
+    return ""
+
+
+def ingest_tabs(payload: dict, ua: str = "") -> int:
     """payload.tabs = [{url, group, tabId}]，按 URL 里的 conversationId 建映射。"""
     global _tab_report_at
     _tab_report_at = now_ms()
+    b = browser_of(ua, payload.get("browser") or "")
+    if b:
+        _tab_report_by_browser[b] = _tab_report_at
     act = payload.get("active") or {}
     aurl = act.get("url") or ""
     am = re.search(r"[?&]conversationId=(\d+)", aurl)
@@ -1351,10 +1510,61 @@ class Handler(BaseHTTPRequestHandler):
                 ln = 0
             raw = self.rfile.read(ln) if ln > 0 else b"{}"
             try:
-                n = ingest_tabs(json.loads(raw or b"{}"))
+                n = ingest_tabs(json.loads(raw or b"{}"),
+                                self.headers.get("User-Agent") or "")
             except Exception:
                 n = 0
             self._json({"ok": True, "mapped": n})
+            return
+
+        # 扩展在页面里（用浏览器 cookie）取到的数据：只落盘 + 立即重算一次
+        if parsed.path == "/webstate":
+            try:
+                ln = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                ln = 0
+            raw = self.rfile.read(ln) if ln > 0 else b"{}"
+            try:
+                payload = json.loads(raw or b"{}")
+            except Exception:
+                payload = None
+            if not isinstance(payload, dict):
+                self._json({"ok": False, "error": "bad json"}, 400)
+                return
+            # api 模式下忽略上报，避免两套数据互相覆盖
+            if source_mode() != "web":
+                self._json({"ok": True, "ignored": "source is api"})
+                return
+            payload["at"] = now_ms()
+            try:
+                os.makedirs(os.path.dirname(WEBSTATE_FILE), exist_ok=True)
+                tmp = WEBSTATE_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False)
+                os.replace(tmp, WEBSTATE_FILE)
+            except OSError as exc:
+                self._json({"ok": False, "error": str(exc)}, 500)
+                return
+            try:
+                save_state(poll_tick(make_agent(), full=True))
+            except Exception as exc:  # noqa: BLE001
+                log(f"webstate 刷新失败: {exc}")
+            self._json({"ok": True})
+            return
+
+        # 切换数据来源：api / web
+        if parsed.path == "/mode":
+            mode = (query.get("value") or [""])[0].strip().lower()
+            if mode not in ("api", "web"):
+                self._json({"ok": False, "error": "value 只能是 api 或 web"}, 400)
+                return
+            try:
+                set_source_mode(mode)
+            except OSError as exc:
+                self._json({"ok": False, "error": str(exc)}, 500)
+                return
+            log("数据来源切换为 %s" % mode)
+            self._json({"ok": True, "source": mode})
             return
 
         # 扩展收到命令并执行完后回报
@@ -1479,8 +1689,8 @@ def _poll_forever() -> None:
         full = started >= next_full
         discovery = (not full) and bool(DISCOVERY_POLL_SECONDS) and started >= next_discovery
         try:
-            if agent is None:
-                agent = AgentClient()
+            if agent is None or isinstance(agent, WebProvider) != (source_mode() == "web"):
+                agent = make_agent()   # 数据来源被切换过
             state = poll_tick(agent, full=full, discovery=discovery)
             failures = 0
             if full:
@@ -1598,7 +1808,7 @@ def main() -> int:
         if lock is None:
             return 0
         with lock:
-            state = poll_tick(AgentClient(), full=True)
+            state = poll_tick(make_agent(), full=True)
         print(json.dumps(view(state), ensure_ascii=False, indent=1))
         return 0
 

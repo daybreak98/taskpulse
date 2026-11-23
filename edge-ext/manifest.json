@@ -6,7 +6,8 @@
   "permissions": [
     "tabs",
     "tabGroups",
-    "alarms"
+    "alarms",
+    "scripting"
   ],
   "host_permissions": [
     "http://127.0.0.1:8899/*"

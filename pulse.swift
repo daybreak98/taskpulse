@@ -64,6 +64,10 @@ struct Counts: Decodable, Equatable {
 }
 struct Payload: Decodable {
     let updated: Int?
+    /// 当前取数来源："api"（本机 OBO token）或 "web"（浏览器内 cookie）
+    let source: String?
+    /// web 来源的缓存新鲜度（秒）
+    let source_age: Double?
     let window_limit: Int?
     let poller_error: String?
     let stale_after_seconds: Double?
@@ -376,6 +380,19 @@ final class CapsuleView: NSView {
         innerEdge.stroke()
     }
 
+    /// 右键胶囊：重新跑一遍安装引导（Esc 关掉引导不会清 onboarded，这里给个入口）
+    override func rightMouseDown(with event: NSEvent) {
+        let menu = NSMenu()
+        let item = NSMenuItem(title: "重新打开安装引导", action: #selector(reopenOnboarding), keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func reopenOnboarding() {
+        OnboardingController.shared.show()
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard event.clickCount == 1, let onPick else { return }
         let p = convert(event.locationInWindow, from: nil)
@@ -423,6 +440,57 @@ final class PinView: NSView {
     override func mouseDown(with event: NSEvent) {
         guard event.clickCount == 1 else { return }
         onClick?()
+    }
+}
+
+// MARK: - 数据来源切换（API / WEB）
+
+/// 两段小胶囊：左 API（本机 token 取数）、右 WEB（浏览器里用 cookie 取数）。
+final class SourceToggleView: NSView {
+    var source = "api" { didSet { needsDisplay = true } }
+    var onPick: ((String) -> Void)?
+
+    override var isFlipped: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let r = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
+                             xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+        rgb(0x0F1A21, alpha: 0.35).setFill()
+        r.fill()
+        hairline.setStroke()
+        r.lineWidth = 0.8
+        r.stroke()
+
+        let labels = [("api", "API"), ("web", "WEB")]
+        let half = bounds.width / 2
+        for (i, pair) in labels.enumerated() {
+            let active = source == pair.0
+            let cell = NSRect(x: CGFloat(i) * half, y: 0, width: half, height: bounds.height)
+            if active {
+                let pill = NSBezierPath(roundedRect: cell.insetBy(dx: 1, dy: 1),
+                                        xRadius: (bounds.height - 2) / 2,
+                                        yRadius: (bounds.height - 2) / 2)
+                palette[pair.0 == "web" ? "done" : "running"]!.withAlphaComponent(0.85).setFill()
+                pill.fill()
+            }
+            let text = pair.1 as NSString
+            let font = NSFont.systemFont(ofSize: 8.5, weight: active ? .bold : .medium)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: active ? NSColor.white.withAlphaComponent(0.96)
+                                         : secondaryText.withAlphaComponent(0.7),
+            ]
+            let size = text.size(withAttributes: attrs)
+            text.draw(at: NSPoint(x: cell.midX - size.width / 2, y: cell.midY - size.height / 2),
+                      withAttributes: attrs)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard event.clickCount == 1 else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        onPick?(p.x < bounds.midX ? "api" : "web")
     }
 }
 
@@ -686,6 +754,7 @@ final class PulseView: NSView {
     var onToggleAll: (() -> Void)?
     var onFilterChange: ((String?) -> Void)?
     var onTogglePin: (() -> Void)?
+    var onSetSource: ((String) -> Void)?
     var onOpen: ((TaskItem) -> Void)?
     var onCheck: ((TaskItem, Bool) -> Void)?
     var onDeadline: ((TaskItem, Int?) -> Void)?
@@ -934,6 +1003,21 @@ final class PulseView: NSView {
         pin.toolTip = pinned ? "已固定展开（点击取消）" : "固定展开"
         pin.onClick = { [weak self] in self?.onTogglePin?() }
         addSubview(pin)
+
+        let src = SourceToggleView(frame: NSRect(x: bounds.width - 100, y: (HEADER_H - 18) / 2,
+                                                 width: 46, height: 18))
+        let current = payload?.source ?? "api"
+        src.source = current
+        if let age = payload?.source_age {
+            src.toolTip = "取数来源：\(current == "web" ? "浏览器内 cookie" : "本机 token")，缓存 \(Int(age)) 秒"
+        } else {
+            src.toolTip = "取数来源：\(current == "web" ? "浏览器内 cookie" : "本机 token")"
+        }
+        src.onPick = { [weak self] mode in
+            guard let self, mode != current else { return }
+            self.onSetSource?(mode)
+        }
+        addSubview(src)
 
         let sep = NSView(frame: NSRect(x: 10, y: HEADER_H - 0.5, width: bounds.width - 20, height: 0.5))
         sep.wantsLayer = true
@@ -1221,6 +1305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.compact = !expanded
         view.onToggleAll = { [weak self] in self?.toggleAll() }
         view.onTogglePin = { [weak self] in self?.togglePin() }
+        view.onSetSource = { [weak self] mode in self?.setSource(mode) }
         view.onOpen = { [weak self] item in self?.open(item) }
         view.onCheck = { [weak self] item, on in on ? self?.ack(item) : self?.unack(item) }
         view.onDeadline = { [weak self] item, m in self?.setDeadline(item, minutes: m) }
@@ -1664,6 +1749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard let self else { return }
                 self.dataRequestInFlight = false
                 let counts = self.view.payload?.counts
+                let shownSource = self.view.payload?.source
                 let items = self.view.compact ? [] : self.view.visibleItems()
                 self.view.connectionLost = payload == nil
                 if let payload {
@@ -1678,6 +1764,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
                 let detail = self.view.statusDetail
                 if detail != self.drawnStatusDetail || counts != self.view.payload?.counts
+                    || shownSource != self.view.payload?.source
                     || (!self.view.compact && items != self.view.visibleItems()) {
                     self.drawnStatusDetail = detail
                     self.applyLayout()
@@ -1720,6 +1807,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 取消勾选：恢复对该会话的监控
     func unack(_ item: TaskItem) {
         post("/unack?id=\(item.id)")
+    }
+
+    /// 切换取数来源：api = 本机 token，web = 浏览器里用 cookie 取数
+    func setSource(_ mode: String) {
+        post("/mode?value=\(mode)")
     }
 
     func post(_ path: String) {

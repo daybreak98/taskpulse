@@ -32,9 +32,10 @@ rm -rf "$OUT" && mkdir -p "$OUT"
 cp -R "$APP" "$OUT/"
 cp poller.py "$OUT/"
 # edge-ext/config.js 是按本机配置生成的，不进包（install.command 会重新生成）
+# *.bak* 是编辑器备份，同样不进包
 mkdir -p "$OUT/edge-ext"
 for f in "$PWD"/edge-ext/*; do
-  case "$(basename "$f")" in config.js) continue ;; esac
+  case "$(basename "$f")" in config.js|*.bak*) continue ;; esac
   cp -R "$f" "$OUT/edge-ext/"
 done
 cp packaging/install.command packaging/uninstall.command packaging/README.md "$OUT/"
