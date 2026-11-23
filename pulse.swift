@@ -94,8 +94,10 @@ func rgb(_ value: UInt32, alpha: CGFloat = 1) -> NSColor {
 // 色值与图层顺序取自 AgentPulse-glass 参考：底板 --glass-rgb 51 77 95，
 // --glass-transparency .10（即底板不透明度 90%），再叠一层高光渐变与 20px 背后的模糊。
 
-let glassRGB: UInt32 = 0x334D5F
-let glassTransparency: CGFloat = 0.10
+// 比参考再压一档：底色整体加深 25%（#334D5F × 0.75），
+// 同时把底板透明度从 10% 提到 35%，能透出背后的内容。
+let glassRGB: UInt32 = 0x263A47
+let glassTransparency: CGFloat = 0.35
 let glassRadius: CGFloat = 16
 /// 面板/提示条的边框与内高光（参考里的 --glass-border 与 inset shadow）
 let glassBorder = rgb(0xD2E8F4, alpha: 0.49)
@@ -235,7 +237,7 @@ final class CapsuleView: NSView {
         let outerRadius: CGFloat = vertical ? 13 : 9
         let shellRect = bounds.insetBy(dx: 0.5, dy: 0.5)
         let shell = NSBezierPath(roundedRect: shellRect, xRadius: outerRadius, yRadius: outerRadius)
-        rgb(0x435B6C, alpha: 0.96).setFill()
+        rgb(0x324451, alpha: 0.96).setFill()
         shell.fill()
 
         // 内圈：状态色块都画在这一块里，自动获得圆角
