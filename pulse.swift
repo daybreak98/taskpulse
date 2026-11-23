@@ -119,13 +119,39 @@ struct CapsuleTone {
     let fill: NSColor
     let highlight: NSColor
 }
+/// 色块默认亮度与高光亮度统一的提亮倍数（1 = 原样，2 = 视觉亮度翻倍）
+let capsuleBrightness: CGFloat = 2
+
+/// 线性光空间里按倍数提亮：感知亮度真的翻倍，同时保住色相
+/// （直接在 sRGB 上乘系数会偏色、往白里塌）
+func brightened(_ color: NSColor, by factor: CGFloat) -> NSColor {
+    guard let c = color.usingColorSpace(.sRGB) else { return color }
+    func toLinear(_ v: CGFloat) -> CGFloat {
+        v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+    }
+    func fromLinear(_ v: CGFloat) -> CGFloat {
+        let l = min(max(v, 0), 1)
+        return l <= 0.0031308 ? l * 12.92 : 1.055 * pow(l, 1 / 2.4) - 0.055
+    }
+    return NSColor(srgbRed: fromLinear(toLinear(c.redComponent) * factor),
+                   green: fromLinear(toLinear(c.greenComponent) * factor),
+                   blue: fromLinear(toLinear(c.blueComponent) * factor),
+                   alpha: c.alphaComponent)
+}
+
+func capsuleTone(_ fill: NSColor, _ highlight: NSColor) -> CapsuleTone {
+    CapsuleTone(fill: brightened(fill, by: capsuleBrightness),
+                highlight: brightened(highlight, by: capsuleBrightness)
+                    .withAlphaComponent(min(1, highlight.alphaComponent * capsuleBrightness)))
+}
+
 let capsuleTones: [String: CapsuleTone] = [
-    "running": CapsuleTone(fill: rgb(0x4E8BAC), highlight: rgb(0x76BADE, alpha: 0xA8 / 255.0)),
-    "attention": CapsuleTone(fill: rgb(0x9B926F), highlight: rgb(0xE5BD69, alpha: 0xCC / 255.0)),
-    "stuck": CapsuleTone(fill: rgb(0xA5707A), highlight: rgb(0xEFA8AF, alpha: 0xA8 / 255.0)),
+    "running": capsuleTone(rgb(0x4E8BAC), rgb(0x76BADE, alpha: 0xA8 / 255.0)),
+    "attention": capsuleTone(rgb(0x9B926F), rgb(0xE5BD69, alpha: 0xCC / 255.0)),
+    "stuck": capsuleTone(rgb(0xA5707A), rgb(0xEFA8AF, alpha: 0xA8 / 255.0)),
 ]
 /// 计数为 0 时统一降到这一档，不再按状态各配一个灰
-let capsuleZero = CapsuleTone(fill: rgb(0x607E90), highlight: rgb(0x9EB4C3, alpha: 0x59 / 255.0))
+let capsuleZero = capsuleTone(rgb(0x607E90), rgb(0x9EB4C3, alpha: 0x59 / 255.0))
 /// 胶囊底板 / 整圈描边 / 内圈细线 / 数字墨色
 let capsuleShell = rgb(0x3A5B6D, alpha: 0.78)
 let capsuleEdge = rgb(0xCDE5F2, alpha: 0.64)
