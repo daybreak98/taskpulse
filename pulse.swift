@@ -94,9 +94,9 @@ func rgb(_ value: UInt32, alpha: CGFloat = 1) -> NSColor {
 // 色值与图层顺序取自 AgentPulse-glass 参考：底板 --glass-rgb 51 77 95，
 // --glass-transparency .10（即底板不透明度 90%），再叠一层高光渐变与 20px 背后的模糊。
 
-// 底色在参考基础上加深 25%（#334D5F × 0.75）；透明度先回到 10% 那一档。
+// 底色在参考 #334D5F 基础上再压两档（× 0.75 × 0.75 ≈ 0.56），透明度停在 10%。
 // 想更透就改 glassTransparency（0.2 左右还能看清字，0.35 会明显发白）。
-let glassRGB: UInt32 = 0x263A47
+let glassRGB: UInt32 = 0x1D2C35
 let glassTransparency: CGFloat = 0.10
 let glassRadius: CGFloat = 16
 /// 面板/提示条的边框与内高光（参考里的 --glass-border 与 inset shadow）
@@ -139,11 +139,12 @@ func drawRowPlate(_ path: NSBezierPath, _ status: String?) {
     path.fill()
     NSGraphicsContext.saveGraphicsState()
     path.setClip()
-    if let g = NSGradient(starting: rgb(0xE3F5FF, alpha: 0.07),
-                          ending: rgb(0xE3F5FF, alpha: 0.0)) {
-        g.draw(in: NSRect(x: path.bounds.minX, y: path.bounds.minY,
-                          width: path.bounds.width, height: path.bounds.height * 0.72),
-               angle: -90)
+    // 明暗扩散：左上提亮、右下压暗，斜向拉一层，避免每行像一块平涂色卡
+    if let g = NSGradient(colorsAndLocations:
+        (rgb(0xEAF7FF, alpha: 0.11), 0.0),
+        (rgb(0xEAF7FF, alpha: 0.0), 0.48),
+        (rgb(0x0B1A24, alpha: 0.16), 1.0)) {
+        g.draw(in: path.bounds, angle: -55)
     }
     NSGraphicsContext.restoreGraphicsState()
     rgb(0xD8F1FC, alpha: 0.16).setStroke()
@@ -238,7 +239,7 @@ final class CapsuleView: NSView {
         let outerRadius: CGFloat = vertical ? glassRadius : 10
         let shellRect = bounds.insetBy(dx: 0.25, dy: 0.25)
         let shell = NSBezierPath(roundedRect: shellRect, xRadius: outerRadius, yRadius: outerRadius)
-        rgb(0x324451, alpha: 0.96).setFill()
+        rgb(0x25333D, alpha: 0.97).setFill()
         shell.fill()
 
         // 内圈：状态色块都画在这一块里，自动获得圆角
@@ -931,10 +932,11 @@ final class ToastView: NSView {
         shape.fill()
         NSGraphicsContext.saveGraphicsState()
         shape.setClip()
-        if let g = NSGradient(starting: rgb(0xCBE3F1, alpha: 0.16),
-                              ending: rgb(0xCBE3F1, alpha: 0.0)) {
-            g.draw(in: NSRect(x: 0, y: bounds.height * 0.45,
-                              width: bounds.width, height: bounds.height * 0.55), angle: -90)
+        if let g = NSGradient(colorsAndLocations:
+            (rgb(0xCBE3F1, alpha: 0.16), 0.0),
+            (rgb(0xCBE3F1, alpha: 0.02), 0.45),
+            (rgb(0x061319, alpha: 0.20), 1.0)) {
+            g.draw(in: bounds, angle: -55)
         }
         NSGraphicsContext.restoreGraphicsState()
 
@@ -1114,29 +1116,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         tint.wantsLayer = true
         tint.layer?.backgroundColor = panelTint.cgColor
         tint.autoresizingMask = [.width, .height]
-        // 两层高光：左上角一团柔光（参考的 radial-gradient）+ 斜向渐变，
-        // 再压一条顶部 1px 亮边当作玻璃厚度。
-        let glow = CAGradientLayer()
-        glow.type = .radial
-        glow.frame = tint.bounds
-        glow.startPoint = CGPoint(x: 0.9, y: 1.0)
-        glow.endPoint = CGPoint(x: 0.2, y: 0.1)
-        glow.colors = [rgb(0xCBE3F1, alpha: 0.17).cgColor,
-                       rgb(0xCBE3F1, alpha: 0.0).cgColor]
-        glow.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        tint.layer?.addSublayer(glow)
+        // 明暗扩散：左上提亮、右下压暗，一层斜向渐变贯到底；
+        // 参考图里每块玻璃都是这个走向（亮部在左上，暗部沉到右下）。
+        let diffusion = CAGradientLayer()
+        diffusion.frame = tint.bounds
+        diffusion.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        diffusion.startPoint = CGPoint(x: 0.08, y: 1.0)
+        diffusion.endPoint = CGPoint(x: 0.92, y: 0.0)
+        diffusion.colors = [rgb(0xCBE3F1, alpha: 0.14).cgColor,
+                            rgb(0xCBE3F1, alpha: 0.02).cgColor,
+                            rgb(0x061319, alpha: 0.22).cgColor]
+        diffusion.locations = [0, 0.42, 1]
+        tint.layer?.addSublayer(diffusion)
 
-        let sheen = CAGradientLayer()
-        sheen.frame = tint.bounds
-        sheen.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        sheen.colors = [rgb(0xB6D6E5, alpha: 0.10).cgColor,
-                        rgb(0x8FB6CE, alpha: 0.02).cgColor,
-                        rgb(0x9DC1D0, alpha: 0.11).cgColor]
-        sheen.locations = [0, 0.62, 1]
-        sheen.startPoint = CGPoint(x: 0.15, y: 1.0)
-        sheen.endPoint = CGPoint(x: 0.85, y: 0.0)
-        tint.layer?.addSublayer(sheen)
-
+        // 顶部 1px 内高光，当作玻璃厚度
         let edge = CAGradientLayer()
         edge.frame = tint.bounds
         edge.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
