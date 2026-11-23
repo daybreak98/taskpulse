@@ -6,6 +6,10 @@
 //   其它会话      60 秒复查
 //   会话列表      30 秒刷新
 (function () {
+  // 后台会对已经开着的页面再注入一次（免去手刷），这里挡住重复启动
+  if (window.__tpWebBridge) return;
+  window.__tpWebBridge = true;
+
   let CFG = null;
   let convs = [];
   const queues = {};        // cid -> {sessionState, pending, ...}

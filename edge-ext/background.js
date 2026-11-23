@@ -63,10 +63,22 @@ async function push() {
   if (!SCOPE) return;
   try {
     const [tabs, active] = await Promise.all([snapshot(), activeInfo()]);
+    // web 段是排障用的自检：装上报里就能看出「为什么浏览器内取数没起来」
+    let registered = [];
+    try {
+      registered = (await chrome.scripting.getRegisteredContentScripts({ ids: ["tp-web-bridge"] }))
+        .map((s) => s.matches.join(","));
+    } catch (_) {}
+    const web = {
+      hasApi: !!API_CFG,
+      scripting: !!chrome.scripting,
+      pages: tabs.length,
+      registered: registered,
+    };
     await fetch(ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ at: Date.now(), browser: BROWSER, tabs, active })
+      body: JSON.stringify({ at: Date.now(), browser: BROWSER, tabs, active, web })
     });
   } catch (_) {
     // TaskPulse 没在跑时静默失败
@@ -219,6 +231,19 @@ async function ensureWebBridge() {
   }
 }
 
+async function injectIntoOpenTabs() {
+  if (!SCOPE || !chrome.scripting) return;
+  try {
+    const tabs = await chrome.tabs.query({ url: SCOPE });
+    for (const t of tabs) {
+      if (typeof t.id !== "number") continue;
+      // 已开着的页面收不到新注册的 content script，这里补一次；页面内自己会去重
+      chrome.scripting.executeScript({ target: { tabId: t.id }, files: ["web-bridge.js"] })
+        .catch(() => void 0);
+    }
+  } catch (_) {}
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   if (!msg) return;
   if (msg.kind === "get-config") {
@@ -235,4 +260,4 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   }
 });
 
-ensureWebBridge();
+ensureWebBridge().then(injectIntoOpenTabs);

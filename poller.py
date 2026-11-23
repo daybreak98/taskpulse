@@ -1001,7 +1001,9 @@ def view(state: dict) -> dict:
                       # 哪些浏览器最近 3 分钟内有上报，例如 ["edge"]。
                       # 老扩展不带 browser 字段，所以这里可能为空但 ok 为真。
                       "browsers": [k for k, t in _tab_report_by_browser.items()
-                                   if stamp - t < 180_000]},
+                                   if stamp - t < 180_000],
+                      # 扩展对「浏览器内取数」能力的自检结果（谁注册了 content script）
+                      "web": dict(_web_diag)},
         "tasks": active[:limit],
         "active": active,
         "all": rows,
@@ -1023,6 +1025,8 @@ _active_tab = {"cid": None, "focused": False, "ts": 0}
 _tab_report_at = 0
 # 按浏览器分别记：装了 Edge 不代表 Chrome 也装好了，引导要区分
 _tab_report_by_browser: dict = {}
+# browser -> 扩展自报的「浏览器内取数能力」（hasApi / scripting / pages / registered）
+_web_diag: dict = {}
 
 
 def watching(cid: str, act: dict) -> bool:
@@ -1078,6 +1082,8 @@ def ingest_tabs(payload: dict, ua: str = "") -> int:
     b = browser_of(ua, payload.get("browser") or "")
     if b:
         _tab_report_by_browser[b] = _tab_report_at
+    if isinstance(payload.get("web"), dict):
+        _web_diag[b or "?"] = payload["web"]
     act = payload.get("active") or {}
     aurl = act.get("url") or ""
     am = re.search(r"[?&]conversationId=(\d+)", aurl)
@@ -1440,6 +1446,16 @@ schedule(0);
 """
 
 
+class QuietServer(ThreadingHTTPServer):
+    """客户端（App / 扩展）断开连接是常态，不必把 traceback 打到日志里。"""
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        log("请求处理异常：%s: %s" % (type(exc).__name__, exc))
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # 静默
         pass
@@ -1492,6 +1508,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(204, b"", "application/json")
                 return
             self._json(item)
+        elif path == "/mode":
+            # GET 只查询当前来源；切换走 POST（带 value）
+            self._json({"ok": True, "source": source_mode()})
         elif path in ("/", "/index.html"):
             self._send(200, DASHBOARD.encode(), "text/html; charset=utf-8")
         else:
@@ -1798,7 +1817,7 @@ def main() -> int:
                     self._json({"ok": True, "result": "demo"})
                 else:
                     self._json({"ok": True})
-        server = ThreadingHTTPServer(("127.0.0.1", PORT), DemoHandler)
+        server = QuietServer(("127.0.0.1", PORT), DemoHandler)
         log(f"TaskPulse DEMO on http://127.0.0.1:{PORT}")
         server.serve_forever()
         return 0
@@ -1813,7 +1832,7 @@ def main() -> int:
         return 0
 
     # 取数循环常驻本进程：省掉每次都启动解释器的开销，也复用已建立的会话（少换 token）
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server = QuietServer(("127.0.0.1", PORT), Handler)
     threading.Thread(target=poll_loop, name="poller", daemon=True).start()
     log(f"TaskPulse serving on http://127.0.0.1:{PORT}")
     server.serve_forever()

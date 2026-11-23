@@ -175,34 +175,40 @@ cp -R edge-ext "$DEST/"
 # 去掉 Gatekeeper 隔离标记，避免「已损坏，无法打开」
 xattr -dr com.apple.quarantine "$HOME/Applications/$APP_NAME.app" 2>/dev/null
 
-# ---------- 4. 把域名和端口写进扩展（不声明 <all_urls>）----------
-if [ -n "$TP_SCOPE" ]; then
-  "$UV_BIN" run --quiet --no-project python - "$DEST/edge-ext" "$TP_SCOPE" "$TP_PORT" <<'PY'
+# ---------- 4. 把域名、端口和接口路径写进扩展（不声明 <all_urls>）----------
+"$UV_BIN" run --quiet --no-project python - "$DEST/edge-ext" "$CONFIG" "$TP_PORT" <<'PY'
 import json, os, sys
-d, scope, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+d, cfg_path, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+cfg = json.load(open(cfg_path))
+scope = (cfg.get("extension") or {}).get("scope") or ""
+plat = cfg.get("platform") or {}
+
+# 内容脚本在页面里取数时要用到的接口路径；同样是配置驱动，代码里不写死任何内部域名
+body = {}
+for k, v in (plat.get("conversations_body") or {}).items():
+    body[k] = list(plat.get("agent_ids") or []) if v == "{agent_ids}" else v
+api = {
+    "prefix": plat.get("api_prefix") or "",
+    "conv": (plat.get("endpoints") or {}).get("conversations") or "",
+    "queue": (plat.get("endpoints") or {}).get("queue") or "",
+    "idle": list((plat.get("queue_fields") or {}).get("idle") or []),
+    "body": body,
+}
+
 mpath = os.path.join(d, "manifest.json")
-m = json.load(open(mpath))
+m = json.load(open(os.path.join(d, "manifest.template.json")))
 # scope 同时给 host 权限：内容脚本（浏览器内取数）需要它才能注入页面
-m["host_permissions"] = ["http://127.0.0.1:%d/*" % port, scope]
+m["host_permissions"] = ["http://127.0.0.1:%d/*" % port] + ([scope] if scope else [])
 json.dump(m, open(mpath, "w"), ensure_ascii=False, indent=2)
+
 with open(os.path.join(d, "config.js"), "w") as f:
     f.write("// 由 install.command 按你的配置生成，重新安装会覆盖\n")
-    f.write("self.TP_CONFIG = %s;\n" % json.dumps({"scope": scope, "port": port}))
+    f.write("self.TP_CONFIG = %s;\n" % json.dumps(
+        {"scope": scope, "port": port, "api": api if scope else None}))
 print("   -> manifest.json / config.js")
 PY
-else
-  echo "-- 跳过：extension.scope 为空，扩展装上也不会匹配任何页面"
-  "$UV_BIN" run --quiet --no-project python - "$DEST/edge-ext" "$TP_PORT" <<'PY'
-import json, os, sys
-d, port = sys.argv[1], int(sys.argv[2])
-mpath = os.path.join(d, "manifest.json")
-m = json.load(open(mpath))
-m["host_permissions"] = ["http://127.0.0.1:%d/*" % port]
-json.dump(m, open(mpath, "w"), ensure_ascii=False, indent=2)
-with open(os.path.join(d, "config.js"), "w") as f:
-    f.write("// 由 install.command 按你的配置生成，重新安装会覆盖\n")
-    f.write("self.TP_CONFIG = %s;\n" % json.dumps({"scope": "", "port": port}))
-PY
+if [ -z "$TP_SCOPE" ]; then
+  echo "-- 注意：extension.scope 为空，扩展装上也不会匹配任何页面"
 fi
 
 # ---------- 5. 写入 launchd 配置 ----------
