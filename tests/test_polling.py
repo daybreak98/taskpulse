@@ -177,6 +177,30 @@ class PollingTests(unittest.TestCase):
         poller.poll_tick(agent, full=False)
         self.assertEqual(agent.queue_calls, [1])
 
+    def test_attention_restarts_countdown_after_turn_finishes(self):
+        agent = FakeAgent([conversation(1)], busy=(1,))
+        poller.poll_tick(agent, full=True)                        # 起跑
+        self.stamp += 400_000
+        poller.poll_tick(agent, full=True)
+        self.assertEqual(poller.load_state()["tasks"]["1"]["status"], "running")
+
+        agent.busy = set()                                        # 这一轮结束，转待回复
+        self.stamp += 1_000
+        poller.poll_tick(agent, full=True)
+        task = poller.load_state()["tasks"]["1"]
+        self.assertEqual(task["status"], "attention")
+        self.assertEqual(task["countdown_since"], self.stamp)     # 倒计时从这一刻重新起算
+
+        # 累计已 800 秒，但待回复阶段才过了 400 秒：不能判卡住
+        self.stamp += 400_000
+        poller.poll_tick(agent, full=True)
+        self.assertEqual(poller.load_state()["tasks"]["1"]["status"], "attention")
+
+        # 待回复本身等满阈值（测试里压到 600 秒）→ 卡住
+        self.stamp += 250_000
+        state = poller.poll_tick(agent, full=True)
+        self.assertEqual(state["tasks"]["1"]["status"], "stuck")
+
     def test_rate_limit_message_is_detected_while_still_running(self):
         agent = FakeAgent([conversation(1)], busy=(1,))
         poller.poll_tick(agent, full=True)

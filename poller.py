@@ -80,7 +80,7 @@ DEFAULTS = {
         "stuck_interval_seconds": 60,
         "rate_limit_probe_seconds": 60,
         "watch_limit": 20,
-        "stuck_seconds": 600,
+        "stuck_seconds": 1800,
         "window_limit": 10,
         "archive_hours": 48,
     },
@@ -472,6 +472,7 @@ def mark_seen(task: dict) -> None:
     task["acked_update"] = task.get("update_ms") or 0
     task["acked_at"] = now_ms()
     task["reply_pending"] = False
+    task["countdown_since"] = 0
     if task.get("status") in ("attention", "stuck") or task.get("status") is None:
         task["prev"] = task.get("status") or "running"
         task["status"] = "seen"
@@ -563,6 +564,7 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
         if not started:
             started = sample.at
             task["running_since"] = started
+            task["countdown_since"] = started
         # 运行中也可能被限流卡住：这一轮翻过消息就把结论落在状态上，别等它转空闲。
         run_reply = f"run:{started}"
         checked = sample.checked_reply == run_reply
@@ -576,7 +578,10 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
         task["failed"] = bool(sample.failed) if checked else False
         task["reply_pending"] = False
         elapsed = (sample.at - started) // 1000
-        task["status"] = "stuck" if (elapsed >= DEFAULT_STUCK_SECONDS or task["failed"]) else "running"
+        # 卡住判定看的是「这一阶段」的倒计时：运行中从起跑算，转入待回复后重新起算
+        phase = task.get("countdown_since") or started
+        waited = (sample.at - phase) // 1000
+        task["status"] = "stuck" if (waited >= DEFAULT_STUCK_SECONDS or task["failed"]) else "running"
         if task["failed"] and task.get("failed_notified") != started:
             task["failed_notified"] = started
             notifications.append(("疑似被限流",
@@ -589,6 +594,7 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
 
     update = task["update_ms"]
     reply = pending_reply(task, update, sample.at)
+    was_attention = task.get("status") == "attention"
     task["running_since"] = 0
     task["stuck_notified"] = 0
 
@@ -600,6 +606,7 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
         task["status"] = "seen"
         task["failed"] = False
         task["reply_pending"] = False
+        task["countdown_since"] = 0
         return
 
     if started:
@@ -616,6 +623,18 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
             task["classified_reply"] = reply
             task["failed"] = sample.failed
     task["status"] = "stuck" if task.get("failed") else "attention"
+    # 从「运行中」转入「待回复」的那一刻重新计 30 分钟；同一阶段内不重置
+    if not was_attention or not task.get("countdown_since"):
+        task["countdown_since"] = sample.at
+    waited = (sample.at - (task.get("countdown_since") or sample.at)) // 1000
+    if task["status"] == "attention" and waited >= DEFAULT_STUCK_SECONDS:
+        # 等你回复等太久，同样算卡住
+        task["status"] = "stuck"
+        if task.get("stuck_notified") != task["countdown_since"]:
+            task["stuck_notified"] = task["countdown_since"]
+            notifications.append(("任务疑似卡住",
+                                  f"{task['name']} 等你回复已超过 {max(1, waited // 60)} 分钟",
+                                  str(task["id"])))
 
     if task["status"] == "attention" and watching(str(task["id"]), act):
         mark_seen(task)
@@ -752,8 +771,10 @@ def view(state: dict) -> dict:
             bool(task.get("queue_error")) or not observed
             or (running(task) and stamp - observed > stale_after_seconds * 1000))
         started = task.get("running_since") or 0
+        phase = task.get("countdown_since") or started
         elapsed = max(0, ((observed if stale else stamp) - started) // 1000) if started else 0
-        progress = 1.0 if task.get("status") in ("attention", "done") else min(elapsed / stuck, 1.0)
+        waited = max(0, ((observed if stale else stamp) - phase) // 1000) if phase else 0
+        progress = 1.0 if task.get("status") == "done" else min(waited / stuck, 1.0)
         rows.append({
             "id": task["id"],
             "name": task.get("name"),

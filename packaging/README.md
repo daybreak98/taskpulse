@@ -88,7 +88,7 @@ launchctl kickstart -k gui/$UID/com.taskpulse.poller
 | `auth.token_file` | `token_file` 时读这个文件的首行当令牌，每次请求重读 |
 | `auth.env` | `module` 时在建会话前注入的环境变量（有些 SDK 靠环境变量决定去哪换凭据）；留空即可 |
 | `poll.interval_seconds` | 取数间隔，默认 60 |
-| `poll.stuck_seconds` | 同一轮跑过多久算「卡住」，默认 600 |
+| `poll.stuck_seconds` | 同一轮跑过多久算「卡住」，默认 1800（30 分钟） |
 | `poll.window_limit` | 窄条最多显示几条，默认 10 |
 | `poll.watch_limit` | 只对最近更新的 N 个会话查队列，默认 20 |
 | `poll.archive_hours` | 已读且 N 小时没有新动作就自动归档，默认 48 |

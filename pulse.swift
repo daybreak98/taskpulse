@@ -217,6 +217,8 @@ final class CapsuleView: NSView {
     var vertical = true { didSet { needsDisplay = true } }
     /// 正在按哪个状态筛选（该段描边加亮）
     var activeKind: String? { didSet { needsDisplay = true } }
+    /// 取数异常/待确认：白边整体染成琥珀色，替代原来压在最上面的 3pt 色条
+    var alerting = false { didSet { needsDisplay = true } }
     var onPick: ((String) -> Void)?
 
     override var isFlipped: Bool { true }
@@ -235,49 +237,60 @@ final class CapsuleView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard !segments.isEmpty else { return }
-
-        // 外框是深蓝灰圆角矩形，色块缩在里面——不做成整条椭圆，
-        // 这样竖排时像「一节电池」，横排时像参考里那条药丸。
-        // 深蓝外框只留一条贴着数字色块的细边（原来 4pt，显得像厚边框）
-        let pad: CGFloat = 2
-        let outerRadius: CGFloat = vertical ? glassRadius : 10
-        let shellRect = bounds.insetBy(dx: 0.25, dy: 0.25)
-        let shell = NSBezierPath(roundedRect: shellRect, xRadius: outerRadius, yRadius: outerRadius)
-        rgb(0x25333D, alpha: 0.97).setFill()
-        shell.fill()
-
-        // 内圈：状态色块都画在这一块里，自动获得圆角
-        let innerRect = bounds.insetBy(dx: pad, dy: pad)
-        let innerRadius = max(2, outerRadius - pad)
-        let inner = NSBezierPath(roundedRect: innerRect, xRadius: innerRadius, yRadius: innerRadius)
+        let n = max(1, segments.count)
+        // 色块直接铺到边：外框不再是「深蓝边 + 缩进的色块」两层，
+        // 白边就贴在色块边缘上，不会出现「白边比色块大一圈」的错位
+        let outerRadius: CGFloat = vertical ? glassRadius : bounds.height / 2
+        let pill = NSBezierPath(roundedRect: bounds, xRadius: outerRadius, yRadius: outerRadius)
+        // 描边与色块边界同心：内缩 0.5pt 时半径也要减 0.5，
+        // 否则圆角处两条曲线不平行，白边会跑到色块外面去
+        let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
+                                   xRadius: max(1, outerRadius - 0.5),
+                                   yRadius: max(1, outerRadius - 0.5))
 
         NSGraphicsContext.saveGraphicsState()
-        inner.setClip()
-        let n = max(1, segments.count)
-        let cellH = innerRect.height / CGFloat(n)
-        let cellW = innerRect.width / CGFloat(n)
+        pill.addClip()
+
+        let cellH = bounds.height / CGFloat(n)
+        let cellW = bounds.width / CGFloat(n)
         for (i, seg) in segments.enumerated() {
             let cell = vertical
-                ? NSRect(x: innerRect.minX, y: innerRect.minY + CGFloat(i) * cellH,
-                         width: innerRect.width, height: cellH)
-                : NSRect(x: innerRect.minX + CGFloat(i) * cellW, y: innerRect.minY,
-                         width: cellW, height: innerRect.height)
+                ? NSRect(x: 0, y: CGFloat(i) * cellH, width: bounds.width, height: cellH)
+                : NSRect(x: CGFloat(i) * cellW, y: 0, width: cellW, height: bounds.height)
             let zero = (seg.value ?? 0) == 0
             let base = (zero ? paletteZero[seg.key] : palette[seg.key]) ?? paletteZero["zero"]!
             base.setFill()
             NSBezierPath(rect: cell).fill()
-            // 每格一层柔光，做出玻璃泡的厚度
-            if let g = NSGradient(starting: rgb(0xFFFFFF, alpha: 0.18),
-                                  ending: rgb(0x20475B, alpha: 0.12)) {
-                g.draw(in: cell, angle: vertical ? 90 : -90)
+
+            // 玻璃高光扩散：左上提亮 → 中间透明 → 右下压暗（和面板/行块同一套走向）
+            if let g = NSGradient(colorsAndLocations:
+                (rgb(0xFFFFFF, alpha: 0.34), 0.0),
+                (rgb(0xFFFFFF, alpha: 0.06), 0.44),
+                (rgb(0x061319, alpha: 0.28), 1.0)) {
+                g.draw(in: cell, angle: vertical ? 72 : 62)
             }
+            // 顶部一层柔光，做出玻璃泡的厚度
+            if let sheen = NSGradient(colorsAndLocations:
+                (rgb(0xFFFFFF, alpha: 0.20), 0.0),
+                (rgb(0xFFFFFF, alpha: 0.0), 0.62)) {
+                // 每格顶部一层柔光，横向和竖向都按「上亮下暗」走
+                sheen.draw(in: NSRect(x: cell.minX, y: cell.minY,
+                                      width: cell.width, height: cell.height * 0.55),
+                           angle: 90)
+            }
+            // 格间细线
             if i > 0 {
-                rgb(0xD7EAF3, alpha: 0.20).setFill()
+                rgb(0xEBF7FF, alpha: 0.20).setFill()
                 if vertical {
-                    NSBezierPath(rect: NSRect(x: cell.minX, y: cell.minY, width: cell.width, height: 0.75)).fill()
+                    NSBezierPath(rect: NSRect(x: 0, y: cell.minY, width: cell.width, height: 0.75)).fill()
                 } else {
-                    NSBezierPath(rect: NSRect(x: cell.minX, y: cell.minY, width: 0.75, height: cell.height)).fill()
+                    NSBezierPath(rect: NSRect(x: cell.minX, y: 0, width: 0.75, height: cell.height)).fill()
                 }
+            }
+            if let kind = activeKind, seg.key != kind {
+                // 筛选态：没被选中的两格压暗，选中格保持满饱和
+                rgb(0x0B141B, alpha: 0.42).setFill()
+                NSBezierPath(rect: cell).fill()
             }
             let text = seg.value.map { String($0) } ?? "–"
             let fontSize: CGFloat = vertical ? 14 : 12
@@ -292,27 +305,13 @@ final class CapsuleView: NSView {
         }
         NSGraphicsContext.restoreGraphicsState()
 
-        // 色块外的一圈细亮边 + 外框描边
-        // 两条亮边都压淡：边框只有 2pt 时，亮边一重就把深蓝抢没了
-        rgb(0xD6EBF5, alpha: 0.30).setStroke()
-        inner.lineWidth = 0.6
-        inner.stroke()
-        rgb(0xBBD5E4, alpha: 0.26).setStroke()
-        shell.lineWidth = 0.6
-        shell.stroke()
+        // 一圈亮白边：直接描在色块外沿，粗细一致
+        let edge = alerting ? (palette["attention"] ?? rgb(0xEAF7FF, alpha: 0.8))
+                            : rgb(0xEAF7FF, alpha: 0.80)
+        edge.withAlphaComponent(alerting ? 0.95 : 0.80).setStroke()
+        outline.lineWidth = 1
+        outline.stroke()
 
-        // 选中的那一段加一圈内亮边
-        if let kind = activeKind, let i = segments.firstIndex(where: { $0.key == kind }) {
-            let cell = (vertical
-                ? NSRect(x: innerRect.minX, y: innerRect.minY + CGFloat(i) * cellH,
-                         width: innerRect.width, height: cellH)
-                : NSRect(x: innerRect.minX + CGFloat(i) * cellW, y: innerRect.minY,
-                         width: cellW, height: innerRect.height)).insetBy(dx: 1, dy: 1)
-            let path = NSBezierPath(roundedRect: cell, xRadius: 6, yRadius: 6)
-            rgb(0xF1FBFF, alpha: 0.75).setStroke()
-            path.lineWidth = 1
-            path.stroke()
-        }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -761,12 +760,7 @@ final class PulseView: NSView {
         capsule.onPick = { [weak self] kind in self?.toggleFilter(kind) }
         addSubview(capsule)
 
-        if statusMessage != nil {
-            let bar = NSView(frame: NSRect(x: 0, y: 0, width: COMPACT_W, height: 3))
-            bar.wantsLayer = true
-            bar.layer?.backgroundColor = palette["attention"]?.cgColor
-            addSubview(bar)
-        }
+        capsule.alerting = statusMessage != nil
     }
 
     private func rebuildList() {

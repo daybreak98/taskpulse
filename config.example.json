@@ -43,7 +43,7 @@
     "stuck_interval_seconds": 60,
     "rate_limit_probe_seconds": 60,
     "watch_limit": 20,
-    "stuck_seconds": 600,
+    "stuck_seconds": 1800,
     "window_limit": 10,
     "archive_hours": 48
   },

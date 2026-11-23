@@ -135,7 +135,7 @@ else
   "poll": {
     "interval_seconds": 60,
     "watch_limit": 20,
-    "stuck_seconds": 600,
+    "stuck_seconds": 1800,
     "window_limit": 10,
     "archive_hours": 48
   },
