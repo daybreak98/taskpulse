@@ -114,8 +114,23 @@ let palette: [String: NSColor] = [
 ]
 /// 计数胶囊里「0」用的低饱和色（参考的 --pulse-blue-zero / --pulse-zero）
 let paletteZero: [String: NSColor] = ["running": rgb(0x8EABBD), "zero": rgb(0x8EA5B3)]
-/// 胶囊数字的墨色
-let countInk = rgb(0x142B3A)
+/// 计数胶囊配色：对齐参考实现（纯色底 + 中心径向高光），与行/点用的 palette 分开
+struct CapsuleTone {
+    let fill: NSColor
+    let highlight: NSColor
+}
+let capsuleTones: [String: CapsuleTone] = [
+    "running": CapsuleTone(fill: rgb(0x4E8BAC), highlight: rgb(0x76BADE, alpha: 0xA8 / 255.0)),
+    "attention": CapsuleTone(fill: rgb(0x9B926F), highlight: rgb(0xE5BD69, alpha: 0xCC / 255.0)),
+    "stuck": CapsuleTone(fill: rgb(0xA5707A), highlight: rgb(0xEFA8AF, alpha: 0xA8 / 255.0)),
+]
+/// 计数为 0 时统一降到这一档，不再按状态各配一个灰
+let capsuleZero = CapsuleTone(fill: rgb(0x607E90), highlight: rgb(0x9EB4C3, alpha: 0x59 / 255.0))
+/// 胶囊底板 / 整圈描边 / 内圈细线 / 数字墨色
+let capsuleShell = rgb(0x3A5B6D, alpha: 0.78)
+let capsuleEdge = rgb(0xCDE5F2, alpha: 0.64)
+let capsuleEdgeInner = rgb(0xEDF9FF, alpha: 0.13)
+let countInk = rgb(0x122938)
 
 let panelTint = rgb(glassRGB, alpha: 1 - glassTransparency)
 let toastTint = rgb(glassRGB, alpha: 1 - glassTransparency)
@@ -133,12 +148,30 @@ func rowTint(_ status: String?) -> NSColor {
     }
 }
 
+/// 行底色再深一档：用来表示「这一阶段已经走了多久」，从左往右铺
+func rowProgressTint(_ status: String?) -> NSColor? {
+    switch status {
+    case "running": return rgb(0x2F6E96, alpha: 0.55)
+    case "attention": return rgb(0x9A742F, alpha: 0.55)
+    case "stuck": return rgb(0xA95362, alpha: 0.55)
+    default: return nil
+    }
+}
+
 /// 一行底色：状态色 + 顶部一层极淡的高光（参考里的 linear-gradient(174deg, …)）
-func drawRowPlate(_ path: NSBezierPath, _ status: String?) {
+/// progress > 0 时，用更深一档的同色系从左向右铺开，整行底色本身就是定时进度条
+func drawRowPlate(_ path: NSBezierPath, _ status: String?, progress: Double = 0) {
     rowTint(status).setFill()
     path.fill()
     NSGraphicsContext.saveGraphicsState()
     path.setClip()
+    let pct = CGFloat(min(max(progress, 0), 1))
+    if pct > 0, let deeper = rowProgressTint(status) {
+        let b = path.bounds
+        deeper.setFill()
+        NSBezierPath(rect: NSRect(x: b.minX, y: b.minY,
+                                  width: b.width * pct, height: b.height)).fill()
+    }
     // 明暗扩散：左上提亮、右下压暗，斜向拉一层，避免每行像一块平涂色卡
     if let g = NSGradient(colorsAndLocations:
         (rgb(0xEAF7FF, alpha: 0.11), 0.0),
@@ -238,15 +271,12 @@ final class CapsuleView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard !segments.isEmpty else { return }
         let n = max(1, segments.count)
-        // 色块直接铺到边：外框不再是「深蓝边 + 缩进的色块」两层，
-        // 白边就贴在色块边缘上，不会出现「白边比色块大一圈」的错位
         let outerRadius: CGFloat = vertical ? glassRadius : bounds.height / 2
         let pill = NSBezierPath(roundedRect: bounds, xRadius: outerRadius, yRadius: outerRadius)
-        // 描边与色块边界同心：内缩 0.5pt 时半径也要减 0.5，
-        // 否则圆角处两条曲线不平行，白边会跑到色块外面去
-        let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                                   xRadius: max(1, outerRadius - 0.5),
-                                   yRadius: max(1, outerRadius - 0.5))
+
+        // 底板：半透明蓝灰（参考里的 capsule 背景），色块铺在上面
+        capsuleShell.setFill()
+        pill.fill()
 
         NSGraphicsContext.saveGraphicsState()
         pill.addClip()
@@ -258,44 +288,33 @@ final class CapsuleView: NSView {
                 ? NSRect(x: 0, y: CGFloat(i) * cellH, width: bounds.width, height: cellH)
                 : NSRect(x: CGFloat(i) * cellW, y: 0, width: cellW, height: bounds.height)
             let zero = (seg.value ?? 0) == 0
-            let base = (zero ? paletteZero[seg.key] : palette[seg.key]) ?? paletteZero["zero"]!
-            base.setFill()
+            let tone = zero ? capsuleZero : (capsuleTones[seg.key] ?? capsuleZero)
+            tone.fill.setFill()
             NSBezierPath(rect: cell).fill()
 
-            // 玻璃高光扩散：左上提亮 → 中间透明 → 右下压暗（和面板/行块同一套走向）
+            // 中心偏上的径向高光（对应参考的 radial-gradient at 52% 44%）
+            // 单层受 alpha 上限限制，叠 3 层才够亮；选中的那格再叠一层
+            let picked = activeKind != nil && seg.key == activeKind
             if let g = NSGradient(colorsAndLocations:
-                (rgb(0xFFFFFF, alpha: 0.34), 0.0),
-                (rgb(0xFFFFFF, alpha: 0.06), 0.44),
-                (rgb(0x061319, alpha: 0.28), 1.0)) {
-                g.draw(in: cell, angle: vertical ? 72 : 62)
-            }
-            // 顶部一层柔光，做出玻璃泡的厚度
-            if let sheen = NSGradient(colorsAndLocations:
-                (rgb(0xFFFFFF, alpha: 0.20), 0.0),
-                (rgb(0xFFFFFF, alpha: 0.0), 0.62)) {
-                // 每格顶部一层柔光，横向和竖向都按「上亮下暗」走
-                sheen.draw(in: NSRect(x: cell.minX, y: cell.minY,
-                                      width: cell.width, height: cell.height * 0.55),
-                           angle: 90)
-            }
-            // 格间细线
-            if i > 0 {
-                rgb(0xEBF7FF, alpha: 0.20).setFill()
-                if vertical {
-                    NSBezierPath(rect: NSRect(x: 0, y: cell.minY, width: cell.width, height: 0.75)).fill()
-                } else {
-                    NSBezierPath(rect: NSRect(x: cell.minX, y: 0, width: 0.75, height: cell.height)).fill()
+                (tone.highlight, 0.0),
+                (tone.highlight.withAlphaComponent(0), 0.78)) {
+                // 参考是 52% / 44%：略高于中心（视图是翻转坐标系，所以取负）
+                for _ in 0..<(picked ? 4 : 3) {
+                    g.draw(in: cell, relativeCenterPosition: NSPoint(x: 0.02, y: -0.06))
                 }
             }
+
+            // 选中态不画白色框：靠上面多叠的那层状态色高光区分，其余两格压暗一点
             if let kind = activeKind, seg.key != kind {
-                // 筛选态：没被选中的两格压暗，选中格保持满饱和
-                rgb(0x0B141B, alpha: 0.42).setFill()
+                rgb(0x0B141B, alpha: 0.22).setFill()
                 NSBezierPath(rect: cell).fill()
             }
+
+            // 分格处不画分隔线：整圈描边盖住整颗胶囊，格间不该有重复的边线
             let text = seg.value.map { String($0) } ?? "–"
             let fontSize: CGFloat = vertical ? 14 : 12
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .bold),
+                .font: NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .semibold),
                 .foregroundColor: countInk,
             ]
             let size = (text as NSString).size(withAttributes: attrs)
@@ -303,15 +322,25 @@ final class CapsuleView: NSView {
                                                 y: cell.midY - size.height / 2),
                                     withAttributes: attrs)
         }
+
         NSGraphicsContext.restoreGraphicsState()
 
-        // 一圈亮白边：直接描在色块外沿，粗细一致
-        let edge = alerting ? (palette["attention"] ?? rgb(0xEAF7FF, alpha: 0.8))
-                            : rgb(0xEAF7FF, alpha: 0.80)
-        edge.withAlphaComponent(alerting ? 0.95 : 0.80).setStroke()
-        outline.lineWidth = 1
-        outline.stroke()
+        // 整圈描边压在色块上：外层 2px 亮蓝，内侧再 1px 更亮的细线
+        let borderW: CGFloat = vertical ? 2 : 1
+        let edge = NSBezierPath(roundedRect: bounds.insetBy(dx: borderW / 2, dy: borderW / 2),
+                                xRadius: max(1, outerRadius - borderW / 2),
+                                yRadius: max(1, outerRadius - borderW / 2))
+        (alerting ? (capsuleTones["attention"]?.fill ?? capsuleEdge) : capsuleEdge).setStroke()
+        edge.lineWidth = borderW
+        edge.stroke()
 
+        let inset = borderW + 0.5
+        let innerEdge = NSBezierPath(roundedRect: bounds.insetBy(dx: inset, dy: inset),
+                                     xRadius: max(1, outerRadius - inset),
+                                     yRadius: max(1, outerRadius - inset))
+        capsuleEdgeInner.setStroke()
+        innerEdge.lineWidth = 1
+        innerEdge.stroke()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -501,7 +530,9 @@ final class TaskRowView: NSView {
 
         // 一行 = 一块状态色玻璃板（参考里 .row 的 tint + 顶部高光 + 细边）
         let plate = NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 8, yRadius: 8)
-        drawRowPlate(plate, tone)
+        // 定时进度画在底色里：只有运行中/待回复/卡住这三类在做倒计时
+        let timed = !done && ["running", "attention", "stuck"].contains(item.status)
+        drawRowPlate(plate, tone, progress: timed ? item.progress : 0)
         if hovered {
             rgb(0xF4FAFF, alpha: 0.10).setFill()
             plate.fill()
@@ -553,13 +584,6 @@ final class TaskRowView: NSView {
             path.stroke()
         }
 
-        // 进度条：贴着玻璃板下沿
-        let pct = CGFloat(min(max(item.progress, 0), 1))
-        if pct > 0 {
-            color.withAlphaComponent(0.75 * alpha).setFill()
-            NSBezierPath(roundedRect: NSRect(x: 13, y: bounds.height - 3.5, width: (w - 30) * pct, height: 1.5),
-                         xRadius: 0.75, yRadius: 0.75).fill()
-        }
     }
 
     private func metaText() -> String {
