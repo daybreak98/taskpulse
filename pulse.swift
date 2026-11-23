@@ -175,29 +175,40 @@ func rowTint(_ status: String?) -> NSColor {
     }
 }
 
-/// 行底色再深一档：用来表示「这一阶段已经走了多久」，从左往右铺
-func rowProgressTint(_ status: String?) -> NSColor? {
+/// 定时进度的高光色：深色玻璃上「压暗」几乎看不出来，改成亮一档铺开
+func rowProgressGlow(_ status: String?) -> NSColor? {
     switch status {
-    case "running": return rgb(0x2F6E96, alpha: 0.55)
-    case "attention": return rgb(0x9A742F, alpha: 0.55)
-    case "stuck": return rgb(0xA95362, alpha: 0.55)
+    case "running": return rgb(0xD6EDFF)
+    case "attention": return rgb(0xFFEDC9)
+    case "stuck": return rgb(0xFFDEE3)
     default: return nil
     }
 }
 
 /// 一行底色：状态色 + 顶部一层极淡的高光（参考里的 linear-gradient(174deg, …)）
-/// progress > 0 时，用更深一档的同色系从左向右铺开，整行底色本身就是定时进度条
+/// progress > 0 时，用提亮一档的同色高光从左向右铺开，整行底色本身就是定时进度条
 func drawRowPlate(_ path: NSBezierPath, _ status: String?, progress: Double = 0) {
     rowTint(status).setFill()
     path.fill()
     NSGraphicsContext.saveGraphicsState()
     path.setClip()
     let pct = CGFloat(min(max(progress, 0), 1))
-    if pct > 0, let deeper = rowProgressTint(status) {
+    if pct > 0, let glow = rowProgressGlow(status) {
         let b = path.bounds
-        deeper.setFill()
-        NSBezierPath(rect: NSRect(x: b.minX, y: b.minY,
-                                  width: b.width * pct, height: b.height)).fill()
+        let bar = NSRect(x: b.minX, y: b.minY, width: b.width * pct, height: b.height)
+        // 左淡右亮：已走过的一段是「余辉」，推进前沿最亮
+        if let g = NSGradient(colorsAndLocations:
+            (glow.withAlphaComponent(0.15), 0.0),
+            (glow.withAlphaComponent(0.30), 0.75),
+            (glow.withAlphaComponent(0.34), 1.0)) {
+            g.draw(in: bar, angle: 0)
+        }
+        // 前沿压一条亮边，位置一眼可读
+        if pct < 1 {
+            rgb(0xF4FCFF, alpha: 0.7).setFill()
+            NSBezierPath(rect: NSRect(x: bar.maxX - 1.5, y: b.minY,
+                                      width: 1.5, height: b.height)).fill()
+        }
     }
     // 明暗扩散：左上提亮、右下压暗，斜向拉一层，避免每行像一块平涂色卡
     if let g = NSGradient(colorsAndLocations:
