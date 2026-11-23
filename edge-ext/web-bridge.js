@@ -132,6 +132,8 @@
   (async () => {
     CFG = await askConfig();
     if (!CFG || !CFG.api) return;
+    // 后台在页面被节流时靠这个口子来敲门
+    window.__tpWebBridgeTick = tick;
     tick();
     setInterval(tick, 2000);
     document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });

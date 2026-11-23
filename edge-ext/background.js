@@ -174,8 +174,28 @@ chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === "tp-sync") {
     push();
     listen();   // service worker 被回收后在这里重新挂上长轮询
+    nudgeWebBridge();
   }
 });
+
+// 页面在后台时浏览器会把 setInterval 节流到分钟级，页面内取数就跟着停摆。
+// 由后台主动去敲一下（executeScript 不受页面定时器节流限制），只敲最前面几个，
+// 免得几十个标签页一起打接口。
+async function nudgeWebBridge() {
+  if (!SCOPE || !API_CFG || !chrome.scripting) return;
+  try {
+    const tabs = await chrome.tabs.query({ url: SCOPE });
+    // 只敲一个页面就够（各页数据相同），失败再换下一个
+    for (const t of tabs.slice(0, 2)) {
+      if (typeof t.id !== "number") continue;
+      const r = await chrome.scripting.executeScript({
+        target: { tabId: t.id },
+        func: () => { if (window.__tpWebBridgeTick) window.__tpWebBridgeTick(); }
+      }).catch(() => null);
+      if (r) break;
+    }
+  } catch (_) {}
+}
 
 // 只在上报「切到」这个标签时记已读。
 // 曾经这里还会补记「被切走的那个标签」，但它会把用户没看的会话误标已读：
