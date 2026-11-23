@@ -81,7 +81,7 @@ final class OnboardingController {
 
         let tint = NSView(frame: container.bounds)
         tint.wantsLayer = true
-        tint.layer?.backgroundColor = rgb(glassRGB, alpha: 0.72).cgColor
+        tint.layer?.backgroundColor = rgb(0x1D2C35, alpha: 0.92).cgColor
         tint.autoresizingMask = [.width, .height]
         container.addSubview(tint)
 
@@ -95,11 +95,19 @@ final class OnboardingController {
         container.addSubview(border)
 
         self.panel = p
+        // 常驻 App 是 accessory（无 Dock 图标），弹窗要临时变成普通 App 才拿得到焦点，
+        // 否则第一次点击会被系统当成「激活点击」吞掉
+        NSApp.setActivationPolicy(.regular)
         renderChoice()
-        dbg("onboarding panel frame=\(p.frame) visible=\(p.isVisible)")
         NSApp.activate(ignoringOtherApps: true)
         p.makeKeyAndOrderFront(nil)
-        dbg("onboarding shown key=\(p.isKeyWindow) visible=\(p.isVisible)")
+        // 无边框面板要等一轮 runloop 才真正拿到键盘焦点
+        DispatchQueue.main.async { [weak self] in
+            guard let p = self?.panel else { return }
+            NSApp.activate(ignoringOtherApps: true)
+            p.makeKeyAndOrderFront(nil)
+            dbg("onboarding shown key=\(p.isKeyWindow) visible=\(p.isVisible) f=\(p.frame)")
+        }
     }
 
     // MARK: - 页面
@@ -128,6 +136,25 @@ final class OnboardingController {
         return s
     }
 
+    /// 窗口高度跟着内容走：否则内容少的页面下方会留一大块空底
+    private func fitHeight() {
+        resizeToFit()
+        // 换行标签的高度要等一轮布局才准，补算一次
+        DispatchQueue.main.async { [weak self] in self?.resizeToFit() }
+    }
+
+    private func resizeToFit() {
+        guard let p = panel, let s = body, let cv = p.contentView else { return }
+        cv.layoutSubtreeIfNeeded()
+        s.layoutSubtreeIfNeeded()
+        let wanted = max(180, ceil(s.fittingSize.height) + 60)
+        var f = p.frame
+        guard abs(f.height - wanted) > 0.5 else { return }
+        f.origin.y = f.maxY - wanted
+        f.size.height = wanted
+        p.setFrame(f, display: true)
+    }
+
     private func label(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular,
                        color: NSColor = mainText, wrap: Bool = true) -> NSTextField {
         let f = NSTextField(wrappingLabelWithString: text)
@@ -149,6 +176,29 @@ final class OnboardingController {
         return b
     }
 
+    /// 深色底上的主按钮：系统默认按钮文字是黑的，这里统一成浅色
+    private func actionButton(_ title: String, _ sel: Selector, key: String = "") -> NSButton {
+        let b = NSButton(title: title, target: self, action: sel)
+        b.bezelStyle = .rounded
+        b.attributedTitle = NSAttributedString(string: title, attributes: [
+            .foregroundColor: mainText,
+            .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
+        ])
+        if !key.isEmpty { b.keyEquivalent = key }
+        return b
+    }
+
+    private func linkButton(_ title: String, _ sel: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: sel)
+        b.bezelStyle = .inline
+        b.isBordered = false
+        b.attributedTitle = NSAttributedString(string: title, attributes: [
+            .foregroundColor: secondaryText,
+            .font: NSFont.systemFont(ofSize: 11),
+        ])
+        return b
+    }
+
     private func renderChoice() {
         let s = newBody()
         s.addArrangedSubview(label("TaskPulse 已装好", size: 16, weight: .semibold))
@@ -164,21 +214,16 @@ final class OnboardingController {
         pick.spacing = 10
         for (name, app) in [("Microsoft Edge", "Edge"), ("Google Chrome", "Chrome")] {
             let ok = installed(name)
-            let btn = NSButton(title: ok ? "用 \(app)" : "\(app) 未安装",
-                               target: self, action: #selector(pickBrowser(_:)))
-            btn.bezelStyle = .rounded
+            let btn = actionButton(ok ? "用 \(app)" : "\(app) 未安装",
+                                   #selector(pickBrowser(_:)))
             btn.tag = (name == "Microsoft Edge") ? 1 : 2
             btn.isEnabled = ok
             pick.addArrangedSubview(btn)
         }
         s.addArrangedSubview(pick)
 
-        let skip = NSButton(title: "以后再说", target: self, action: #selector(dismissForever))
-        skip.bezelStyle = .inline
-        skip.isBordered = false
-        skip.contentTintColor = secondaryText
-        skip.font = NSFont.systemFont(ofSize: 11)
-        s.addArrangedSubview(skip)
+        s.addArrangedSubview(linkButton("以后再说", #selector(dismissForever)))
+        fitHeight()
     }
 
     private func renderSteps(_ browserName: String) {
@@ -199,14 +244,8 @@ final class OnboardingController {
         let path = label(dir, size: 11, color: mainText, wrap: false)
         path.lineBreakMode = .byTruncatingMiddle
         pathRow.addArrangedSubview(path)
-        let copy = NSButton(title: "复制路径", target: self, action: #selector(copyPath))
-        copy.bezelStyle = .inline
-        copy.font = NSFont.systemFont(ofSize: 11)
-        pathRow.addArrangedSubview(copy)
-        let reveal = NSButton(title: "打开目录", target: self, action: #selector(revealDir))
-        reveal.bezelStyle = .inline
-        reveal.font = NSFont.systemFont(ofSize: 11)
-        pathRow.addArrangedSubview(reveal)
+        pathRow.addArrangedSubview(linkButton("复制路径", #selector(copyPath)))
+        pathRow.addArrangedSubview(linkButton("打开目录", #selector(revealDir)))
         s.addArrangedSubview(pathRow)
 
         s.addArrangedSubview(label("3. 回到这里点「检查一下」。",
@@ -216,26 +255,16 @@ final class OnboardingController {
         let row = NSStackView()
         row.orientation = .horizontal
         row.spacing = 10
-        let check = NSButton(title: "检查一下", target: self, action: #selector(check))
-        check.bezelStyle = .rounded
-        check.keyEquivalent = "\r"
-        row.addArrangedSubview(check)
-        let retry = NSButton(title: "重新打开扩展页", target: self, action: #selector(reopenExtensions))
-        retry.bezelStyle = .inline
-        retry.font = NSFont.systemFont(ofSize: 11)
-        row.addArrangedSubview(retry)
+        row.addArrangedSubview(actionButton("检查一下", #selector(check), key: "\r"))
+        row.addArrangedSubview(linkButton("重新打开扩展页", #selector(reopenExtensions)))
         s.addArrangedSubview(row)
 
         let hint = label("装好扩展后，这个小窗会自动消失。", size: 10.5, color: secondaryText)
         hint.identifier = NSUserInterfaceItemIdentifier("hint")
         s.addArrangedSubview(hint)
 
-        let skip = NSButton(title: "以后再说", target: self, action: #selector(dismissForever))
-        skip.bezelStyle = .inline
-        skip.isBordered = false
-        skip.contentTintColor = secondaryText
-        skip.font = NSFont.systemFont(ofSize: 11)
-        s.addArrangedSubview(skip)
+        s.addArrangedSubview(linkButton("以后再说", #selector(dismissForever)))
+        fitHeight()
     }
 
     private func renderDone() {
@@ -245,10 +274,8 @@ final class OnboardingController {
             "扩展已经在往本机上报了。以后打开会话标签，小窗会自动同步分组和已读状态。",
             size: 11.5, color: secondaryText))
         s.setCustomSpacing(16, after: s.arrangedSubviews.last!)
-        let ok = NSButton(title: "开始使用", target: self, action: #selector(finish))
-        ok.bezelStyle = .rounded
-        ok.keyEquivalent = "\r"
-        s.addArrangedSubview(ok)
+        s.addArrangedSubview(actionButton("开始使用", #selector(finish), key: "\r"))
+        fitHeight()
     }
 
     private func renderFailed(_ msg: String) {
@@ -354,6 +381,8 @@ final class OnboardingController {
         panel = nil
         body = nil
         browser = nil
+        // 回到后台常驻形态，别在 Dock 里留个图标
+        NSApp.setActivationPolicy(.accessory)
     }
 
     /// Esc / 面板关闭走这里：不写 onboarded，下次启动还会提示

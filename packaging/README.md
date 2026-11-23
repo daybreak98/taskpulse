@@ -9,9 +9,16 @@
 
 ## 两条安装路径，选一条
 
-### A. 团队内部渠道给的包（零配置）
+### A. 团队内部渠道给的包（零配置，推荐）
 
-包名通常带 `-internal`。解压后**双击 `install.command`**，脚本检测到包里已带配置就直接沿用，不再问任何问题。
+包名通常带 `-internal`。解压后**双击 `install.command`**，全程不问任何问题：
+
+- 自动装运行依赖（首次联网约 30 秒）
+- 自动写入包内自带的配置
+- 自动注册开机自启并拉起小窗
+
+装完小窗会自己出现在屏幕右上角，并弹一个**扩展安装引导**：选 Edge 或 Chrome，
+它会替你打开扩展页、把扩展目录递到 Finder，你按提示点两下，「检查一下」通过就完成。
 
 ### B. 自己配置
 
@@ -26,28 +33,40 @@
 
 > Gatekeeper 提示「无法验证开发者」时：右键 `install.command` → 打开 → 再点「打开」。
 
-装好后 Finder 会定位到 App，屏幕边缘出现一条 44pt 宽的窄条。
-
 ---
 
-## 还需要手动做两件事
+## 装完之后：扩展安装引导
 
-### ① 加载浏览器扩展
+小窗首次启动会弹「TaskPulse 已装好」，选你平时看会话的浏览器：
 
-Edge 地址栏输入 `edge://extensions` → 打开「开发人员模式」→「加载解压缩的扩展」→
-选择 `~/Applications/TaskPulse/edge-ext`。
+- **Edge** → 打开 `edge://extensions`
+- **Chrome** → 打开 `chrome://extensions`
+
+然后在扩展页里：打开右上角「开发人员模式」→「加载解压缩的扩展」→
+选 `~/Applications/TaskPulse/edge-ext`（引导窗口可以一键复制路径 / 打开目录）。
+
+回到引导窗口点「检查一下」，收到扩展上报就自动关窗。
+
+想重新走一遍引导：
+
+```bash
+defaults delete com.hyj.taskpulse onboarded
+launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
+```
 
 扩展只做两件事：上报目标站点标签页的标题 / 分组名 / 标签 id，以及执行「切到某个标签」的命令。
 它只允许访问 `127.0.0.1`，不读取页面内容、不外传数据。
-
-扩展的站点范围由安装脚本按 `config.json` 里的 `extension.scope` 写进 `edge-ext/config.js`，
+站点范围由安装脚本按 `config.json` 里的 `extension.scope` 写进 `edge-ext/config.js`，
 `manifest.json` 的 `host_permissions` 也只放 `127.0.0.1`——不声明 `<all_urls>`。
-**所以改完配置要重新运行一次 `install.command`，然后在 `edge://extensions` 点一次 ⟳。**
+**所以改完配置要重新运行一次 `install.command`，然后在扩展页点一次 ⟳。**
 
-### ② 授权与登录
+> 为什么不做成全自动？macOS 上的 Chromium 只接受商店来源的静默安装
+> （本地 crx 的 External Extensions 通道实测不生效），装解压缩目录必须由人点一次。
+
+## 授权与登录
 
 - 第一次点任务行（或右上角提示条）跳转时，系统会弹「TaskPulse 想要控制 Microsoft Edge」，点**允许**。
-- 如果服务需要登录，按日志里给出的提示完成一次即可（`~/Library/Logs/taskpulse.log`）。
+- 认证沿用你浏览器里已登录的账号，不用另填 token。
   取数失败不会让进程退出，日志会写「取数线程中断」并在 1 分钟后重试，间隔逐步拉长到 30 分钟。
 
 ---
@@ -117,6 +136,8 @@ launchctl kickstart -k gui/$UID/com.taskpulse.poller
 | 启动就报「TaskPulse 还不能开始工作」 | 按提示补 `~/.taskpulse/config.json`，或重跑 `install.command` |
 | 窄条不见了 | `launchctl kickstart -k gui/$UID/com.taskpulse.ui` |
 | 数字一直不变 | `curl 127.0.0.1:8899/state` 看 `poller_error`；再看 `~/Library/Logs/taskpulse.log` |
-| 点任务不跳转 | 确认扩展已加载；`curl 127.0.0.1:8899/diag` 里 `ext_seen_age` 应在 0~10 秒内 |
+| 点任务不跳转 | 确认扩展已加载；`curl 127.0.0.1:8899/state` 里 `extension.ok` 应为 `true` |
+| 引导点了「检查一下」不通过 | 确认扩展在扩展页是「已启用」状态，且浏览器里至少开着一个会话标签 |
+| 有两个 TaskPulse 在跑 | 老版本留下的 `com.hyj.taskpulse.*` 标签，卸掉旧的再重跑 `install.command` |
 | 想改刷新间隔 | 改 `config.json` 的 `poll.interval_seconds`，或临时 `TP_POLL_SECONDS=30` |
 | 想看明细日志 | `~/Library/Logs/taskpulse.log`（行为日志）、`taskpulse.poll.out`（每轮快照） |

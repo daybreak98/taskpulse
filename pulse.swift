@@ -196,11 +196,12 @@ func drawRowPlate(_ path: NSBezierPath, _ status: String?, progress: Double = 0)
     if pct > 0, let glow = rowProgressGlow(status) {
         let b = path.bounds
         let bar = NSRect(x: b.minX, y: b.minY, width: b.width * pct, height: b.height)
-        // 左淡右亮：已走过的一段是「余辉」，推进前沿最亮
+        // 左淡右亮，但末端要淡出：直接切在进度点会形成一道竖直亮线
         if let g = NSGradient(colorsAndLocations:
             (glow.withAlphaComponent(0.15), 0.0),
-            (glow.withAlphaComponent(0.30), 0.75),
-            (glow.withAlphaComponent(0.34), 1.0)) {
+            (glow.withAlphaComponent(0.30), 0.72),
+            (glow.withAlphaComponent(0.30), 0.86),
+            (glow.withAlphaComponent(0.0), 1.0)) {
             g.draw(in: bar, angle: 0)
         }
     }
@@ -564,7 +565,9 @@ final class TaskRowView: NSView {
         let plate = NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 8, yRadius: 8)
         // 定时进度画在底色里：只有运行中/待回复/卡住这三类在做倒计时
         let timed = !done && ["running", "attention", "stuck"].contains(item.status)
-        drawRowPlate(plate, tone, progress: timed ? item.progress : 0)
+        // TEMP-VERIFY
+        let forced = ProcessInfo.processInfo.environment["TP_UI_PROGRESS"].flatMap(Double.init)
+        drawRowPlate(plate, tone, progress: timed ? (forced ?? item.progress) : 0)
         if hovered {
             rgb(0xF4FAFF, alpha: 0.10).setFill()
             plate.fill()
@@ -749,6 +752,8 @@ final class PulseView: NSView {
 
     /// 组默认只显示一行；有阻塞/待响应的组自动展开，突出需要关注的标签页
     func isOpenNamed(_ name: String) -> Bool {
+        // TEMP-VERIFY
+        if ProcessInfo.processInfo.environment["TP_UI_OPEN"] != nil { return true }
         if closedGroups.contains(name) { return false }
         if openGroups.contains(name) { return true }
         guard let g = groups().first(where: { $0.name == name }) else { return false }
