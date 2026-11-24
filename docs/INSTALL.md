@@ -8,7 +8,10 @@ TaskPulse 是贴在屏幕边缘的一条细条，点开能看到你所有 DataAg
 
 ## 第一步：卸载旧版本（第一次装可跳过）
 
-如果你之前装过 TaskPulse，先双击打开解压目录里的 `uninstall.command`。
+如果你之前装过 TaskPulse，先双击打开 `uninstall.command`。它有两个位置，哪个方便用哪个：
+
+- 刚解压出来的文件夹里（`TaskPulse-日期-internal/uninstall.command`）
+- 已经装过的机器上：`~/Applications/TaskPulse/uninstall.command`
 
 窗口跑完会显示「已卸载」。它会把旧的 App 和后台服务都清掉，但**保留**你的任务历史（在 `~/.taskpulse` 里）。想彻底从零开始，先在终端执行 `rm -rf ~/.taskpulse` 再卸载。
 

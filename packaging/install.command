@@ -172,6 +172,8 @@ cp -R "$APP_NAME.app" "$HOME/Applications/" || { echo "!! 拷贝 App 失败"; ex
 cp poller.py "$DEST/"
 rm -rf "$DEST/edge-ext"
 cp -R edge-ext "$DEST/"
+# 卸载脚本也留一份到安装目录：用户以后想卸载，不需要再找回当初解压的包
+cp uninstall.command "$DEST/" && chmod +x "$DEST/uninstall.command"
 # 去掉 Gatekeeper 隔离标记，避免「已损坏，无法打开」
 xattr -dr com.apple.quarantine "$HOME/Applications/$APP_NAME.app" 2>/dev/null
 
