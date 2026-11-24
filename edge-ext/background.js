@@ -76,11 +76,12 @@ async function push() {
       registered: registered,
     };
     const cap = await readCapture();
+    web.hooked = cap.hooked;
     await fetch(ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ at: Date.now(), browser: BROWSER, tabs, active, web,
-                             cap: cap.length ? cap : undefined })
+                             cap: cap.items.length ? cap.items : undefined })
     });
   } catch (_) {
     // TaskPulse 没在跑时静默失败
@@ -88,59 +89,83 @@ async function push() {
 }
 
 // ── 一次性抓包：读页面自己的请求参数 ────────────────────────────────
-// 服务端对列表接口的分页参数没有文档，靠猜猜不出来。这里在页面主世界挂一个
-// fetch 包装，把会话相关请求的 URL 和请求体记下来，随心跳带回 TaskPulse。
+// 服务端对列表接口的分页参数没有文档，靠猜猜不出来。这里在页面主世界挂上
+// fetch 与 XHR 的钩子（页面用的是 axios，走哪个 adapter 不确定，两边都包），
+// 把会话相关请求的 URL 和请求体记下来，随心跳带回 TaskPulse。
 // 只在排障时用，不改变任何请求行为。
+
+const CAP_INJECT = () => {
+  if (window.__tpCapHooked) return true;
+  window.__tpCapHooked = true;
+  window.__tpCap = [];
+  const want = (u) => String(u).indexOf("/conversations/") >= 0;
+  const keep = (u, b) => {
+    if (window.__tpCap.length < 40) {
+      window.__tpCap.push({ url: String(u), body: String(b == null ? "" : b) });
+    }
+  };
+
+  const origFetch = window.fetch;
+  window.fetch = function (...args) {
+    try {
+      const first = args[0];
+      const url = first && first.url ? first.url : first;
+      if (want(url)) {
+        const init = args[1] || (first && typeof first === "object" ? first : {});
+        keep(url, init && init.body);
+      }
+    } catch (_) {}
+    return origFetch.apply(this, args);
+  };
+
+  const xOpen = XMLHttpRequest.prototype.open;
+  const xSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    this.__tpUrl = url;
+    return xOpen.call(this, method, url, ...rest);
+  };
+  XMLHttpRequest.prototype.send = function (body) {
+    try { if (want(this.__tpUrl)) keep(this.__tpUrl, body); } catch (_) {}
+    return xSend.call(this, body);
+  };
+  return true;
+};
 
 async function hookFetch() {
   if (!SCOPE || !chrome.scripting) return;
   try {
     const tabs = await chrome.tabs.query({ url: SCOPE });
-    for (const t of tabs.slice(0, 1)) {
+    // 用户正在看的那个页面才可能触发分组展开，优先它，其次靠前的几个
+    const ordered = tabs.slice().sort((a, b) =>
+      (b.active ? 1 : 0) - (a.active ? 1 : 0) || (b.lastAccessed || 0) - (a.lastAccessed || 0));
+    for (const t of ordered.slice(0, 6)) {
       if (typeof t.id !== "number") continue;
-      await chrome.scripting.executeScript({
-        target: { tabId: t.id },
-        world: "MAIN",
-        func: () => {
-          if (window.__tpCapHooked) return;
-          window.__tpCapHooked = true;
-          window.__tpCap = [];
-          const orig = window.fetch;
-          window.fetch = function (...args) {
-            try {
-              const first = args[0];
-              const url = String(first && first.url ? first.url : first);
-              if (url.indexOf("/conversations/") >= 0) {
-                const init = args[1] || (first && typeof first === "object" ? first : {});
-                if (window.__tpCap.length < 30) {
-                  window.__tpCap.push({ url: url, body: String((init && init.body) || "") });
-                }
-              }
-            } catch (_) {}
-            return orig.apply(this, args);
-          };
-        }
+      chrome.scripting.executeScript({
+        target: { tabId: t.id }, world: "MAIN", func: CAP_INJECT
       }).catch(() => null);
     }
   } catch (_) {}
 }
 
 async function readCapture() {
-  if (!SCOPE || !chrome.scripting) return [];
+  if (!SCOPE || !chrome.scripting) return { hooked: false, items: [] };
   try {
     const tabs = await chrome.tabs.query({ url: SCOPE });
-    for (const t of tabs.slice(0, 2)) {
+    const ordered = tabs.slice().sort((a, b) =>
+      (b.active ? 1 : 0) - (a.active ? 1 : 0) || (b.lastAccessed || 0) - (a.lastAccessed || 0));
+    for (const t of ordered.slice(0, 6)) {
       if (typeof t.id !== "number") continue;
       const r = await chrome.scripting.executeScript({
         target: { tabId: t.id },
         world: "MAIN",
-        func: () => (window.__tpCap || []).slice(-20)
+        func: () => ({ hooked: !!window.__tpCapHooked, items: (window.__tpCap || []).slice(-20) })
       }).catch(() => null);
       const got = r && r[0] && r[0].result;
-      if (got && got.length) return got;
+      if (got && got.items && got.items.length) return { hooked: true, items: got.items };
+      if (got && got.hooked) return { hooked: true, items: [] };
     }
   } catch (_) {}
-  return [];
+  return { hooked: false, items: [] };
 }
 
 // 用户切到某个目标站点标签页 → 通知 TaskPulse 把对应任务标记为已查看
