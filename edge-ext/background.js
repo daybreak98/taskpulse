@@ -75,14 +75,72 @@ async function push() {
       pages: tabs.length,
       registered: registered,
     };
+    const cap = await readCapture();
     await fetch(ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ at: Date.now(), browser: BROWSER, tabs, active, web })
+      body: JSON.stringify({ at: Date.now(), browser: BROWSER, tabs, active, web,
+                             cap: cap.length ? cap : undefined })
     });
   } catch (_) {
     // TaskPulse 没在跑时静默失败
   }
+}
+
+// ── 一次性抓包：读页面自己的请求参数 ────────────────────────────────
+// 服务端对列表接口的分页参数没有文档，靠猜猜不出来。这里在页面主世界挂一个
+// fetch 包装，把会话相关请求的 URL 和请求体记下来，随心跳带回 TaskPulse。
+// 只在排障时用，不改变任何请求行为。
+
+async function hookFetch() {
+  if (!SCOPE || !chrome.scripting) return;
+  try {
+    const tabs = await chrome.tabs.query({ url: SCOPE });
+    for (const t of tabs.slice(0, 1)) {
+      if (typeof t.id !== "number") continue;
+      await chrome.scripting.executeScript({
+        target: { tabId: t.id },
+        world: "MAIN",
+        func: () => {
+          if (window.__tpCapHooked) return;
+          window.__tpCapHooked = true;
+          window.__tpCap = [];
+          const orig = window.fetch;
+          window.fetch = function (...args) {
+            try {
+              const first = args[0];
+              const url = String(first && first.url ? first.url : first);
+              if (url.indexOf("/conversations/") >= 0) {
+                const init = args[1] || (first && typeof first === "object" ? first : {});
+                if (window.__tpCap.length < 30) {
+                  window.__tpCap.push({ url: url, body: String((init && init.body) || "") });
+                }
+              }
+            } catch (_) {}
+            return orig.apply(this, args);
+          };
+        }
+      }).catch(() => null);
+    }
+  } catch (_) {}
+}
+
+async function readCapture() {
+  if (!SCOPE || !chrome.scripting) return [];
+  try {
+    const tabs = await chrome.tabs.query({ url: SCOPE });
+    for (const t of tabs.slice(0, 2)) {
+      if (typeof t.id !== "number") continue;
+      const r = await chrome.scripting.executeScript({
+        target: { tabId: t.id },
+        world: "MAIN",
+        func: () => (window.__tpCap || []).slice(-20)
+      }).catch(() => null);
+      const got = r && r[0] && r[0].result;
+      if (got && got.length) return got;
+    }
+  } catch (_) {}
+  return [];
 }
 
 // 用户切到某个目标站点标签页 → 通知 TaskPulse 把对应任务标记为已查看
@@ -280,4 +338,4 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   }
 });
 
-ensureWebBridge().then(injectIntoOpenTabs);
+ensureWebBridge().then(injectIntoOpenTabs).then(hookFetch);
