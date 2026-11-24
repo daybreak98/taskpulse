@@ -90,6 +90,9 @@ final class OnboardingController {
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        // 按钮是 container 的直接子视图，不在背景层之下。外观必须在 container 上
+        // 设，否则浅色模式下 .rounded 按钮画白底、而我们用浅色字，整块糊白。
+        container.appearance = NSAppearance(named: .darkAqua)
         container.wantsLayer = true
         container.layer?.cornerRadius = glassRadius
         container.layer?.masksToBounds = true

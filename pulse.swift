@@ -1341,6 +1341,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.endDrag("mouseUp")
             return e
         }
+        // 诊断入口：TP_TEST_TOAST=1 启动时弹一条测试提示条，用来确认右上角
+        // 那条「Agent 回话了」到底能不能显示（毛玻璃渲染在部分机器上会失效）
+        if ProcessInfo.processInfo.environment["TP_TEST_TOAST"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                guard let self, let first = self.view.payload?.all.first else {
+                    self?.showToast(TaskItem(id: 0, name: "测试提示条", group: nil, status: "attention",
+                                             prev: nil, progress: 0, elapsed: 0, idle_minutes: 0,
+                                             overdue: false, failed: nil, muted: nil, stale: nil,
+                                             reply_version: nil),
+                                   title: "测试提示条", body: "如果你看到这条，说明提示条正常")
+                    return
+                }
+                self.showToast(first, title: "测试提示条", body: "如果你看到这条，说明提示条正常")
+            }
+        }
+
         // 全新安装首次启动：先带一遍扩展安装引导
         if OnboardingController.shouldShow {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
