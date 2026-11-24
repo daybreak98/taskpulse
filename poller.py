@@ -235,6 +235,9 @@ REPROBE_WINDOW_SECONDS = 300
 REPROBE_ATTEMPTS = 4
 # 多久没再出现在列表里，就只当历史记录、不再计入实时状态
 COVERAGE_EXPIRE_SECONDS = 3600
+# 跑动结束后先等一个窗口再下结论：列表刷新比队列慢，立刻判「已查看」会吃掉
+# 短任务的回复。90 秒覆盖 api（60s）与 web（30s）两种列表周期
+REPLY_SETTLE_SECONDS = 90
 # 两次成功观测之间断档超过半小时，就不再认为「同一轮一直在跑」。
 # 定在半小时而不是几分钟：正常轮询是分钟级，能断到这么久只有休眠/断网/进程停摆，
 # 而低于卡住阈值的一半时，重启计时反而会掩盖真实的长时间运行。
@@ -946,6 +949,19 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
     task["stuck_notified"] = 0
 
     if not reply:
+        # 这一轮刚跑完，但列表还没补上来（列表 60s/30s 才刷一次）。此刻定「已查看」
+        # 会把 8 秒短任务的回复吃掉——它其实需要你处理，只是我们还没有证据。
+        # 做法：先留在「运行中」，给一个结算窗口；下一轮列表到了自然转成待回复，
+        # 窗口内一直没动静才真的算已查看。代价是短任务晚最多一个窗口才变「已查看」。
+        settle_until = task.get("settle_until") or 0
+        if started and not settle_until:
+            task["settle_until"] = sample.at + REPLY_SETTLE_SECONDS * 1000
+        if task.get("settle_until") and sample.at < task["settle_until"]:
+            task["status"] = "running"
+            task["running_since"] = started
+            task["countdown_since"] = task.get("countdown_since") or started
+            return
+        task.pop("settle_until", None)
         if update <= (task.get("reply_completed_at") or 0):
             task["acked_update"] = max(update, task.get("acked_update") or 0)
         if task.get("status") in ("running", "attention", "stuck"):

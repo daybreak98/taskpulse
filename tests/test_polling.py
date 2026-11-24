@@ -409,6 +409,34 @@ class PollingTests(unittest.TestCase):
         self.assertIn("429", poller.load_state()["poller_error"])
         self.assertEqual(poller.load_state()["updated"], NOW)
 
+    def test_short_task_is_not_marked_seen_before_list_catches_up(self):
+        """8 秒短任务：队列先转空闲、列表还没刷新，不能直接判「已查看」。"""
+        base = NOW
+        agent = FakeAgent([conversation(1, updated=base)], busy=(1,))
+        poller.poll_tick(agent, full=True)
+
+        # 上一轮结束过（reply_completed_at 有值），这一轮 8 秒前刚跑完；
+        # 列表还没刷新，updateTime 仍是 base
+        self.stamp = base + 8_000
+        state = poller.load_state()
+        state["tasks"]["1"].update(reply_completed_at=base, acked_update=base,
+                                   update_ms=base, status="running",
+                                   running_since=base + 8_000,
+                                   countdown_since=base + 8_000)
+        poller.save_state(state)
+
+        agent.busy.clear()
+        agent.items = [conversation(1, updated=base)]
+        poller.poll_tick(agent, full=True)
+        self.assertEqual(poller.load_state()["tasks"]["1"]["status"], "running",
+                         "列表还没补上新回复就当成已查看了")
+
+        # 列表补上来：这一轮确实有回复，转成待回复
+        agent.items = [conversation(1, updated=self.stamp + 1_000)]
+        self.stamp += 5_000
+        poller.poll_tick(agent, full=True)
+        self.assertEqual(poller.load_state()["tasks"]["1"]["status"], "attention")
+
     def test_long_gap_restarts_the_run_instead_of_reporting_stuck(self):
         """休眠/断网很久之后仍看到「忙」，不能沿用旧起点立刻报卡住。"""
         agent = FakeAgent([conversation()], busy=(1,))
