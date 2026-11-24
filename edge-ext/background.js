@@ -105,7 +105,7 @@ async function notifyActive(tabId) {
 }
 
 // 按 conversationId 找到标签并切过去；找不到才新开
-async function focusConversation(cid, url, tabId) {
+async function focusConversation(cid, url, tabId, stale) {
   const re = new RegExp("[?&]conversationId=" + cid + "(?:[&#]|$)");
   let hit = null;
   // 优先用 TaskPulse 缓存的 tabId（单标签查询，比全量 query 快一个量级）
@@ -126,7 +126,9 @@ async function focusConversation(cid, url, tabId) {
       jobs.push(chrome.windows.update(hit.windowId, { focused: true }).catch(() => {}));
     }
     await Promise.all(jobs);
-  } else if (url) {
+  } else if (url && !stale) {
+    // 命令已经过期（TaskPulse 那边用兜底路径处理过了）：别再新开一个标签，
+    // 否则一次点击会看到两个标签页
     await chrome.tabs.create({ url, active: true });
   }
 }
@@ -142,7 +144,8 @@ async function listen() {
       if (r.status === 200) {
         const cmd = await r.json();
         if (cmd && cmd.cmd === "focus" && cmd.cid) {
-          await focusConversation(String(cmd.cid), cmd.url || "", cmd.tabId);
+          const stale = !!cmd.expires && Date.now() > cmd.expires;
+          await focusConversation(String(cmd.cid), cmd.url || "", cmd.tabId, stale);
           if (cmd.id) {
             try {
               await fetch(ACK_ENDPOINT + "?id=" + encodeURIComponent(cmd.id), { method: "POST" });

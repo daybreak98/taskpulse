@@ -1113,6 +1113,9 @@ def view(state: dict) -> dict:
 
 _tab_groups: dict[str, str] = {}
 _tab_ids: dict[str, int] = {}       # conversationId -> 扩展给的 tabId，切标签时免查询
+# conversationId -> 这个标签在哪个浏览器里（edge/chrome）。两个浏览器都装了扩展时，
+# 命令必须发给真正持有该标签的那一个，否则对方找不到就会新开一个标签
+_tab_browser: dict[str, str] = {}
 # 用户此刻正停留在哪个会话的标签页上（窗口聚焦才算）
 _active_tab = {"cid": None, "focused": False, "ts": 0}
 # 扩展最近一次上报的时刻：初装引导靠它判断「装好了没有」
@@ -1194,6 +1197,8 @@ def ingest_tabs(payload: dict, ua: str = "") -> int:
         tid = t.get("tabId")
         if isinstance(tid, int):
             _tab_ids[cid] = tid
+        if b:
+            _tab_browser[cid] = b
         g = (t.get("group") or "").strip()
         if g:
             _tab_groups[cid] = g
@@ -1277,7 +1282,10 @@ def focus_tab(win: int, tab: int) -> bool:
 
 
 # ── 扩展命令通道：长轮询，避免 AppleScript 的一百多毫秒开销 ──────────
-_cmd_q: "queue.Queue[dict]" = queue.Queue()
+# 每个浏览器一个队列：命令只能被「真正持有那个标签」的扩展领走。
+# 共用一个队列时，没开该会话的那个浏览器会先领到，然后自己新开一个标签。
+_cmd_queues: dict[str, "queue.Queue[dict]"] = {}
+_cmd_done: dict[str, float] = {}    # 已经执行或已过期，防止迟到的扩展再执行一次
 _cmd_acks: dict[str, float] = {}
 _cmd_t0: dict[str, float] = {}      # cmd_id -> 入队时刻，用于量跳转耗时
 _cmd_waiters = 0                    # 当前有多少个扩展长轮询正挂着等命令
@@ -1285,10 +1293,24 @@ _cmd_waiters_lock = threading.Lock()
 _ext_seen = 0.0          # 扩展最近一次长轮询的时间
 
 
+def _cmd_queue(browser: str) -> "queue.Queue[dict]":
+    q = _cmd_queues.get(browser)
+    if q is None:
+        q = _cmd_queues[browser] = queue.Queue()
+    return q
+
+
+def _cmd_expired(item: dict) -> bool:
+    return bool(item.get("expires")) and time.time() * 1000 > item["expires"]
+
+
 def _open_fallback(cid: str, cmd_id: str) -> None:
     """扩展没在 0.25s 内接走命令时，退回 AppleScript 聚焦（必须执行）。"""
     if _cmd_acks.pop(cmd_id, None) is not None:
+        _cmd_done[cmd_id] = time.time()
         return
+    # 兜底已经动过手了：命令作废，迟到的扩展即使领到也不要再执行一次
+    _cmd_done[cmd_id] = time.time()
     t0 = _cmd_t0.pop(cmd_id, None)
     try:
         r = open_conversation(cid)
@@ -1582,7 +1604,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(view(load_state()))
         elif path == "/diag":
             self._json({"ext_seen_age": round(time.time() - _ext_seen, 1),
-                        "cmd_queue": _cmd_q.qsize(),
+                        "cmd_queue": {b: q.qsize() for b, q in _cmd_queues.items()},
                         "watching_cid": _active_tab["cid"],
                         "watching_focused": _active_tab["focused"],
                         "watching_age": round((now_ms() - (_active_tab["ts"] or 0)) / 1000, 1),
@@ -1590,13 +1612,26 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/cmd":
             global _cmd_waiters
             _ext_seen = time.time()
+            browser = browser_of(self.headers.get("User-Agent") or "", "")
+            q = _cmd_queue(browser)
             with _cmd_waiters_lock:
                 _cmd_waiters += 1
             item = None
+            deadline = time.monotonic() + 10
             try:
-                item = _cmd_q.get(timeout=10)
-            except queue.Empty:
-                pass
+                while True:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    try:
+                        candidate = q.get(timeout=left)
+                    except queue.Empty:
+                        break
+                    # 兜底已经执行过、或已经过期的命令直接丢掉，别再开一个标签
+                    if candidate.get("id") in _cmd_done or _cmd_expired(candidate):
+                        continue
+                    item = candidate
+                    break
             finally:
                 with _cmd_waiters_lock:
                     _cmd_waiters -= 1
@@ -1687,6 +1722,7 @@ class Handler(BaseHTTPRequestHandler):
         # 扩展收到命令并执行完后回报
         if parsed.path == "/cmd/ack":
             _cmd_acks[cid] = time.time()
+            _cmd_done[cid] = time.time()
             t0 = _cmd_t0.pop(cid, None)
             if t0:
                 log("open ack id=%s %dms" % (cid, int((time.time() - t0) * 1000)))
@@ -1701,10 +1737,13 @@ class Handler(BaseHTTPRequestHandler):
             cmd_id = "%s-%d" % (cid, int(time.time() * 1000))
             task0 = (load_state().get("tasks") or {}).get(cid) or {}
             url0 = task0.get("url")
-            if url0 and (time.time() - _ext_seen) < 20 and _cmd_waiters > 0:
+            owner = _tab_browser.get(cid)
+            if (url0 and owner and (time.time() - _ext_seen) < 20 and _cmd_waiters > 0):
                 _cmd_t0[cmd_id] = time.time()
-                _cmd_q.put({"cmd": "focus", "cid": cid, "url": url0,
-                            "tabId": _tab_ids.get(cid), "id": cmd_id})
+                _cmd_queue(owner).put({"cmd": "focus", "cid": cid, "url": url0,
+                                       "tabId": _tab_ids.get(cid), "id": cmd_id,
+                                       "browser": owner,
+                                       "expires": int(time.time() * 1000) + 1500})
                 threading.Timer(0.25, _open_fallback, args=(cid, cmd_id)).start()
                 result = "queued"
             else:

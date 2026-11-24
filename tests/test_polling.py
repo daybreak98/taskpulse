@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import ExitStack, contextmanager
 from http.server import ThreadingHTTPServer
@@ -516,6 +517,39 @@ class PollingTests(unittest.TestCase):
         state = poller.poll_tick(agent, full=False, discovery=True)
         self.assertEqual(agent.queue_calls, [1], "重跑的会话没被快探取到")
         self.assertEqual(state["tasks"]["1"]["status"], "running")
+
+    # ── 跳转：命令只能发给持有该标签的浏览器 ─────────────────────────
+
+    def test_open_command_targets_the_browser_that_owns_the_tab(self):
+        agent = FakeAgent([conversation(1)])
+        poller.poll_tick(agent, full=True)
+        task = poller.load_state()["tasks"]["1"]
+        poller._cmd_queues.clear()
+        poller._cmd_done.clear()
+
+        with patch.multiple(poller, _ext_seen=time.time(), _cmd_waiters=1,
+                            open_conversation=Mock(return_value="focused")):
+            poller.ingest_tabs({"browser": "edge",
+                                "tabs": [{"url": task["url"], "tabId": 77}]},
+                               "Mozilla/5.0 (Macintosh) Edg/157")
+            with self.serve() as url:
+                r = requests.post(url + f"/open?id={task['id']}", timeout=5)
+            self.assertEqual(r.json()["result"], "queued")
+            time.sleep(0.4)          # 等兜底定时器走完，避免影响下一个用例
+
+        self.assertEqual(poller._cmd_queue("edge").qsize(), 1)
+        self.assertEqual(poller._cmd_queue("chrome").qsize(), 0)
+
+    def test_expired_command_is_not_delivered(self):
+        poller._cmd_queues.clear()
+        poller._cmd_done.clear()
+        poller._cmd_queue("chrome").put({"cmd": "focus", "cid": "1", "id": "olds",
+                                         "expires": int(time.time() * 1000) - 1000})
+        with self.serve() as url:
+            # 长轮询会挂到底，过期的命令既不返回也不执行，最后 204
+            r = requests.get(url + "/cmd", timeout=15,
+                             headers={"User-Agent": "Mozilla/5.0 Chrome/157"})
+        self.assertEqual(r.status_code, 204)
 
     def test_finished_task_leaves_live_counts(self):
         agent = FakeAgent([conversation(1)], busy=(1,))
