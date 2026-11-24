@@ -190,8 +190,9 @@ TP_DEBUG = os.environ.get("TP_DEBUG") == "1"
 WATCH_LIMIT = max(0, int(CFG["poll"]["watch_limit"]))
 # 数据来源可在运行时切换（UI 上那个 API / WEB 按钮）
 WEBSTATE_FILE = os.path.join(HOME, ".taskpulse", "webstate.json")
-# web 模式下缓存超过这么久没更新，就当作「页面关了」，别让旧数字看着像新的
-WEB_STALE_SECONDS = max(90, POLL_SECONDS * 2)
+# web 模式下缓存超过这么久没更新，就当作「页面没在报」，别让旧数字看着像新的。
+# 页面在后台会被节流，实测有过 80 秒的空档；阈值取 180 秒，避免提示来回闪。
+WEB_STALE_SECONDS = max(180, POLL_SECONDS * 3)
 
 
 def source_mode() -> str:

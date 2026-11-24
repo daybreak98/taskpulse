@@ -96,6 +96,9 @@ final class OnboardingController {
         p.contentView = container
 
         let bg = NSVisualEffectView(frame: container.bounds)
+        // 面板本身是深色玻璃；不锁深色外观时，系统浅色模式下 .rounded 按钮
+        // 会画成白底，而我们给标题用的是浅色，整块按钮就糊成一片白
+        bg.appearance = NSAppearance(named: .darkAqua)
         bg.material = .hudWindow
         bg.blendingMode = .behindWindow
         bg.state = .active

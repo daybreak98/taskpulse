@@ -888,7 +888,11 @@ final class PulseView: NSView {
     var statusMessage: String? {
         if connectionLost { return "本机服务连接中断" }
         guard let p = payload else { return "正在连接本机服务…" }
-        if p.poller_error != nil { return "上游取数失败，显示上次快照" }
+        if let error = p.poller_error {
+            // 两种故障要分开说：接口/认证出问题，和「浏览器页面这一会儿没上报」
+            if error.contains("没有上报") { return "浏览器页面暂无数据，显示上次快照" }
+            return "取数暂时失败，显示上次快照"
+        }
         if p.updated == nil { return "等待首次采样…" }
         if countersUnavailable { return "取数暂未更新，显示上次快照" }
         if let actionMessage { return actionMessage }
@@ -1543,6 +1547,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 固定锚在主屏（origin == 0,0）。副屏位于左侧负坐标，
     /// 若跟随 panel.screen 会在跨屏边界时算错贴边位置。
+    /// 所有屏幕的并集：窗口要被允许拖到笔记本上方的显示器里，
+    /// 只按主屏裁会把「往上拖」直接夹回来。
+    func desktopBounds() -> NSRect {
+        let frames = NSScreen.screens.map { $0.visibleFrame }
+        guard var union = frames.first else { return NSRect(x: 0, y: 0, width: 1440, height: 900) }
+        for f in frames.dropFirst() { union = union.union(f) }
+        return union
+    }
+
+    /// 窗口当前落在哪块屏幕上（按中心点判断），贴边吸附以它为准。
+    func screenFor(_ f: NSRect) -> NSRect {
+        let c = NSPoint(x: f.midX, y: f.midY)
+        if let hit = NSScreen.screens.first(where: { $0.frame.contains(c) }) { return hit.visibleFrame }
+        return desktopBounds()
+    }
+
     func visibleFrame() -> NSRect {
         let main = NSScreen.screens.first { $0.frame.origin == .zero }
             ?? NSScreen.main ?? NSScreen.screens.first
@@ -1553,16 +1573,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard panel != nil, !dragging else { return }
         let w = view.contentWidth()
         let h = max(view.layoutHeight(), 56)
-        let v = visibleFrame()
+        let v = desktopBounds()
+        let screen = screenFor(panel.frame)
         var f = panel.frame
-        let touchRight = abs(f.maxX - v.maxX) <= 8
-        let touchLeft = abs(f.minX - v.minX) <= 8
+        let touchRight = abs(f.maxX - screen.maxX) <= 8
+        let touchLeft = abs(f.minX - screen.minX) <= 8
 
         var x: CGFloat
         if touchRight {
-            x = v.maxX - w
+            x = screen.maxX - w
         } else if touchLeft {
-            x = v.minX
+            x = screen.minX
         } else {
             x = min(max(f.minX, v.minX), v.maxX - w)
         }
@@ -1593,7 +1614,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 窗口是否贴着任意一条屏幕边（贴边才允许保持细条形态）
     func nearAnyEdge(_ f: NSRect) -> Bool {
-        let v = visibleFrame()
+        let v = screenFor(f)
         return f.maxX >= v.maxX - EDGE_SNAP || f.minX <= v.minX + EDGE_SNAP
             || f.maxY >= v.maxY - EDGE_SNAP || f.minY <= v.minY + EDGE_SNAP
     }
