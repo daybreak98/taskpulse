@@ -33,25 +33,48 @@ fi
 APP="$(ps -Ao command | grep -iE "/(MyFlicker|CodeFlicker)\.app/Contents/MacOS/" | grep -v grep | head -1 | sed 's|.*/\([^/]*\)\.app/.*|\1|')"
 [ -z "$APP" ] && APP="未运行"
 
-IDENT="$(curl -s -m 4 http://127.0.0.1:3459/api/open/ap-token 2>/dev/null | PY -c '
+TARGET_DOMAIN="$(PY -c '
+import json, sys
+from urllib.parse import urlparse
+try:
+    host = urlparse(json.load(open(sys.argv[1]))["platform"]["base_url"]).netloc
+except Exception:
+    host = ""
+print(host)
+' "$CFG" 2>/dev/null)"
+IDENT="$(curl -s -m 4 "http://127.0.0.1:3459/api/open/ap-token?trustDomain=${TARGET_DOMAIN}" 2>/dev/null | PY -c '
 import sys, json, base64
 try:
     d = json.load(sys.stdin)
     t = (d.get("data") or {}).get("accessToken") or ""
     p = t.split(".")[1]; p += "=" * (-len(p) % 4)
     i = json.loads(base64.urlsafe_b64decode(p))
-    print("%s %s" % (i.get("username") or "-", i.get("claw_id_issuer") or "-"))
+    aud = ",".join(i.get("aud") or []) or "-"
+    print("%s %s %s" % (i.get("username") or "-", i.get("claw_id_issuer") or "-", aud))
 except Exception:
     print("? ?")
 ' 2>/dev/null)"
-USER_NAME="${IDENT%% *}"
-ISSUER="${IDENT##* }"
+USER_NAME="$(printf '%s' "$IDENT" | awk '{print $1}')"
+ISSUER="$(printf '%s' "$IDENT" | awk '{print $2}')"
+AUD="$(printf '%s' "$IDENT" | awk '{print $3}')"
+SDK_VER="$("$UV" run --quiet --no-project --python ">=3.10" --with 'ks-aimate>=1.4.0' \
+  --index https://pypi.corp.kuaishou.com/kuaishou/prod/+simple/ \
+  python -c 'from importlib.metadata import version; print(version("ks_aimate"))' 2>/dev/null | tail -1)"
 say "客户端" "${APP}（票据签发方 ${ISSUER}）"
 say "登录账号" "${USER_NAME}"
+say "SDK" "ks-aimate ${SDK_VER:-未知}"
+say "票据范围" "${AUD}（目标域 ${TARGET_DOMAIN}，SDK 实际使用的那张）"
+# 票的 aud 里没有目标域名 → 换到的是普通票，数据平台会以 401 拒掉
+if [ -n "$AUD" ] && [ "$AUD" != "-" ]; then
+  case "$AUD" in
+    *dataagent*) : ;;
+    *) say "注意" "票据不含 dataagent 域，SDK 版本偏低会导致此现象（需 >=1.4.0）" ;;
+  esac
+fi
 
 # ── 2. 直连取数（和常驻服务完全同一套参数）────────────────────────
 RESULT="$("$UV" run --quiet --no-project --python ">=3.10" \
-  --with 'ks-aimate>=1.0.29' \
+  --with 'ks-aimate>=1.4.0' \
   --index https://pypi.corp.kuaishou.com/kuaishou/prod/+simple/ \
   python - "$CFG" <<'PY' 2>&1 | tail -1
 import importlib.util, os, sys

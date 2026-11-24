@@ -2,101 +2,62 @@
 
 记录时间：2026-11-24 23:10 · 上报人：huyingjie · 相关提交：`3c61e34`
 
-## 一句话
+## 结论：依赖版本不一致，票的作用域缺 dataagent
 
-同一份安装包、同一份配置，A 机器（本人）API 模式正常取到会话；B 机器（同事
-yuan）调用 `/conversations/list` 返回 **HTTP 401**，而 WEB 模式在 B 机器上正常。
-需要判断这张票为什么不被数据平台接受。
+安装包只声明了 `ks-aimate>=1.0.29`，**没有上限**，不同机器可能解析出不同版本。
+两个版本的换票行为不同：
 
-## 两台机器的对照
+| SDK 版本 | 换票时带 `trustDomain` | 票的 `aud` | 结果 |
+|---|---|---|---|
+| 1.0.29 | 否（没有 `token_provider.py`） | `["cloud-claw"]` | `/conversations/list` **401** |
+| 1.2.0 / 1.3.0 / 1.4.0 / 1.5.3 | 是 | `["cloud-claw", "dataagent.corp.kuaishou.com"]` | 正常，69 个会话 |
 
-| | A（正常） | B（401） |
-|---|---|---|
-| 客户端 | MyFlicker（票据 `claw_id_issuer=MyFlicker`） | 客户端在运行（3459 有响应） |
-| 票据的 username | `huyingjie` | 未采集到 |
-| `pypi.corp` 可达 | HTTP 200 | HTTP 200 |
-| `127.0.0.1:3459/api/open/ap-token` | HTTP 200 | HTTP 200 |
-| 直接取数 `/conversations/list` | 成功，69 个会话 | **HTTP 401** |
-| WEB 模式 | 正常 | 正常 |
-
-B 机器 `api_check.command` 的完整输出：
+证据（本机实测，同一台机器分别用两个版本跑）：
 
 ```
-配置     provider=module  KS_AGENT_PLATFORM=codeflicker
-内网源   可达（HTTP 200）
-凭据服务  在线（HTTP 200）
-直接取数  FAIL HTTPError: /conversations/list 返回 HTTP 401
-结论     服务在线（端口 8899），但取数未就绪，上游报错：HTTPError: /conversations/list 返回 HTTP 401
+ks-aimate==1.0.29  → 模块内没有 token_provider.py，源码中无 trustDomain，无 OBO 域限票能力
+ks-aimate==1.5.3   → 无 trustDomain: aud=['cloud-claw'] token_len=999
+                     带 trustDomain: aud=['cloud-claw','dataagent.corp.kuaishou.com'] token_len=1039
 ```
 
-## 已排除
-
-- 内网不通：`pypi.corp` 200，依赖安装成功
-- 依赖缺失：`ks-aimate` 能导入（否则 `api_check` 会报 `ModuleNotFoundError`）
-- 客户端没起：3459 有响应
-- 配置缺字段：`provider=module`、`KS_AGENT_PLATFORM=codeflicker` 都在
-- 代码差异：两台用同一个 zip、同一个 `poller.py`
-
-## 涉及代码
-
-认证入口（[poller.py:463](/Users/hyj/taskpulse/poller.py:463)）：
+SDK 里这张域限票的取法是 [token_provider.py:338](/Users/hyj/taskpulse/poller.py)（第三方包，非本仓库）：
 
 ```python
-def make_session():
-    a = CFG.get("auth") or {}
-    # 有些 SDK 靠环境变量决定去哪换凭据；在导入模块之前注入
-    for k, v in (a.get("env") or {}).items():
-        os.environ[str(k)] = str(v)
-    if provider == "module":
-        return _ModuleSession(module, factory, extra_config, ctor_kwargs)
+def _get_token_codeflicker(self, trust_domain=None, trace_id=None):
+    api_url = f"http://localhost:{port}/api/open/ap-token"
+    if trust_domain:
+        api_url = f"{api_url}?trustDomain={trust_domain}"
 ```
 
-`_ModuleSession` 把 `extra_config` 透传给 SDK 的 `request()`（若是签名里有该参数）：
+调用方按请求 URL 的 host 决定 trust_domain（`session.py:4027`）：
 
 ```python
-class _ModuleSession:
-    def request(self, method: str, url: str, **kw):
-        if self._takes_extra and self._extra:
-            kw["extra_config"] = self._extra
-        return self._s.request(method, url, **kw)
+target_domain = urlparse(url).netloc
+if cfg.get("obo_required"):
+    self._probe_obo_token_or_exit(trust_domain=target_domain)
 ```
 
-配置（安装包内 `config.json`）：
+## 修复
 
-```json
-"auth": {
-  "provider": "module",
-  "module": "ks_aimate.sso_login_client",
-  "factory": "SmartSSOSession",
-  "extra_config": { "obo_required": true },
-  "env": { "KS_AGENT_PLATFORM": "codeflicker" }
-}
-```
+`packaging/internal/uv-args.txt` 与 `packaging/api_check.command` 的下限从
+`ks-aimate>=1.0.29` 提到 `ks-aimate>=1.4.0`（已验证支持 trustDomain）。
+新包 `dist/TaskPulse-20261125-internal.zip`。
 
-A 机器上解码 `ap-token` 拿到的身份（供对照）：
+## 诊断工具
+
+`api_check.command` 现在会打印 SDK 版本与**SDK 实际使用的域限票的 aud**：
 
 ```
-username       = huyingjie
-claw_id_issuer = MyFlicker
-iss            = kssso-session
+SDK      ks-aimate 1.5.3
+票据范围 cloud-claw,dataagent.corp.kuaishou.com（目标域 dataagent.corp.kuaishou.com，SDK 实际使用的那张）
 ```
 
-## 需要专家判断的点
+若 `票据范围` 里没有 `dataagent`，它会直接给出「SDK 版本偏低」的判断。
 
-1. `ks_aimate.sso_login_client.SmartSSOSession` + `extra_config={"obo_required": true}`
-   在什么条件下会换出**非 OBO** 的票？B 机器是否可能静默降级成普通 session 票，
-   导致 `dataagent` 侧 401。
-2. `/conversations/list` 的 401 是「票无效」还是「票有效但 interface 未授权」？
-   如果是后者，返回 403 还是 401。
-3. `KS_AGENT_PLATFORM` 取值（`codeflicker` / `myflicker` / 其他）是否影响票的
-   audience。A 机器用 `codeflicker` 而票由 MyFlicker 签发且可用，说明二者并非一一对应；
-   是否存在「换票路径名」与「签发方」两套概念。
-4. 账号维度：B 机器的内网账号是否需要单独开通 DataAgent 权限，还是只要网页能登录即可。
-   若是前者，需要哪个系统里给权限。
-5. 是否存在 OBO 需要「先有一次网页登录」的前置条件（B 机器 WEB 正常，说明网页侧登录过）。
+## 仍需确认
 
-## 已提供的一次性诊断工具
+同事机器的 `ks-aimate` 版本与票据 aud。若重装后 `SDK` 显示 < 1.4.0，说明
+内网源在她的网络环境下解析到了旧版，需要确认是缓存还是源不同。
 
-安装包自带 `api_check.command`（[packaging/api_check.command](/Users/hyj/taskpulse/packaging/api_check.command)），
-在 B 机器上双击即可输出上述对照信息，并在 API 不可用时自动切到 WEB 保证可用。
-它也会打印票据所属的 `username` 与 `claw_id_issuer`，可直接判定「是不是登错账号」。
+---
+
