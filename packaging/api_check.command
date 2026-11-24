@@ -17,6 +17,9 @@ api() { curl -s -m 4 -H "X-TP-Token: $(cat "$TOKEN_FILE" 2>/dev/null)" "http://1
 
 echo "== TaskPulse 自检 =="
 
+# poller.py 与脚本通常同目录（安装后就是这样）；在仓库里直接跑时它在上一级
+[ -f "poller.py" ] || cd .. || exit 1
+
 # ── 0. 服务在不在 ────────────────────────────────────────────────
 if ! api /mode >/dev/null 2>&1; then
   launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.taskpulse.poller.plist" 2>/dev/null
