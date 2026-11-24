@@ -42,7 +42,17 @@ except Exception:
     host = ""
 print(host)
 ' "$CFG" 2>/dev/null)"
-IDENT="$(curl -s -m 4 "http://127.0.0.1:3459/api/open/ap-token?trustDomain=${TARGET_DOMAIN}" 2>/dev/null | PY -c '
+TOKEN_URL=""
+for port in 3459 3469 3479; do
+  if curl -s -o /dev/null -m 2 "http://127.0.0.1:${port}/api/open/ap-token" 2>/dev/null; then
+    TOKEN_URL="http://127.0.0.1:${port}/api/open/ap-token"
+    break
+  fi
+done
+[ -z "$TOKEN_URL" ] && TOKEN_URL="http://127.0.0.1:3459/api/open/ap-token"
+say "凭据服务" "$(printf '%s' "$TOKEN_URL" | sed 's|.*//||; s|/api.*||')"
+
+IDENT="$(curl -s -m 4 "${TOKEN_URL}?trustDomain=${TARGET_DOMAIN}" 2>/dev/null | PY -c '
 import sys, json, base64
 try:
     d = json.load(sys.stdin)
@@ -126,7 +136,7 @@ case "$DETAIL" in
     if [ "${COOKIES:-0}" -lt 5 ]; then
       WHY="本机没有登录凭据（cookie=${COOKIES}），需要扫码授权一次"
     else
-      WHY="票据被数据平台拒绝（账号 ${USER_NAME}）"
+      WHY="登录凭据已过期或账号无权限（账号 ${USER_NAME}），重跑 api_login.command 可续期"
     fi ;;
   *403*)  WHY="账号 ${USER_NAME} 没有该接口权限" ;;
   *ModuleNotFoundError*) WHY="依赖没装上（内网源不通）" ;;
