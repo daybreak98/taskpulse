@@ -54,8 +54,10 @@ for f in "$PWD"/edge-ext/*; do
   cp -R "$f" "$OUT/edge-ext/"
 done
 # health_check.sh 随包分发：install.command 用它区分「进程在线」和「取数就绪」
-cp packaging/install.command packaging/uninstall.command packaging/health_check.sh packaging/README.md "$OUT/"
-chmod +x "$OUT/install.command" "$OUT/uninstall.command" "$OUT/health_check.sh"
+cp packaging/install.command packaging/uninstall.command packaging/health_check.sh \
+   packaging/api_check.command packaging/README.md "$OUT/"
+chmod +x "$OUT/install.command" "$OUT/uninstall.command" "$OUT/health_check.sh" \
+         "$OUT/api_check.command"
 mkdir -p "$OUT/docs" && cp docs/product-spec.md docs/INSTALL.md "$OUT/docs/"
 cp docs/INSTALL.md "$OUT/INSTALL.md"     # 用户第一眼就能看到，不用进 docs 目录找
 

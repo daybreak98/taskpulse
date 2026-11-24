@@ -108,6 +108,23 @@ TaskPulse 是贴在屏幕边缘的一条细条，点开能看到你所有 DataAg
 
 ---
 
+## API 模式取不到数据？
+
+`API` 模式是进程直连接口，用内网 SSO 凭据，不碰浏览器。它需要三样东西：内网可达、
+本机跑着 CodeFlicker / MyFlicker 客户端（提供 `127.0.0.1:3459` 的 ap-token）、
+客户端登录态有效。
+
+双击安装目录里的 `api_check.command`，它会逐项检查并直接告诉你卡在哪：
+
+```
+配置    provider=module  KS_AGENT_PLATFORM=codeflicker
+内网源  可达（HTTP 200）
+凭据服务 在线（HTTP 200）
+直接取数 OK 取到 69 个会话（源=api）
+```
+
+哪一行不对，按它下面给出的处理办法做。都不行就先切 `WEB`——那个不需要任何凭据。
+
 ## 遇到问题
 
 **细条没出现**
