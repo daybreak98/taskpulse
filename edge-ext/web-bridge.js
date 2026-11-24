@@ -16,6 +16,8 @@
   const queueAt = {};       // cid -> 这条队列是哪一刻成功取到的
   const lastMessages = {};  // cid -> {sender, content}
   const lastQueueAt = {};   // cid -> 上次拉队列的时刻
+  const seenUpdate = {};    // cid -> 上一次看到的 updateTime
+  const hotUntil = {};      // cid -> 这个时刻之前按「刚有动静」加密采样
   const lastMsgAt = {};     // cid -> 上次拉最后一条消息的 updateTime
   let lastListAt = 0;
   let lastReportAt = 0;
@@ -148,8 +150,16 @@
       let pulled = 0;
       for (const c of watch) {
         const cid = String(c.id);
+        // 列表里的 updateTime 变了＝这一轮刚有动静（用户发消息 / 回复落地）。
+        // 只按「忙不忙」决定采样间隔是不够的：刚发完消息的那 60 秒里它仍然是
+        // IDLE，等下一次 60 秒的采样赶到，短任务已经结束，什么都看不到。
+        if (c.updateTime && c.updateTime !== seenUpdate[cid]) {
+          seenUpdate[cid] = c.updateTime;
+          hotUntil[cid] = now() + 120000;
+        }
+        const hot = (hotUntil[cid] || 0) > now();
         const b = isBusy(cid);
-        const gap = b === true ? 5000 : 60000;
+        const gap = b === true ? 5000 : (hot ? 5000 : 60000);
         const last = lastQueueAt[cid] || 0;
         if (now() - last < gap) continue;
         if (pulled >= 6) break;       // 单轮最多 6 个，避免突发
