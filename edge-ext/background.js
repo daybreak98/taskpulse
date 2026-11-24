@@ -208,6 +208,17 @@ async function nudgeWebBridge() {
   } catch (_) {}
 }
 
+// alarm 的最小周期在未打包扩展里也就 30 秒，页面被节流时数据会拖到半分钟以上。
+// 用自排队的 setTimeout 补到 15 秒；长轮询本身就占着 service worker，
+// 不会因为空闲被回收，alarm 只作为「被回收后叫醒」的兜底。
+const NUDGE_MS = 15000;
+function scheduleNudge() {
+  setTimeout(() => {
+    nudgeWebBridge().catch(() => void 0);
+    scheduleNudge();
+  }, NUDGE_MS);
+}
+
 // 只在上报「切到」这个标签时记已读。
 // 曾经这里还会补记「被切走的那个标签」，但它会把用户没看的会话误标已读：
 // 从 TaskPulse 点任务跳转时，扩展切走的上一个标签会被当成「看过了」，
@@ -452,5 +463,5 @@ async function refreshSource() {
   syncRole();
 }
 
-ensureWebBridge().then(injectIntoOpenTabs);
+ensureWebBridge().then(injectIntoOpenTabs).then(scheduleNudge);
 refreshSource().then(ensureLeader).catch(() => void 0);
