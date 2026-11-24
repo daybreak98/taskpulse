@@ -89,13 +89,18 @@
   function report() {
     if (now() - lastReportAt < 4000) return;
     lastReportAt = now();
+    // 分好组的会话往往不活跃、updateTime 靠后，按时间截断会把它们整批丢掉；
+    // 所以先把所有带分组的挑出来，再补上最近的未分组会话。
+    const grouped = convs.filter((c) => c.groupName);
+    const rest = convs.filter((c) => !c.groupName).slice(0, 60);
+    const pick = grouped.concat(rest).map((c) => ({
+      id: c.id, name: c.name, agentId: c.agentId,
+      updateTime: c.updateTime, createTime: c.createTime, groupName: c.groupName
+    }));
     const payload = {
       at: now(),
       url: location.href,
-      conversations: convs.slice(0, 60).map((c) => ({
-        id: c.id, name: c.name, agentId: c.agentId,
-        updateTime: c.updateTime, createTime: c.createTime, groupName: c.groupName
-      })),
+      conversations: pick,
       queues: queues,
       lastMessages: lastMessages
     };
