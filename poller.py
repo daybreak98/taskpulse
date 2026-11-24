@@ -1605,6 +1605,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/diag":
             self._json({"ext_seen_age": round(time.time() - _ext_seen, 1),
                         "cmd_queue": {b: q.qsize() for b, q in _cmd_queues.items()},
+                        # 标签归属：哪几个会话的标签在哪个浏览器里（跳转要按它路由）
+                        "tab_owner": dict(_tab_browser),
+                        "tab_ids": len(_tab_ids),
                         "watching_cid": _active_tab["cid"],
                         "watching_focused": _active_tab["focused"],
                         "watching_age": round((now_ms() - (_active_tab["ts"] or 0)) / 1000, 1),
