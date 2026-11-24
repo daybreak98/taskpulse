@@ -801,8 +801,10 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
     tasks = base.get("tasks") or {}
     stamp = now_ms()
     listed: list[dict] = []
+    fetched: list[dict] = []
     if full or discovery:
-        listed = agent.conversations(request_timeout(deadline))[:WATCH_LIMIT]
+        fetched = agent.conversations(request_timeout(deadline))
+        listed = fetched[:WATCH_LIMIT]
         if full:
             # 慢请求耗尽预算时，下轮先补最久未检查的会话。
             listed.sort(key=lambda conv: tasks.get(str(conv["id"]), {}).get("queue_checked_at") or 0)
@@ -852,10 +854,21 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             task.setdefault("queue_observed_at", task.get("seen_ms") or 0)
             task.update(id=conv["id"], name=conv.get("name") or f"会话 {cid}",
                         agent_id=conv.get("agentId") or (AGENT_IDS[0] if AGENT_IDS else ""),
-                        update_ms=update, seen_ms=stamp)
+                        update_ms=update, seen_ms=stamp,
+                        # 会话在 DataAgent 里的分组；取消分组时也要覆盖成空
+                        group_name=conv.get("groupName") or "")
             task["url"] = conv_url(task["agent_id"], cid)
             if task.get("archived") and update > (task.get("acked_update") or 0):
                 task.update(archived=False, muted=False, auto_archived=0, prev="running", status="seen")
+
+        # 分组 / 名称这类元数据对**所有**拉到的会话都更新一遍：分组信息来自列表接口，
+        # 而监控窗口只有前 WATCH_LIMIT 个，不补这一趟的话，靠后的任务永远显示「未分组」。
+        for conv in fetched:
+            task = tasks.get(str(conv["id"]))
+            if task is None:
+                continue
+            task["name"] = conv.get("name") or task.get("name") or ""
+            task["group_name"] = conv.get("groupName") or ""
 
         for conv in conversations:
             cid = str(conv["id"])
@@ -958,7 +971,9 @@ def view(state: dict) -> dict:
         rows.append({
             "id": task["id"],
             "name": task.get("name"),
-            "group": _tab_groups.get(str(task["id"]), ""),
+            # 分组用会话在 DataAgent 里的分组（conversations 接口自带 groupName），
+            # 不是浏览器标签组：标签组是用户手动整理的标签，和业务分组经常对不上。
+            "group": task.get("group_name") or "",
             "status": task.get("status"),
             "prev": task.get("prev"),
             "reply_version": task.get("reply_version"),
@@ -1025,9 +1040,8 @@ def view(state: dict) -> dict:
     }
 
 
-# ── 标签页组名（由 Edge 扩展上报，仅存内存不落盘）─────────────────────
+# ── 标签页映射（由浏览器扩展上报，仅存内存不落盘）─────────────────────
 
-_tab_groups: dict[str, str] = {}
 _tab_ids: dict[str, int] = {}       # conversationId -> 扩展给的 tabId，切标签时免查询
 # 用户此刻正停留在哪个会话的标签页上（窗口聚焦才算）
 _active_tab = {"cid": None, "focused": False, "ts": 0}
@@ -1110,10 +1124,6 @@ def ingest_tabs(payload: dict, ua: str = "") -> int:
         tid = t.get("tabId")
         if isinstance(tid, int):
             _tab_ids[cid] = tid
-        g = (t.get("group") or "").strip()
-        if not g:
-            continue
-        _tab_groups[cid] = g
         n += 1
     return n
 

@@ -1,3 +1,5 @@
+import json
+import os
 import tempfile
 import threading
 import unittest
@@ -9,7 +11,15 @@ from unittest.mock import Mock, patch
 
 import requests
 
-import poller
+# poller 在 import 时就确定配置文件位置。不指定的话会读本机的
+# ~/.taskpulse/config.json——那台机器把 source 切成 web 时，make_agent()
+# 返回的是 WebProvider，各用例注入的 FakeAgent 便被静默忽略。
+# 这里指到一份空配置，poller 会把它叠在内置默认值上（source=api）。
+_TEST_CONFIG = Path(tempfile.gettempdir()) / "taskpulse-test-config.json"
+_TEST_CONFIG.write_text("{}", encoding="utf-8")
+os.environ["TASKPULSE_CONFIG"] = str(_TEST_CONFIG)
+
+import poller  # noqa: E402  （必须排在设置环境变量之后）
 
 
 NOW = 1_800_000_000_000
