@@ -21,12 +21,16 @@ jobs:
           "$RUNNER_TEMP/taskpulse-tests/bin/python" -m unittest discover -s tests -v
       - name: Compile the AppKit app
         run: |
+          # swiftc 只允许名为 main.swift 的文件写顶层代码，和 packaging/build.sh 一样先改名
+          cp pulse.swift "$RUNNER_TEMP/main.swift"
           for arch in arm64 x86_64; do
-            swiftc -O -target "$arch-apple-macos13.0" pulse.swift -framework Cocoa -o "$RUNNER_TEMP/TaskPulse-$arch"
+            swiftc -O -target "$arch-apple-macos13.0" "$RUNNER_TEMP/main.swift" onboarding.swift \
+              -framework Cocoa -o "$RUNNER_TEMP/TaskPulse-$arch"
           done
       - name: Check extension and package script syntax
         run: |
           node --check edge-ext/background.js
+          node --check edge-ext/web-bridge.js
           for script in packaging/build.sh packaging/install.command packaging/uninstall.command; do
             bash -n "$script"
           done
