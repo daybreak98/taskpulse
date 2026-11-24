@@ -13,6 +13,12 @@ const CMD_ENDPOINT = BASE + "/cmd";
 const ACK_ENDPOINT = BASE + "/cmd/ack";
 const WEBSTATE_ENDPOINT = BASE + "/webstate";
 
+// 本机服务的身份头：poller 只认 X-TP-Token，没带或不一致一律 401。
+// 密钥由 install.command 生成并写进 config.js，所以扩展装上即可用；
+// 读不到就按空串发（表现为 401），而不是干脆不发——那样更难看出是缺密钥。
+const TOKEN = String(CFG.token || "");
+const authHeaders = (extra) => Object.assign({ "X-TP-Token": TOKEN }, extra || {});
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 上报里带上「我是哪个浏览器」：初装引导要据此判断「用户刚装的那个浏览器连上没有」。
@@ -77,7 +83,7 @@ async function push() {
     };
     await fetch(ENDPOINT, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ at: Date.now(), browser: BROWSER, tabs, active, web })
     });
   } catch (_) {
@@ -98,7 +104,7 @@ async function notifyActive(tabId) {
     } catch (_) {}
     await fetch(ACTIVE_ENDPOINT, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ url: t.url, focused, at: Date.now() })
     });
   } catch (_) {}
@@ -140,7 +146,7 @@ async function listen() {
   listening = true;
   while (true) {
     try {
-      const r = await fetch(CMD_ENDPOINT, { cache: "no-store" });
+      const r = await fetch(CMD_ENDPOINT, { cache: "no-store", headers: authHeaders() });
       if (r.status === 200) {
         const cmd = await r.json();
         if (cmd && cmd.cmd === "focus" && cmd.cid) {
@@ -148,7 +154,8 @@ async function listen() {
           await focusConversation(String(cmd.cid), cmd.url || "", cmd.tabId, stale);
           if (cmd.id) {
             try {
-              await fetch(ACK_ENDPOINT + "?id=" + encodeURIComponent(cmd.id), { method: "POST" });
+              await fetch(ACK_ENDPOINT + "?id=" + encodeURIComponent(cmd.id),
+                { method: "POST", headers: authHeaders() });
             } catch (_) {}
           }
         }
@@ -296,7 +303,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg.kind === "webstate" && msg.payload) {
     fetch(WEBSTATE_ENDPOINT, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(msg.payload)
     }).then(() => respond({ ok: true })).catch(() => respond({ ok: false }));
     return true;
@@ -433,7 +440,7 @@ async function refreshSource() {
   if (!API_CFG) return;
   let src = "";
   try {
-    const r = await fetch(BASE + "/mode", { cache: "no-store" });
+    const r = await fetch(BASE + "/mode", { cache: "no-store", headers: authHeaders() });
     if (r.ok) src = String(((await r.json()) || {}).source || "");
   } catch (_) {
     return;   // TaskPulse 没在跑：维持现状，别把采集权误收走

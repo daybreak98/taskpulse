@@ -175,10 +175,39 @@ cp -R edge-ext "$DEST/"
 # 去掉 Gatekeeper 隔离标记，避免「已损坏，无法打开」
 xattr -dr com.apple.quarantine "$HOME/Applications/$APP_NAME.app" 2>/dev/null
 
+# ---------- 3.5 本机接口密钥：生成并交给扩展 ----------
+# poller / App / 浏览器扩展三方共用这一把钥匙。它只存在本机家目录里：
+# 这里确保它存在（没有就现生成 32 字节 urlsafe base64，权限 0600），
+# 值再写进扩展的 config.js。这样装完就能用，用户不用手动抄一遍密钥。
+TOKEN_FILE="$HOME/.taskpulse/token"
+if [ ! -s "$TOKEN_FILE" ]; then
+  mkdir -p "$(dirname "$TOKEN_FILE")"
+  OLD_UMASK="$(umask)"
+  umask 077          # 生成期间别让同机其他账号读到
+  if "$UV_BIN" run --quiet --no-project python - "$TOKEN_FILE" <<'PY'
+import secrets, sys
+with open(sys.argv[1], "w") as f:
+    f.write(secrets.token_urlsafe(32) + "\n")
+PY
+  then
+    echo "-- 已生成本机接口密钥：$TOKEN_FILE"
+  else
+    echo "!! 生成密钥失败，扩展和 App 会被本机服务拒绝（401）"
+  fi
+  umask "$OLD_UMASK"
+fi
+chmod 600 "$TOKEN_FILE" 2>/dev/null || true
+# 密钥里不会有空白，顺手把尾随换行去掉
+TP_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE" 2>/dev/null || true)"
+if [ -z "$TP_TOKEN" ]; then
+  echo "!! 读不到本机接口密钥（$TOKEN_FILE）：扩展和 App 会被本机服务拒绝（401）"
+  echo "   检查该文件是否可读，或删掉后重新运行本脚本"
+fi
+
 # ---------- 4. 把域名、端口和接口路径写进扩展（不声明 <all_urls>）----------
-"$UV_BIN" run --quiet --no-project python - "$DEST/edge-ext" "$CONFIG" "$TP_PORT" <<'PY'
+"$UV_BIN" run --quiet --no-project python - "$DEST/edge-ext" "$CONFIG" "$TP_PORT" "$TP_TOKEN" <<'PY'
 import json, os, sys
-d, cfg_path, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+d, cfg_path, port, token = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 cfg = json.load(open(cfg_path))
 scope = (cfg.get("extension") or {}).get("scope") or ""
 plat = cfg.get("platform") or {}
@@ -209,8 +238,9 @@ json.dump(m, open(mpath, "w"), ensure_ascii=False, indent=2)
 
 with open(os.path.join(d, "config.js"), "w") as f:
     f.write("// 由 install.command 按你的配置生成，重新安装会覆盖\n")
+    # token 一起写进去：扩展请求本机服务时必须带 X-TP-Token，否则 poller 回 401
     f.write("self.TP_CONFIG = %s;\n" % json.dumps(
-        {"scope": scope, "port": port, "api": api if scope else None}))
+        {"scope": scope, "port": port, "token": token, "api": api if scope else None}))
 print("   -> manifest.json / config.js")
 PY
 if [ -z "$TP_SCOPE" ]; then

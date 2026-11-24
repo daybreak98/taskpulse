@@ -22,7 +22,16 @@ trap 'rm -f "$BODY"' EXIT
 # --fail-with-body：HTTP >= 400 时返回非零（22），同时仍把响应体写进 $BODY，
 # 这样既能判失败，又能在需要时把服务端错误原文带出来；--max-time 3 防止安装流程被卡死。
 # stderr 丢掉，结论由本脚本自己拼成一行，避免 curl 的原始报错刷屏。
-CODE="$(curl -sS --fail-with-body --max-time 3 -o "$BODY" -w '%{http_code}' "$URL" 2>/dev/null)"
+# 本机服务要鉴权（X-TP-Token）。探针自己读密钥文件，否则裸 curl 会拿到 401，
+# 把「服务好好的、只是没带票」误报成「进程没起来」。
+TOKEN_FILE="${HOME}/.taskpulse/token"
+if [ -r "$TOKEN_FILE" ]; then
+  TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null)"
+else
+  TOKEN=""
+fi
+CODE="$(curl -sS --fail-with-body --max-time 3 -o "$BODY" -w '%{http_code}' \
+  ${TOKEN:+-H "X-TP-Token: ${TOKEN}"} "$URL" 2>/dev/null)"
 RC=$?
 
 if [ "$RC" -ne 0 ]; then

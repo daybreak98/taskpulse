@@ -239,6 +239,7 @@ final class OnboardingController {
     private func markConnected(_ pick: NSStackView) {
         guard let url = URL(string: endpoint + "/state") else { return }
         var req = URLRequest(url: url)
+        withToken(&req)          // 本机服务要鉴权，不带票会被 401 当成「后台没起来」
         req.timeoutInterval = 2
         URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
             guard let d = data,
@@ -486,6 +487,7 @@ final class OnboardingController {
     private func probe(for want: String = "", _ done: @escaping (Probe) -> Void) {
         guard let url = URL(string: endpoint + "/state") else { return done(.noBackend) }
         var req = URLRequest(url: url)
+        withToken(&req)
         req.timeoutInterval = 3
         URLSession.shared.dataTask(with: req) { data, _, _ in
             var result = Probe.noBackend

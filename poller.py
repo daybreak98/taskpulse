@@ -18,12 +18,14 @@
 """
 
 import fcntl
+import hmac
 import importlib
 import inspect
 import json
 from collections import deque
 import os
 import re
+import secrets
 import subprocess
 import queue
 import sys
@@ -40,6 +42,10 @@ CONFIG_FILE = os.environ.get("TASKPULSE_CONFIG") or os.path.join(HOME, ".taskpul
 STATE_FILE = os.path.join(HOME, ".taskpulse", "state.json")
 # 「用户正在看哪个标签页」要跨进程共享：HTTP 进程收扩展上报，--once 进程算状态
 ACTIVE_FILE = os.path.join(HOME, ".taskpulse", "active.json")
+# 本机 HTTP 的身份密钥。三方（poller / App / 浏览器扩展）各自独立启动，
+# 谁也管不到别人，只有共同家目录里的这个文件能当「谁是同一台机器主人」的唯一真相。
+TOKEN_FILE = os.path.join(HOME, ".taskpulse", "token")
+TOKEN_HEADER = "X-TP-Token"
 LOG_FILE = os.path.join(HOME, "Library", "Logs", "taskpulse.log")
 
 # 全部默认值都指向「不存在的示例服务」，避免任何真实系统痕迹
@@ -229,8 +235,10 @@ REPROBE_WINDOW_SECONDS = 300
 REPROBE_ATTEMPTS = 4
 # 多久没再出现在列表里，就只当历史记录、不再计入实时状态
 COVERAGE_EXPIRE_SECONDS = 3600
-# 两次队列观测之间隔太久，就不再认为「同一轮一直在跑」
-RUN_GAP_RESET_SECONDS = max(300, POLL_SECONDS * 3)
+# 两次成功观测之间断档超过半小时，就不再认为「同一轮一直在跑」。
+# 定在半小时而不是几分钟：正常轮询是分钟级，能断到这么久只有休眠/断网/进程停摆，
+# 而低于卡住阈值的一半时，重启计时反而会掩盖真实的长时间运行。
+RUN_GAP_RESET_SECONDS = max(1800, POLL_SECONDS * 10)
 ROUND_BUDGET_SECONDS = 10
 DEFAULT_STUCK_SECONDS = int(CFG["poll"]["stuck_seconds"])
 DEFAULT_WINDOW_LIMIT = int(CFG["poll"]["window_limit"])
@@ -256,18 +264,91 @@ def log(msg: str) -> None:
         pass
 
 
+def ensure_token() -> str:
+    """确保家目录里有身份密钥，没有就现生成一份（32 字节 urlsafe base64，权限 0600）。
+
+    为什么是文件而不是配置项：安装脚本、App、扩展、poller 四者启动顺序不确定，
+    配置里存一份就得四处同步；放到 ~/.taskpulse/token 只需要「读同一个文件」。
+    """
+    try:
+        with open(TOKEN_FILE, encoding="utf-8") as f:
+            value = f.read().strip()
+        if value:
+            return value
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log(f"读取本机接口密钥失败：{exc}")
+    value = secrets.token_urlsafe(32)
+    try:
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+        try:
+            # O_EXCL：谁先建谁算数。安装脚本和 poller 可能同时第一次启动，
+            # 各自生成一把的话，扩展里已经写好的那把票就作废了。
+            fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            with open(TOKEN_FILE, encoding="utf-8") as f:
+                current = f.read().strip()
+            if current:
+                return current
+            # 空文件（上次写到一半被打断）：覆盖重建，别让它一直当「空钥匙」
+            fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(value + "\n")
+        os.chmod(TOKEN_FILE, 0o600)   # 文件已存在时 O_CREAT 的 mode 不生效，补齐
+    except OSError as exc:
+        log(f"生成本机接口密钥失败：{exc}（本机接口将无法校验调用方）")
+        return ""
+    log("已生成本机接口密钥：%s" % TOKEN_FILE)
+    return value
+
+
+_TOKEN_CACHE = {"key": None, "value": ""}
+_TOKEN_LOCK = threading.Lock()
+
+
+def read_token() -> str:
+    """读当前密钥，按 (路径, mtime) 缓存。
+
+    为什么要缓存：/state 会被 App 每秒拉一次，每次都 stat + open 纯属浪费；
+    缓存键带上 mtime 与大小，用户手动换钥匙后能立刻生效。
+    """
+    try:
+        st = os.stat(TOKEN_FILE)
+    except OSError:
+        # 文件被删了：重生成一把，别让界面一直停在「未授权」
+        return ensure_token()
+    key = (TOKEN_FILE, st.st_mtime_ns, st.st_size)
+    with _TOKEN_LOCK:
+        if _TOKEN_CACHE["key"] == key:
+            return str(_TOKEN_CACHE["value"])
+    try:
+        with open(TOKEN_FILE, encoding="utf-8") as f:
+            value = f.read().strip()
+    except OSError as exc:
+        log(f"读取本机接口密钥失败：{exc}")
+        return ""
+    with _TOKEN_LOCK:
+        _TOKEN_CACHE["key"] = key
+        _TOKEN_CACHE["value"] = value
+    return value
+
+
 # 通知不再走 osascript：macOS 会把 `display notification` 记在「脚本编辑器」名下，
 # 点通知打开的是脚本编辑器而不是会话。改成把事件塞进 /state，由 App 自己的提示条弹出，
 # 点一下就直接跳到对应标签页。
 _STARTED_AT = int(time.time())
 _events: list[dict] = []
 _events_seq = 0
+_events_lock = threading.Lock()
 
 
 def notify(title: str, body: str, cid: str | None = None) -> None:
     global _events_seq
-    _events_seq += 1
-    _events.append({"seq": _events_seq, "title": title, "body": body, "cid": cid})
+    with _events_lock:      # 两个线程都可能推事件，序号必须唯一，否则 App 会当成重复丢掉
+        _events_seq += 1
+        seq = _events_seq
+    _events.append({"seq": seq, "title": title, "body": body, "cid": cid})
     del _events[:-20]
 
 
@@ -805,6 +886,9 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
 
 def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
                        notifications: list[tuple[str, str, str]]) -> None:
+    # 先把「上一次真正观测到状态」的时刻抓出来：下面几行会把它覆盖成本次，
+    # 事后再读就永远读到新值，间隔判断会退化成死代码
+    previous = task.get("queue_observed_at") or 0
     task["queue_checked_at"] = sample.at
     # 只有真的取数失败才记为 error；「这轮没问到」保持原状，别把安静的会话
     # 永久标成「待确认」
@@ -818,7 +902,6 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
     task["raw_state"] = sample.raw
 
     started = task.get("running_since") or 0
-    previous = task.get("queue_checked_at") or 0
     if started and previous and sample.at - previous > RUN_GAP_RESET_SECONDS * 1000:
         # 休眠/断网期间可能已经结束一轮、又起了新一轮。两次观测之间的「忙」
         # 不能当成同一轮持续在跑，否则恢复后立刻报「卡住」
@@ -970,6 +1053,8 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                     legacy = "%s@%s" % (cid, old_agent)
                     tasks.setdefault(legacy, dict(task, archived=True, muted=True,
                                                   scope_note="另一个数据范围的旧记录"))
+                    # 截止时间是用户对这个会话的意图，不随数据范围一起丢
+                    carried = {k: task[k] for k in ("deadline", "deadline_notified") if k in task}
                     log("会话 %s 换了数据范围（%s → %s），旧记录归档为 %s"
                         % (cid, old_agent, agent_id, legacy))
                     task = None
@@ -986,6 +1071,7 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                         update_ms=update, seen_ms=stamp,
                         # 会话在 DataAgent 里的分组；取消分组时也要覆盖成空
                         group_name=conv.get("groupName") or "")
+            task.update({k: v for k, v in locals().get("carried", {}).items()})
             task["url"] = conv_url(task["agent_id"], cid)
             task["listed_at"] = stamp          # 最后一次出现在监控窗口里
             if task.get("archived") and update > (task.get("acked_update") or 0):
@@ -1025,9 +1111,13 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             before = task.get("status")
             apply_queue_sample(task, sample, act, notifications)
             after = task.get("status")
-            if after != before and after in ("attention", "stuck", "done"):
-                upstream = task.get("update_ms") or sample.at
-                _latencies.append(max(0, sample.at - upstream))
+            if after != before and after == "attention":
+                # 只有「跑完 → 待回复」的 update_ms 才真是这条回复的上游可见时刻；
+                # 其它转换拿到的可能是用户几小时前那条消息，样本会失真
+                upstream = task.get("update_ms") or 0
+                delta = sample.at - upstream
+                if 0 <= delta <= POLL_SECONDS * 3 * 1000:
+                    _latencies.append(delta)
 
         if fresh:
             busy = sum(1 for cid in fresh
@@ -1072,9 +1162,13 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
 
 # ── 视图 ────────────────────────────────────────────────────────────
 
-def _view_source() -> tuple[str, float | None]:
-    """当前数据来源，以及 web 模式下缓存有多旧（秒）。"""
-    mode = source_mode()
+def _view_source(mode: str | None = None) -> tuple[str, float | None]:
+    """当前数据来源，以及 web 模式下缓存有多旧（秒）。
+
+    mode 由调用方传入复用同一次快照，避免一份响应里来源与缓存年龄来自两个时刻。
+    """
+    if mode is None:
+        mode = source_mode()
     if mode != "web":
         return mode, None
     try:
@@ -1120,6 +1214,7 @@ def view(state: dict) -> dict:
     # 整份响应共用这一份快照：来源、标签组，动手前各取一次
     mode = source_mode()
     tabs = dict(_tab_groups)
+    source, source_age = _view_source(mode)
     stale_after_seconds = max(POLL_SECONDS * 2, 45)
 
     rows = []
@@ -1186,8 +1281,7 @@ def view(state: dict) -> dict:
     active = [r for r in rows if visible(r)]
     return {
         "updated": state.get("updated"),
-        "source": _view_source()[0],
-        "source_age": _view_source()[1],
+        "source": source, "source_age": source_age,
         "poller_error": state.get("poller_error"),
         "poller_error_at": state.get("poller_error_at"),
         "stale_after_seconds": stale_after_seconds,
@@ -1208,13 +1302,13 @@ def view(state: dict) -> dict:
         "tasks": active[:limit],
         "active": active,
         "all": rows,
-        # 实时计数只统计仍在覆盖范围内的会话；掉出列表的历史待办单独放在
-        # out_of_scope_count 里，不参与「在跑 / 待回复 / 卡住」的汇总
+        # 计数必须和界面渲染的行口径一致：App 只认 counts 与任务行，若这里
+        # 悄悄扣掉「范围外」的会话，就会出现「胶囊显示 0、点开却有 3 行」。
+        # 范围外的数量单独给 out_of_scope_count，供后续做专门视图。
         "counts": {
-            **{s: sum(1 for r in rows if r["status"] == s and not r["stale"] and r["covered"])
+            **{s: sum(1 for r in rows if r["status"] == s and not r["stale"])
                for s in ("running", "stuck")},
-            **{s: sum(1 for r in rows if r["status"] == s and r["covered"])
-               for s in ("attention", "done", "seen")},
+            **{s: sum(1 for r in rows if r["status"] == s) for s in ("attention", "done", "seen")},
         },
         "out_of_scope_count": sum(1 for r in rows if not r["covered"]),
         "latency": _latency_stats(),
@@ -1408,6 +1502,7 @@ _cmd_t0: dict[str, float] = {}      # cmd_id -> 入队时刻，用于量跳转�
 _cmd_waiters = 0                    # 当前有多少个扩展长轮询正挂着等命令
 _cmd_waiters_lock = threading.Lock()
 _ext_seen = 0.0          # 扩展最近一次长轮询的时间
+_auth_warned = False     # 「密钥不可用、请求放行」的告警只打一次，别刷屏日志
 
 
 def _confirm_open(cid: str, clicked_update: int) -> None:
@@ -1561,6 +1656,10 @@ DASHBOARD = """<!doctype html>
 </main>
 <script>
 const labels = {running:"进行中", attention:"待我处理", stuck:"卡住", seen:"已查看", done:"已完成"};
+// 本机服务要求带身份头。页面由 / 同源下发，令牌由服务端渲染时填进来（见 Handler._get），
+// 所以看板不需要额外开口子，也不必让用户手动贴密钥。
+const TP_TOKEN = __TP_TOKEN__;
+const TP_HEADERS = {"X-TP-Token": TP_TOKEN};
 const counters = ["running", "attention", "stuck", "done"];
 const list = document.getElementById("list");
 const health = document.getElementById("health");
@@ -1652,7 +1751,7 @@ async function post(path, id, minutes) {
   const params = new URLSearchParams({id});
   if (minutes !== undefined && minutes !== "") params.set("minutes", minutes);
   try {
-    const response = await fetch(path + "?" + params, {method:"POST"});
+    const response = await fetch(path + "?" + params, {method:"POST", headers:TP_HEADERS});
     const result = await response.json();
     if (!response.ok || !result.ok) throw new Error();
     schedule(0);
@@ -1678,7 +1777,7 @@ async function tick() {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
   try {
-    const response = await fetch("/state", {signal:controller.signal});
+    const response = await fetch("/state", {signal:controller.signal, headers:TP_HEADERS});
     if (!response.ok) throw new Error();
     const data = await response.json();
     render(data);
@@ -1722,22 +1821,58 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # 不再回 Access-Control-Allow-Origin：调用方是本机原生客户端和同源看板，
+        # 谁也不需要 CORS；回 * 等于给任意网页一个读取本机会话标题的机会。
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self) -> None:
+        # 保留 204 是为了让浏览器干脆地在预检这一步停下（没有 ACAO 就放不出去）；
+        # 这里不校验令牌——预检请求带不上自定义头，校验了反而会卡住正常的预检流程。
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def _json(self, obj, code: int = 200) -> None:
         self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json")
 
+    def _authorized(self) -> bool:
+        """校验 X-TP-Token：只有拿到同一份密钥的本机进程能调这些接口。
+
+        密钥真的建不出来时（家目录只读等）放行并记一次日志：那是装机本身坏了，
+        此时把用户锁在自己的界面外面，比本机进程乱调的风险更糟。
+        """
+        global _auth_warned
+        expected = read_token()
+        if not expected:
+            if not _auth_warned:
+                _auth_warned = True
+                log("本机接口密钥不可用，请求暂未校验（检查 ~/.taskpulse 是否可写）")
+            return True
+        given = self.headers.get(TOKEN_HEADER) or ""
+        # 常量时间比较：本机进程也可能反复猜，别留时间侧信道
+        return bool(given) and hmac.compare_digest(given, expected)
+
+    def _reject(self) -> None:
+        self._json({"error": "unauthorized",
+                    "hint": "请求头缺少正确的 %s（见 %s）" % (TOKEN_HEADER, TOKEN_FILE)}, 401)
+
     def do_GET(self) -> None:
+        # 看板页是唯一免鉴权的路由：它存在的意义就是先把密钥交给浏览器里的同源脚本，
+        # 浏览器又发不出自定义头，自己校验就等于让看板永远打不开。
+        path = urlparse(self.path).path
+        if path not in ("/", "/index.html") and not self._authorized():
+            self._reject()
+            return
+        self._get()
+
+    def do_POST(self) -> None:
+        if not self._authorized():
+            self._reject()
+            return
+        self._post()
+
+    def _get(self) -> None:
         global _ext_seen
         path = urlparse(self.path).path
         if path == "/state":
@@ -1786,11 +1921,14 @@ class Handler(BaseHTTPRequestHandler):
             # GET 只查询当前来源；切换走 POST（带 value）
             self._json({"ok": True, "source": source_mode()})
         elif path in ("/", "/index.html"):
-            self._send(200, DASHBOARD.encode(), "text/html; charset=utf-8")
+            # 令牌随页面一起下发（同源）：看板不必再走一次单独取密钥的接口，
+            # 也不需要在服务端为它开一个免鉴权的口子。json.dumps 负责转义。
+            page = DASHBOARD.replace("__TP_TOKEN__", json.dumps(read_token()))
+            self._send(200, page.encode(), "text/html; charset=utf-8")
         else:
             self._json({"error": "not found"}, 404)
 
-    def do_POST(self) -> None:
+    def _post(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         cid = (query.get("id") or [""])[0]
@@ -2136,15 +2274,20 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
+    # 先把身份密钥准备好：所有 HTTP 路由都要它，缺文件就现生成，
+    # 免得「装完少一个文件」直接变成整个界面不可用。
+    ensure_token()
+
     if "--demo" in sys.argv:
         class DemoHandler(Handler):
-            def do_GET(self):
+            # 只替换路由分发，鉴权留在 Handler.do_GET/do_POST 里，别被示例模式绕过去
+            def _get(self):
                 if urlparse(self.path).path == "/state":
                     self._json(demo_state())
                 else:
-                    super().do_GET()
+                    super()._get()
 
-            def do_POST(self):
+            def _post(self):
                 parsed = urlparse(self.path)
                 if parsed.path == "/open":
                     self._json({"ok": True, "result": "demo"})

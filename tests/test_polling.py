@@ -72,6 +72,8 @@ class PollingTests(unittest.TestCase):
             poller,
             STATE_FILE=str(Path(self.directory) / "state.json"),
             ACTIVE_FILE=str(Path(self.directory) / "active.json"),
+            # 身份密钥也指到临时目录：绝不能碰本机真实的那一份
+            TOKEN_FILE=str(Path(self.directory) / "token"),
             CONV_URL="https://agent.example.com/chat?conversationId={cid}",
             POLL_SECONDS=60,
             ACTIVE_POLL_SECONDS=10,
@@ -96,6 +98,12 @@ class PollingTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 thread.join()
+
+    def auth(self):
+        """带身份头的会话：本机接口现在要求 X-TP-Token，不带就 401。"""
+        session = requests.Session()
+        session.headers[poller.TOKEN_HEADER] = poller.ensure_token()
+        return session
 
     def test_fast_checks_rotate_through_running_tasks_outside_latest_list(self):
         agent = FakeAgent([conversation(i) for i in range(1, 6)], busy=(1, 2, 3, 4))
@@ -278,7 +286,7 @@ class PollingTests(unittest.TestCase):
         task = poller.poll_tick(agent, full=True)["tasks"]["1"]
         self.assertEqual((task["status"], task["reply_version"]), ("attention", version))
         with self.serve() as url:
-            seen = requests.post(url + "/active", json={"url": task["url"]}, timeout=2)
+            seen = self.auth().post(url + "/active", json={"url": task["url"]}, timeout=2)
             self.assertTrue(seen.json()["ok"])
 
         agent.items = [conversation(updated=completed_at - 100)]
@@ -328,12 +336,12 @@ class PollingTests(unittest.TestCase):
         with self.serve() as url:
             def user_actions():
                 for path in ("/ack?id=1", "/deadline?id=1&minutes=30"):
-                    response = requests.post(url + path, timeout=2)
+                    response = self.auth().post(url + path, timeout=2)
                     self.assertTrue(response.json()["ok"])
 
             agent.before_queue = user_actions
             state = poller.poll_tick(agent, full=True)
-            stored = requests.get(url + "/state", timeout=2).json()
+            stored = self.auth().get(url + "/state", timeout=2).json()
 
         self.assertEqual(agent.list_calls, 2)
         self.assertEqual(agent.queue_calls, [1, 1])
@@ -401,6 +409,24 @@ class PollingTests(unittest.TestCase):
         self.assertIn("429", poller.load_state()["poller_error"])
         self.assertEqual(poller.load_state()["updated"], NOW)
 
+    def test_long_gap_restarts_the_run_instead_of_reporting_stuck(self):
+        """休眠/断网很久之后仍看到「忙」，不能沿用旧起点立刻报卡住。"""
+        agent = FakeAgent([conversation()], busy=(1,))
+        poller.poll_tick(agent, full=True)
+        state = poller.load_state()
+        # 三小时前起跑、之后一直没有观测
+        state["tasks"]["1"].update(running_since=self.stamp - 3 * 3600_000,
+                                   countdown_since=self.stamp - 3 * 3600_000,
+                                   queue_observed_at=self.stamp - 3 * 3600_000,
+                                   status="running")
+        poller.save_state(state)
+
+        poller.poll_tick(agent, full=False)
+        task = poller.load_state()["tasks"]["1"]
+        self.assertNotEqual(task["status"], "stuck", "断线恢复后立刻误报卡住")
+        self.assertEqual(task["running_since"], self.stamp, "没有从本次观测重新计时")
+        self.assertEqual(self.notifications.call_args_list, [])
+
     # ── 三条修复的回归 ──────────────────────────────────────────────
 
     def test_deadline_set_during_slow_sample_is_kept(self):
@@ -412,7 +438,7 @@ class PollingTests(unittest.TestCase):
             def during_sample():
                 # 取数还在锁外跑的时候，用户点了「5 分钟后提醒」
                 agent.before_queue = None
-                requests.post(f"{url}/deadline?id=1&minutes=5", timeout=2)
+                self.auth().post(f"{url}/deadline?id=1&minutes=5", timeout=2)
 
             agent.before_queue = during_sample
             self.stamp += 60_000
@@ -489,7 +515,7 @@ class PollingTests(unittest.TestCase):
         with patch.multiple(poller, CONFIG_FILE=config):
             with self.serve() as url:
                 poller._wake.clear()
-                r = requests.post(f"{url}/mode?value=web", timeout=2)
+                r = self.auth().post(f"{url}/mode?value=web", timeout=2)
                 self.assertEqual(r.json(), {"ok": True, "source": "web"})
                 self.assertTrue(poller._wake.is_set())
 
@@ -539,7 +565,7 @@ class PollingTests(unittest.TestCase):
                                 "tabs": [{"url": task["url"], "tabId": 77}]},
                                "Mozilla/5.0 (Macintosh) Edg/157")
             with self.serve() as url:
-                r = requests.post(url + f"/open?id={task['id']}", timeout=5)
+                r = self.auth().post(url + f"/open?id={task['id']}", timeout=5)
             self.assertEqual(r.json()["result"], "queued")
             time.sleep(0.4)          # 等兜底定时器走完，避免影响下一个用例
 
@@ -553,8 +579,8 @@ class PollingTests(unittest.TestCase):
                                          "expires": int(time.time() * 1000) - 1000})
         with self.serve() as url:
             # 长轮询会挂到底，过期的命令既不返回也不执行，最后 204
-            r = requests.get(url + "/cmd", timeout=15,
-                             headers={"User-Agent": "Mozilla/5.0 Chrome/157"})
+            r = self.auth().get(url + "/cmd", timeout=15,
+                                headers={"User-Agent": "Mozilla/5.0 Chrome/157"})
         self.assertEqual(r.status_code, 204)
 
     def test_finished_task_leaves_live_counts(self):
@@ -568,6 +594,49 @@ class PollingTests(unittest.TestCase):
         state = poller.view(poller.load_state())
         self.assertEqual(state["counts"]["running"], 0)
         self.assertEqual(state["tasks"][0]["status"], "attention")
+
+    # ── 身份校验：本机接口只认带密钥的调用方 ─────────────────────────
+
+    def test_state_without_token_is_rejected(self):
+        with self.serve() as url:
+            read = requests.get(url + "/state", timeout=5)
+            write = requests.post(url + "/ack?id=1", timeout=5)
+        self.assertEqual(read.status_code, 401)
+        self.assertEqual(read.json()["error"], "unauthorized")
+        self.assertEqual(write.status_code, 401, "写接口更不能放行")
+
+    def test_state_with_correct_token_is_allowed(self):
+        agent = FakeAgent([conversation(1)])
+        poller.poll_tick(agent, full=True)
+        with self.serve() as url:
+            read = self.auth().get(url + "/state", timeout=5)
+            write = self.auth().post(url + "/ack?id=1", timeout=5)
+        self.assertEqual(read.status_code, 200)
+        self.assertEqual([task["id"] for task in read.json()["all"]], [1])
+        self.assertEqual(write.status_code, 200)
+
+    def test_wrong_token_is_rejected(self):
+        with self.serve() as url:
+            response = requests.get(url + "/state", timeout=5,
+                                    headers={poller.TOKEN_HEADER: "not-the-real-key"})
+        self.assertEqual(response.status_code, 401)
+
+    def test_dashboard_page_hands_the_token_to_its_own_script(self):
+        # 看板页本身免鉴权（浏览器发不出自定义头），所以它必须把密钥注入进页面，
+        # 否则它自己发的 /state 请求会全部 401 —— 页面能打开却永远没有数据。
+        with self.serve() as url:
+            page = requests.get(url + "/", timeout=5)
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(poller.ensure_token(), page.text)
+        self.assertIn("X-TP-Token", page.text)
+
+    def test_token_file_is_private_to_the_owner(self):
+        token = poller.ensure_token()
+        self.assertTrue(token)
+        self.assertEqual(os.stat(poller.TOKEN_FILE).st_mode & 0o777, 0o600,
+                         "密钥文件不能给别人读")
+        # 已存在时不该被重新生成：换钥匙会让所有客户端立刻 401
+        self.assertEqual(poller.ensure_token(), token)
 
 
 class ResponseTests(unittest.TestCase):

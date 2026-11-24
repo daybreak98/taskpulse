@@ -17,6 +17,58 @@ func taskPulsePort() -> Int {
 
 let endpoint = "http://127.0.0.1:\(taskPulsePort())"
 
+/// 本机服务的共享密钥：~/.taskpulse/token（由 poller / 安装脚本生成，权限 0600）。
+/// 没有它 poller 会回 401，所以每个请求都要挂上 X-TP-Token。
+enum TokenCache {
+    static var signature: String?
+    static var value = ""
+    static var warned = false
+    static let lock = NSLock()
+}
+
+/// 读密钥，按文件 (mtime, size) 缓存。
+/// 为什么要缓存：/state 每秒拉一次，每次都读盘 + 解析纯属浪费；
+/// 为什么用 mtime 当键：用户换钥匙（重装、手动删文件）后能立刻生效，不需要重启 App。
+func taskPulseToken() -> String {
+    let path = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".taskpulse/token")
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else {
+        // 文件还不存在：按空 token 发（服务端会回 401），只记一次日志。
+        // 不在这里崩、也不静默跳过请求——「发出去被拒」在界面上是明确的未授权。
+        TokenCache.lock.lock()
+        defer { TokenCache.lock.unlock() }
+        TokenCache.signature = nil
+        TokenCache.value = ""
+        if !TokenCache.warned {
+            TokenCache.warned = true
+            dbg("token 缺失：\(path.path) 不存在，按空 token 发送（服务端会回 401）")
+        }
+        return ""
+    }
+    let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+    let size = (attrs[.size] as? Int) ?? 0
+    let signature = "\(mtime)-\(size)"
+
+    TokenCache.lock.lock()
+    defer { TokenCache.lock.unlock() }
+    if TokenCache.signature == signature { return TokenCache.value }
+    let text = ((try? String(contentsOf: path, encoding: .utf8)) ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    TokenCache.signature = signature
+    TokenCache.value = text
+    if text.isEmpty && !TokenCache.warned {
+        TokenCache.warned = true
+        dbg("token 为空：\(path.path) 内容是空的，按空 token 发送（服务端会回 401）")
+    }
+    return text
+}
+
+/// 给请求挂上身份头。空 token 也照样挂：让服务端明确拒绝，
+/// 比在这里「悄悄不发」好排查得多。
+func withToken(_ req: inout URLRequest) {
+    req.setValue(taskPulseToken(), forHTTPHeaderField: "X-TP-Token")
+}
+
 /// 行为日志：追加到 /tmp/taskpulse-drag.log，用来排查交互问题
 func dbg(_ s: String) {
     let path = "/tmp/taskpulse-drag.log"
@@ -1740,6 +1792,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         dataRequestInFlight = true
         var req = URLRequest(url: url)
         req.timeoutInterval = 4
+        withToken(&req)
         URLSession.shared.dataTask(with: req) { [weak self] data, response, _ in
             let payload: Payload?
             if (response as? HTTPURLResponse)?.statusCode == 200, let data {
@@ -1792,6 +1845,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 15
+        withToken(&req)
         let t0 = Date()
         dbg("open req id=\(item.id)")
         URLSession.shared.dataTask(with: req) { data, resp, err in
@@ -1825,6 +1879,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 10
+        withToken(&req)
         URLSession.shared.dataTask(with: req) { [weak self] data, response, _ in
             let result = data.flatMap { try? JSONDecoder().decode(ActionResult.self, from: $0) }
             let ok = (response as? HTTPURLResponse)?.statusCode == 200 && result?.ok == true

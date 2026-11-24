@@ -81,6 +81,17 @@ launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 `web` 模式依赖至少一个目标站点标签页开着（扩展不保活，也不会替你开页面）；
 页面关掉后界面会显示「浏览器里的页面没有上报数据」。
 
+### web 模式下只有一页在采集
+
+几十个页面各拉一遍等于把同一份数据重复取几十次，所以采集权只给一页：
+
+- 扩展从当前站点的页面里选**一个**采集页，优先你正在看的那一页，其余页面不开定时器。
+- 采集页被关掉、被浏览器丢弃或重新加载时，自动重新选一页。
+- 切到 `api` 会立刻收回采集权（页面停手，本机自己取），切回 `web` 再发还。
+
+两种来源的分组也不是同一套：`web` 用平台侧的分组（和网页侧边栏一致），
+`api` 进程里没有页面上下文，用浏览器的标签组。
+
 > 为什么不做成全自动？macOS 上的 Chromium 只接受商店来源的静默安装
 > （本地 crx 的 External Extensions 通道实测不生效），装解压缩目录必须由人点一次。
 
@@ -96,7 +107,8 @@ launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 
 - 窄条上的三个数字：**进行中 / 待我处理 / 卡住**，点任意数字只看那一类（再点一次恢复）。
 - 鼠标悬停 → 展开成完整列表；移开 0.15s 后自动收起。
-- **点任务行** → 浏览器切到该会话的标签页（不会新开）。
+- **点任务行** → 浏览器切到该会话的标签页（不会新开）；只有标签真的切过去了，
+  这次回复才算已读，切不过去不会凭空记成已读。
 - 行尾的勾选框 = 这个任务处理完了，彻底从列表移除，不再提醒。
 - 右上角会弹「Agent 回话了」提示条，**点一下直接跳过去**，15 秒自动消失。
 - 双击卡片顶部标题栏 = 展开 / 收起；右上角图钉 = 固定常展开。
@@ -114,6 +126,7 @@ launchctl kickstart -k gui/$UID/com.taskpulse.poller
 
 | 字段 | 作用 |
 |---|---|
+| `source` | `api` / `web`，默认 `api`；面板上的 `API` / `WEB` 开关改的就是这一项 |
 | `platform.base_url` | 平台地址，如 `https://agent.example.com` |
 | `platform.api_prefix` | 接口前缀，如 `/api/v1` |
 | `platform.agent_ids` | 要监视的 agent id 列表 |
@@ -142,6 +155,30 @@ launchctl kickstart -k gui/$UID/com.taskpulse.poller
 
 ---
 
+## 健康检查
+
+`health_check.sh` 把「进程在线」和「取数就绪」分开判。别用 `curl` 的退出码判断能不能取数——
+服务返回 HTTP 500 时，`curl` 照样返回 0。
+
+```bash
+./health_check.sh          # 默认端口 8899
+./health_check.sh 9000     # 也可以手动传端口
+```
+
+| 退出码 | 结论 |
+|---|---|
+| 0 | 取数就绪：HTTP 2xx、结构完整、有采样时间、没有上游错误 |
+| 1 | 进程没起来 / 非 2xx / 返回的不是 TaskPulse 的 `/state` |
+| 2 | 进程在线，但取数未就绪：上游报错，或还没采到第一份数据 |
+
+`install.command` 装完会自动跑一次：0 直接往下走，2 提示「页面/凭据就位后会自动开始」，
+1 指向 `~/Library/Logs/taskpulse.poll.err`。
+
+想量化取数延迟，看 `/state` 的 `latency`：`samples`、`p50_ms`、`p95_ms`、`max_ms`，
+单位毫秒，取最近 200 次。
+
+---
+
 ## 卸载
 
 双击 `uninstall.command`。
@@ -161,4 +198,7 @@ launchctl kickstart -k gui/$UID/com.taskpulse.poller
 | 引导点了「检查一下」不通过 | 确认扩展在扩展页是「已启用」状态，且浏览器里至少开着一个会话标签 |
 | 有两个 TaskPulse 在跑 | 老版本留下的 `com.hyj.taskpulse.*` 标签，卸掉旧的再重跑 `install.command` |
 | 想改刷新间隔 | 改 `config.json` 的 `poll.interval_seconds`，或临时 `TP_POLL_SECONDS=30` |
+| `web` 模式下数字不动 | 至少留一个目标站点标签页开着；采集页被关或丢弃后扩展会自动换一页 |
+| 计数比列表里的行少 | 掉出监控窗口超过 1 小时的会话不再计入实时计数，见 `/state` 的 `out_of_scope_count` |
+| 出现「N 个会话状态待确认」 | 只针对运行中/待回复/已卡住的会话——这批没拿到队列样本；安静的会话不提示 |
 | 想看明细日志 | `~/Library/Logs/taskpulse.log`（行为日志）、`taskpulse.poll.out`（每轮快照） |
