@@ -240,7 +240,9 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    tmp = STATE_FILE + ".tmp"
+    # 临时文件名要唯一：取数循环和 /webstate 会同时写，共用一个 .tmp 时
+    # 先 replace 的那个会把文件搬走，另一个就 ENOENT
+    tmp = "%s.%d.%d.tmp" % (STATE_FILE, os.getpid(), threading.get_ident())
     with open(tmp, "w") as f:
         json.dump(state, f, ensure_ascii=False, indent=1)
     os.replace(tmp, STATE_FILE)
@@ -468,6 +470,11 @@ class WebProvider:
         """缓存多久没更新了；用于判定「页面都关了」。"""
         at = self._load().get("at") or 0
         return None if not at else (now_ms() - int(at)) / 1000
+
+    def last_at(self) -> int | None:
+        """浏览器里那份数据的生成时刻（毫秒）。"""
+        at = self._load().get("at") or 0
+        return int(at) or None
 
     def conversations(self, timeout: float) -> list[dict]:
         items = self._load().get("conversations") or []
@@ -899,7 +906,10 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                                              "显示上次缓存")
                     state["poller_error_at"] = stamp
         if full or any(sample.busy is not None for sample in samples.values()):
-            state["updated"] = stamp
+            # web 模式的「更新时间」是浏览器里那份数据的生成时刻，不是本次落盘的时刻——
+            # 否则页面停了 100 秒，UI 还以为是刚更新过
+            fresh_at = agent.last_at() if isinstance(agent, WebProvider) else None
+            state["updated"] = fresh_at or stamp
         save_state(state)
 
     for title, body, cid in notifications:
@@ -1557,7 +1567,8 @@ class Handler(BaseHTTPRequestHandler):
             payload["at"] = now_ms()
             try:
                 os.makedirs(os.path.dirname(WEBSTATE_FILE), exist_ok=True)
-                tmp = WEBSTATE_FILE + ".tmp"
+                # 多个标签页会同时上报，临时文件名带线程号避免互相搬走
+                tmp = "%s.%d.tmp" % (WEBSTATE_FILE, threading.get_ident())
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(payload, f, ensure_ascii=False)
                 os.replace(tmp, WEBSTATE_FILE)
