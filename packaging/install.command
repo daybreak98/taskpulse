@@ -267,7 +267,7 @@ cat > "$AGENTS/com.taskpulse.poller.plist" <<PLIST
   <key>Label</key><string>com.taskpulse.poller</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$UV_BIN</string><string>run</string><string>--quiet</string>$UV_EXTRA_XML
+    <string>$UV_BIN</string><string>run</string><string>--quiet</string><string>--python</string><string>&gt;=3.10</string>$UV_EXTRA_XML
     <string>$DEST/poller.py</string>
   </array>
   <key>WorkingDirectory</key><string>$DEST</string>
@@ -307,11 +307,11 @@ if [ -f "./uv-args.txt" ]; then
 fi
 # bash 3.2（macOS 自带）在 set -u 下展开空数组会报错，分两条写
 if [ ${#UV_PREHEAT[@]} -gt 0 ]; then
-  "$UV_BIN" run --quiet --no-project "${UV_PREHEAT[@]}" python -c "print('   -> 依赖就绪')" || {
+  "$UV_BIN" run --quiet --no-project --python ">=3.10" "${UV_PREHEAT[@]}" python -c "print('   -> 依赖就绪')" || {
     echo "!! 依赖安装失败（多见于公司网络未连内网）。装好后重跑本脚本即可。"
   }
 else
-  "$UV_BIN" run --quiet --no-project python -c "print('   -> 依赖就绪')" || {
+  "$UV_BIN" run --quiet --no-project --python ">=3.10" python -c "print('   -> 依赖就绪')" || {
     echo "!! 依赖安装失败。装好后重跑本脚本即可。"
   }
 fi
