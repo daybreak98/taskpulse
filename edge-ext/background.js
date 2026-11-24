@@ -165,38 +165,39 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create("tp-sync", { periodInMinutes: 0.5 });
   push();
   listen();
+  refreshSource().then(ensureLeader).catch(() => void 0);
 });
 
 chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create("tp-sync", { periodInMinutes: 0.5 });
   push();
   listen();
+  refreshSource().then(ensureLeader).catch(() => void 0);
 });
 
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === "tp-sync") {
     push();
     listen();   // service worker 被回收后在这里重新挂上长轮询
-    nudgeWebBridge();
+    // 顺手对账：leader 可能已被关掉/弃用，来源也可能刚被切成 api
+    refreshSource()
+      .then(ensureLeader)
+      .then(nudgeWebBridge)
+      .catch(() => void 0);
   }
 });
 
 // 页面在后台时浏览器会把 setInterval 节流到分钟级，页面内取数就跟着停摆。
-// 由后台主动去敲一下（executeScript 不受页面定时器节流限制），只敲最前面几个，
-// 免得几十个标签页一起打接口。
+// 由后台主动去敲一下（executeScript 不受页面定时器节流限制）。
+// 各页数据完全相同，所以只敲 leader；否则一次唤醒就把几十个页面同时叫起来。
 async function nudgeWebBridge() {
   if (!SCOPE || !API_CFG || !chrome.scripting) return;
+  if (pausedByApi || leaderId === -1) return;
   try {
-    const tabs = await chrome.tabs.query({ url: SCOPE });
-    // 只敲一个页面就够（各页数据相同），失败再换下一个
-    for (const t of tabs.slice(0, 2)) {
-      if (typeof t.id !== "number") continue;
-      const r = await chrome.scripting.executeScript({
-        target: { tabId: t.id },
-        func: () => { if (window.__tpWebBridgeTick) window.__tpWebBridgeTick(); }
-      }).catch(() => null);
-      if (r) break;
-    }
+    await chrome.scripting.executeScript({
+      target: { tabId: leaderId },
+      func: () => { if (window.__tpWebBridgeTick) window.__tpWebBridgeTick(); }
+    });
   } catch (_) {}
 }
 
@@ -226,6 +227,15 @@ for (const ev of [
 ]) {
   if (ev && ev.addListener) ev.addListener(() => push());
 }
+
+// 采集页只在「这一页不能干活了」时换人：关掉、被浏览器丢弃、页面刚加载完。
+// 用户切标签不算——粘性换主会让每切一次都重新拉一遍会话列表。
+chrome.tabs.onRemoved.addListener(() => ensureLeader());
+chrome.tabs.onCreated.addListener(() => ensureLeader());
+chrome.tabs.onUpdated.addListener((_tabId, info) => {
+  if (!info) return;
+  if (info.discarded || info.status === "complete" || info.url) ensureLeader();
+});
 
 chrome.alarms.create("tp-sync", { periodInMinutes: 0.5 });
 push();
@@ -267,10 +277,20 @@ async function injectIntoOpenTabs() {
   } catch (_) {}
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (!msg) return;
   if (msg.kind === "get-config") {
     respond(API_CFG ? { api: API_CFG } : null);
+    return;
+  }
+  if (msg.kind === "tp-role-ask") {
+    // 页面刚注入时自己来问一句：默认不开采集，否则五十个标签页会同时开火
+    const tabId = sender && sender.tab && sender.tab.id;
+    const leader = typeof tabId === "number" && tabId === leaderId && !pausedByApi;
+    if (leader) roleSent = true;
+    respond({ leader });
+    // 还没选过主（刚装好/刚唤醒）就顺手补一次，问话的那一页也可能是该干活的那页
+    if (!leaderReady || leaderId === -1) ensureLeader();
     return;
   }
   if (msg.kind === "webstate" && msg.payload) {
@@ -283,4 +303,147 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   }
 });
 
+// ── 采集权：只让一个页面负责采集 ─────────────────────────────────
+// 用户常开几十个 DataAgent 标签页，各页都跑 setInterval，等于把同一份数据拉几十遍；
+// 这里选出一页当 leader，其余页面不开定时器，页面被换下时立刻停手。
+const LEADER_KEY = "tp-leader-tab";
+let leaderId = -1;        // 当前负责采集的标签页
+let leaderReady = false;  // 是否已从 storage.session 读回上次的选主结果
+let pausedByApi = false;  // api 模式下 TaskPulse 自己取数，页面不必再采集
+let roleSent = null;      // 已通知过 leader 的角色，稳定状态下不再重复发消息
+let electing = null;      // 在途的选主，避免事件成串时重复选
+let electAgain = false;
+
+function postRole(tabId, leader) {
+  try {
+    const p = chrome.tabs.sendMessage(tabId, { kind: "tp-role", leader });
+    if (p && p.catch) p.catch(() => void 0);
+  } catch (_) {}
+}
+
+function persistLeader(id) {
+  try {
+    const p = chrome.storage.session.set({ [LEADER_KEY]: id });
+    if (p && p.catch) p.catch(() => void 0);
+  } catch (_) {}
+}
+
+async function restoreLeader() {
+  leaderReady = true;
+  try {
+    const got = await chrome.storage.session.get(LEADER_KEY);
+    const v = got && got[LEADER_KEY];
+    // service worker 随时会被回收：读回来才不至于每次唤醒都重新选主、重新拉列表
+    if (typeof v === "number") leaderId = v;
+  } catch (_) {}
+}
+
+function syncRole() {
+  if (leaderId === -1) return;
+  const want = !pausedByApi;
+  if (roleSent === want) return;
+  roleSent = want;
+  postRole(leaderId, want);
+}
+
+function applyLeader(next) {
+  if (next === leaderId) {
+    syncRole();   // 页面可能刚注入、还没收到过角色，这里补一句
+    return;
+  }
+  const prev = leaderId;
+  leaderId = next;
+  roleSent = null;   // 换了页面，新 leader 要从头通知一次
+  persistLeader(next);
+  if (prev !== -1) postRole(prev, false);   // 老 leader 立刻停手，不等它自己发现
+  syncRole();
+}
+
+async function pickLeader(tabs) {
+  // discarded 的页面里没有 content script 在跑，敲了也不动；
+  // status 不到 complete 的还在加载，dom 都还没稳，同样采不到东西
+  const usable = tabs.filter((t) =>
+    typeof t.id === "number" && !t.discarded && t.status === "complete");
+  if (!usable.length) return -1;
+
+  let focusedWin = -1;
+  try {
+    const w = await chrome.windows.getLastFocused({});
+    if (w && w.focused && typeof w.id === "number") focusedWin = w.id;
+  } catch (_) {}
+  // 用户正看着的那一页数据最新，优先给它
+  const hot = usable.find((t) => t.active && t.windowId === focusedWin);
+  if (hot) return hot.id;
+
+  // 老版本 Edge 不给 lastAccessed，这时退化成「标签顺序靠前的先选」，宁可稳定也别空转
+  let best = -1;
+  let bestAt = -1;
+  for (const t of usable) {
+    const at = typeof t.lastAccessed === "number" ? t.lastAccessed : 0;
+    if (at > bestAt) {
+      bestAt = at;
+      best = t.id;
+    }
+  }
+  return best;
+}
+
+async function doEnsureLeader() {
+  if (!SCOPE) return;
+  if (!leaderReady) await restoreLeader();
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: SCOPE });
+  } catch (_) {}
+  const alive = new Map();
+  for (const t of tabs) if (typeof t.id === "number") alive.set(t.id, t);
+
+  let next = -1;
+  if (leaderId !== -1) {
+    const cur = alive.get(leaderId);
+    // 粘性：leader 还活着就不要换，否则用户每切一次标签都要重新拉一遍会话列表
+    if (cur && !cur.discarded && cur.status === "complete") next = leaderId;
+  }
+  if (next === -1) next = await pickLeader(tabs);
+  applyLeader(next);
+}
+
+function ensureLeader() {
+  // 关标签、切 url、加载完成会在同一瞬间连着来，合并成一次选主
+  if (electing) {
+    electAgain = true;   // 在途那次查的是旧快照，这次变化得再对一遍账
+    return electing;
+  }
+  electing = (async () => {
+    try {
+      await doEnsureLeader();
+    } catch (_) {}
+    electing = null;
+    if (electAgain) {
+      electAgain = false;
+      ensureLeader();
+    }
+  })();
+  return electing;
+}
+
+// api 模式下页面采到的数据没人用，继续拉只是白发请求；所以定时看一眼来源，
+// 切到 api 就收走 leader 的采集权，切回 web 再发还。
+async function refreshSource() {
+  if (!API_CFG) return;
+  let src = "";
+  try {
+    const r = await fetch(BASE + "/mode", { cache: "no-store" });
+    if (r.ok) src = String(((await r.json()) || {}).source || "");
+  } catch (_) {
+    return;   // TaskPulse 没在跑：维持现状，别把采集权误收走
+  }
+  if (src !== "api" && src !== "web") return;   // 老版本没有 /mode，别乱动
+  const paused = src === "api";
+  if (paused === pausedByApi) return;
+  pausedByApi = paused;
+  syncRole();
+}
+
 ensureWebBridge().then(injectIntoOpenTabs);
+refreshSource().then(ensureLeader).catch(() => void 0);

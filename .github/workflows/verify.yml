@@ -31,6 +31,6 @@ jobs:
         run: |
           node --check edge-ext/background.js
           node --check edge-ext/web-bridge.js
-          for script in packaging/build.sh packaging/install.command packaging/uninstall.command; do
+          for script in packaging/build.sh packaging/health_check.sh packaging/install.command packaging/uninstall.command; do
             bash -n "$script"
           done

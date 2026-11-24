@@ -187,11 +187,17 @@ plat = cfg.get("platform") or {}
 body = {}
 for k, v in (plat.get("conversations_body") or {}).items():
     body[k] = list(plat.get("agent_ids") or []) if v == "{agent_ids}" else v
+eps = plat.get("endpoints") or {}
+qf = plat.get("queue_fields") or {}
+# 扩展与 poller 必须按同一套字段/路径解析：写死任何一处，换平台配置就会两边不一致
 api = {
     "prefix": plat.get("api_prefix") or "",
-    "conv": (plat.get("endpoints") or {}).get("conversations") or "",
-    "queue": (plat.get("endpoints") or {}).get("queue") or "",
-    "idle": list((plat.get("queue_fields") or {}).get("idle") or []),
+    "conv": eps.get("conversations") or "",
+    "queue": eps.get("queue") or "",
+    "messages": eps.get("messages") or "",
+    "state": qf.get("state") or "state",
+    "pending": qf.get("pending") or "",
+    "idle": list(qf.get("idle") or []),
     "body": body,
 }
 
@@ -298,10 +304,18 @@ launchctl kickstart -k "gui/$(id -u)/com.taskpulse.poller" 2>/dev/null
 launchctl kickstart -k "gui/$(id -u)/com.taskpulse.ui" 2>/dev/null
 
 sleep 3
-if curl -s -m 2 "http://127.0.0.1:$TP_PORT/state" >/dev/null; then
-  echo "-- 后台服务已就绪 (http://127.0.0.1:$TP_PORT/state)"
+# 分别报告「进程在线」与「取数就绪」：服务返回 500 也算进程在线，
+# 但那时候报「已就绪」会把人带进沟里
+if [ -x "./health_check.sh" ]; then
+  ./health_check.sh "${TP_PORT}"
+  HC=$?
+  case "$HC" in
+    0) ;;
+    2) echo "-- 服务在线，但取数还没就绪；页面/凭据就位后会自动开始" ;;
+    *) echo "-- 后台服务没起来，看日志: ${LOGS}/taskpulse.poll.err" ;;
+  esac
 else
-  echo "-- 后台服务还没起来，看日志: $LOGS/taskpulse.poll.err"
+  echo "-- 缺少 health_check.sh，跳过健康检查"
 fi
 
 cat <<TIPS

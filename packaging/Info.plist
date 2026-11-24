@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  App Bundle 的元数据，纳入版本控制。
+  为什么放在这里：TaskPulse.app 整个目录在 .gitignore 里（本地构建产物），
+  如果 Info.plist 只存在于工作区的 App 里，干净检出就没有 Bundle 元数据，
+  packaging/build.sh 也就没法在别的机器上复现出包。
+  取值与原工作区 TaskPulse.app/Contents/Info.plist 一致，未做改动：
+    CFBundleIdentifier      com.hyj.taskpulse
+    LSMinimumSystemVersion 13.0（与 build.sh 里 swiftc -target *-apple-macos13.0 对应）
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>TaskPulse</string>
+  <key>CFBundleDisplayName</key><string>TaskPulse</string>
+  <key>CFBundleIdentifier</key><string>com.hyj.taskpulse</string>
+  <!-- 必须与 Contents/MacOS/ 下的可执行文件名一致，否则 App 启动即失败 -->
+  <key>CFBundleExecutable</key><string>TaskPulse</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <!-- 只在菜单栏显示，不占 Dock：这是后台轮询工具，不是常驻窗口应用 -->
+  <key>LSUIElement</key><true/>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>

@@ -21,6 +21,7 @@ import fcntl
 import importlib
 import inspect
 import json
+from collections import deque
 import os
 import re
 import subprocess
@@ -117,6 +118,43 @@ def _apply_env(cfg: dict) -> dict:
     return cfg
 
 
+# 配置里数值型字段的合法范围：越界就退回默认值并记一条错误，
+# 不让一个笔误（0、负数、字符串）在启动后才炸成看不懂的异常
+_NUMERIC_FIELDS = {
+    ("poll", "interval_seconds"): (1, 86400),
+    ("poll", "discovery_interval_seconds"): (0, 3600),
+    ("poll", "active_interval_seconds"): (0, 3600),
+    ("poll", "active_watch_limit"): (0, 500),
+    ("poll", "watch_limit"): (0, 500),
+    ("poll", "stuck_seconds"): (30, 86400),
+    ("poll", "window_limit"): (1, 200),
+    ("poll", "archive_hours"): (1, 24 * 365),
+    ("ui", "port"): (1, 65535),
+}
+
+
+def _validate_config(cfg: dict) -> list[str]:
+    """按字段校验；不合法的项落回默认值，返回错误清单。"""
+    problems: list[str] = []
+    for (section, field), (low, high) in _NUMERIC_FIELDS.items():
+        bucket = cfg.get(section)
+        if not isinstance(bucket, dict):
+            continue
+        raw = bucket.get(field)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = None
+        if value is None or not (low <= value <= high):
+            fallback = DEFAULTS[section][field]
+            bucket[field] = fallback
+            problems.append("%s.%s=%r 无效，已用默认值 %s" % (section, field, raw, fallback))
+    if str(cfg.get("source", "api")).lower() not in ("api", "web"):
+        cfg["source"] = "api"
+        problems.append("source 只能是 api 或 web，已用 api")
+    return problems
+
+
 def _load_config() -> tuple[dict, str]:
     """读配置；文件缺失或损坏时返回默认值 + 一句给人看的错误。"""
     cfg = json.loads(json.dumps(DEFAULTS))       # 深拷贝
@@ -128,7 +166,11 @@ def _load_config() -> tuple[dict, str]:
             user = json.load(f)
     except Exception as exc:  # noqa: BLE001
         return _apply_env(cfg), "配置文件读取失败：%s（%s）" % (CONFIG_FILE, exc)
-    return _apply_env(_deep_merge(cfg, user)), ""
+    if not isinstance(user, dict):
+        return _apply_env(cfg), "配置文件不是对象：%s" % CONFIG_FILE
+    merged = _apply_env(_deep_merge(cfg, user))
+    problems = _validate_config(merged)
+    return merged, ("；".join(problems) if problems else "")
 
 
 CFG, CONFIG_ERROR = _load_config()
@@ -185,6 +227,10 @@ RATE_LIMIT_PROBE_ATTEMPTS = 3
 REPROBE_GAP_SECONDS = max(30, min(60, RATE_LIMIT_PROBE_GAP_SECONDS // 4))
 REPROBE_WINDOW_SECONDS = 300
 REPROBE_ATTEMPTS = 4
+# 多久没再出现在列表里，就只当历史记录、不再计入实时状态
+COVERAGE_EXPIRE_SECONDS = 3600
+# 两次队列观测之间隔太久，就不再认为「同一轮一直在跑」
+RUN_GAP_RESET_SECONDS = max(300, POLL_SECONDS * 3)
 ROUND_BUDGET_SECONDS = 10
 DEFAULT_STUCK_SECONDS = int(CFG["poll"]["stuck_seconds"])
 DEFAULT_WINDOW_LIMIT = int(CFG["poll"]["window_limit"])
@@ -230,18 +276,38 @@ def notify(title: str, body: str, cid: str | None = None) -> None:
 _lock = threading.Lock()
 # 唤醒取数循环：来源切换、页面新上报都要立刻重排，不能等原来的 sleep 走完
 _wake = threading.Event()
+# 截止时间调度自己的唤醒（改截止时间、撤销时立刻重算，不用等下一个整秒）
+_deadline_wake = threading.Event()
+
+
+# 端到端延迟：会话在列表里露头（update_ms）到本机把状态落定，取最近若干次
+_latencies: "deque[int]" = deque(maxlen=200)
+STATE_SCHEMA = 2
 
 
 def load_state() -> dict:
     try:
         with open(STATE_FILE) as f:
-            return json.load(f)
-    except (OSError, ValueError):
+            state = json.load(f)
+    except OSError:
         return {}
+    except ValueError as exc:
+        # 损坏的状态文件留着当证据，然后从空状态重建：视图必须还能打开
+        bad = STATE_FILE + ".corrupt"
+        try:
+            os.replace(STATE_FILE, bad)
+            log("状态文件损坏，已备份到 %s：%s" % (bad, exc))
+        except OSError:
+            pass
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    return state
 
 
 def save_state(state: dict) -> None:
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    state["schema"] = STATE_SCHEMA
     # 临时文件名要唯一：取数循环和 /webstate 会同时写，共用一个 .tmp 时
     # 先 replace 的那个会把文件搬走，另一个就 ENOENT
     tmp = "%s.%d.%d.tmp" % (STATE_FILE, os.getpid(), threading.get_ident())
@@ -752,6 +818,12 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
     task["raw_state"] = sample.raw
 
     started = task.get("running_since") or 0
+    previous = task.get("queue_checked_at") or 0
+    if started and previous and sample.at - previous > RUN_GAP_RESET_SECONDS * 1000:
+        # 休眠/断网期间可能已经结束一轮、又起了新一轮。两次观测之间的「忙」
+        # 不能当成同一轮持续在跑，否则恢复后立刻报「卡住」
+        started = 0
+        task["run_restarted_at"] = sample.at
     if sample.busy:
         if not started:
             started = sample.at
@@ -815,14 +887,18 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
         if sample.failed is not None:
             task["classified_reply"] = reply
             task["failed"] = sample.failed
-    task["status"] = "stuck" if task.get("failed") else "attention"
-    # 从「运行中」转入「待回复」的那一刻重新计 30 分钟；同一阶段内不重置
-    if not was_attention or not task.get("countdown_since"):
+    stuck_for_same_reply = (task.get("status") == "stuck"
+                            and task.get("stuck_reply") == reply)
+    task["status"] = "stuck" if (task.get("failed") or stuck_for_same_reply) else "attention"
+    # 从「运行中」转入「待回复」的那一刻重新计；同一条回复不重置，
+    # 否则每次采样都把倒计时推回原点，「等你回复超时」永远等不到
+    if not was_attention and not stuck_for_same_reply:
         task["countdown_since"] = sample.at
     waited = (sample.at - (task.get("countdown_since") or sample.at)) // 1000
     if task["status"] == "attention" and waited >= DEFAULT_STUCK_SECONDS:
         # 等你回复等太久，同样算卡住
         task["status"] = "stuck"
+        task["stuck_reply"] = reply
         if task.get("stuck_notified") != task["countdown_since"]:
             task["stuck_notified"] = task["countdown_since"]
             notifications.append(("任务疑似卡住",
@@ -884,7 +960,20 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             cid = str(conv["id"])
             update = conv["updateTime"]
             created = int(conv.get("createTime") or 0)
+            agent_id = conv.get("agentId") or (AGENT_IDS[0] if AGENT_IDS else "")
             task = tasks.get(cid)
+            if task is not None:
+                old_agent = task.get("agent_id")
+                # 同一个会话 ID 落到了另一个数据范围：不能覆盖旧记录（会连带把
+                # 勾选、截止时间带过去），旧记录降级归档，新范围从干净状态开始
+                if old_agent and agent_id and str(old_agent) != str(agent_id):
+                    legacy = "%s@%s" % (cid, old_agent)
+                    tasks.setdefault(legacy, dict(task, archived=True, muted=True,
+                                                  scope_note="另一个数据范围的旧记录"))
+                    log("会话 %s 换了数据范围（%s → %s），旧记录归档为 %s"
+                        % (cid, old_agent, agent_id, legacy))
+                    task = None
+                    tasks.pop(cid, None)
             if task is None:
                 fresh.add(cid)
                 if created and created >= baseline:
@@ -893,11 +982,12 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                     task = tasks[cid] = {"status": "seen", "prev": "running", "acked_update": update}
             task.setdefault("queue_observed_at", task.get("seen_ms") or 0)
             task.update(id=conv["id"], name=conv.get("name") or f"会话 {cid}",
-                        agent_id=conv.get("agentId") or (AGENT_IDS[0] if AGENT_IDS else ""),
+                        agent_id=agent_id,
                         update_ms=update, seen_ms=stamp,
                         # 会话在 DataAgent 里的分组；取消分组时也要覆盖成空
                         group_name=conv.get("groupName") or "")
             task["url"] = conv_url(task["agent_id"], cid)
+            task["listed_at"] = stamp          # 最后一次出现在监控窗口里
             if task.get("archived") and update > (task.get("acked_update") or 0):
                 task.update(archived=False, muted=False, auto_archived=0, prev="running", status="seen")
 
@@ -932,20 +1022,17 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                 # 刚建好、还没跑过任何一轮的空会话，没有「等你处理」这回事
                 task["acked_update"] = update
             # samples 里只有本轮真的问过的会话，所以拿到就能直接落状态
+            before = task.get("status")
             apply_queue_sample(task, sample, act, notifications)
+            after = task.get("status")
+            if after != before and after in ("attention", "stuck", "done"):
+                upstream = task.get("update_ms") or sample.at
+                _latencies.append(max(0, sample.at - upstream))
 
         if fresh:
             busy = sum(1 for cid in fresh
                        if tasks.get(cid, {}).get("status") in ("running", "stuck"))
             log(f"新会话 {len(fresh)} 个已纳入统计（{busy} 个在运行）")
-
-        for task in tasks.values():
-            deadline_ms = task.get("deadline")
-            if task.get("muted") or not deadline_ms or stamp < deadline_ms:
-                continue
-            if stamp - (task.get("deadline_notified") or 0) >= DEADLINE_REMIND_SECONDS * 1000:
-                task["deadline_notified"] = stamp
-                notifications.append(("任务已超时", f"{task['name']} 超过你设定的时间", str(task["id"])))
 
         if full:
             for cid, task in list(tasks.items()):
@@ -998,23 +1085,41 @@ def _view_source() -> tuple[str, float | None]:
     return mode, (now_ms() - at) / 1000 if at else None
 
 
-def task_group(task: dict) -> str:
+def task_group(task: dict, mode: str, tabs: dict) -> str:
     """任务显示在哪个组里——两种来源各有各的用处，不要混：
 
     - web：数据是从那个 DataAgent 页面里取的，组就是会话在平台上的分组
       （列表接口自带 groupName），和你在网页侧边栏看到的一致；
     - api：进程直连接口、没有页面上下文，组用浏览器标签组——那是你自己
       手动归类的标签，正合「我在盯哪几摊事」这个用途。
+
+    mode 与 tabs 由调用方一次性传入：一份响应必须只用同一个来源、同一份标签
+    快照，否则「读到一半切了来源」会把两种分组混进同一次返回。
     """
-    if source_mode() == "web":
+    if mode == "web":
         return task.get("group_name") or ""
-    return _tab_groups.get(str(task.get("id")), "")
+    return tabs.get(str(task.get("id")), "")
+
+
+def _latency_stats() -> dict:
+    """状态从「上游可见」到「本机落定」的耗时分布（毫秒）。样本量小的时候照实说。"""
+    if not _latencies:
+        return {"samples": 0}
+    ordered = sorted(_latencies)
+    def pick(q: float) -> int:
+        idx = min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))
+        return ordered[idx]
+    return {"samples": len(ordered), "p50_ms": pick(0.5),
+            "p95_ms": pick(0.95), "max_ms": ordered[-1]}
 
 
 def view(state: dict) -> dict:
     limit = DEFAULT_WINDOW_LIMIT
     stuck = DEFAULT_STUCK_SECONDS
     stamp = now_ms()
+    # 整份响应共用这一份快照：来源、标签组，动手前各取一次
+    mode = source_mode()
+    tabs = dict(_tab_groups)
     stale_after_seconds = max(POLL_SECONDS * 2, 45)
 
     rows = []
@@ -1024,6 +1129,9 @@ def view(state: dict) -> dict:
         if (not task.get("muted")) and task.get("status") == "done" and stamp - (task.get("seen_ms") or 0) > 6 * 3600_000:
             continue
         observed = task.get("queue_observed_at", task.get("seen_ms")) or 0
+        # 掉出监控窗口太久：状态只能当历史，不该继续占用「待回复 / 卡住」的实时计数
+        covered = (stamp - (task.get("listed_at") or task.get("seen_ms") or 0)
+                   <= COVERAGE_EXPIRE_SECONDS * 1000)
         # 「待确认」只对真在盯的会话有意义：运行中/待回复/已卡住这三种，
         # 拿不到队列就等于不知道该不该报。安静的会话（已查看/完成）本来就没事，
         # 落选监控窗口后拿不到样本是正常的，不能一直挂着「待确认」。
@@ -1040,11 +1148,12 @@ def view(state: dict) -> dict:
         rows.append({
             "id": task["id"],
             "name": task.get("name"),
-            "group": task_group(task),
+            "group": task_group(task, mode, tabs),
             "status": task.get("status"),
             "prev": task.get("prev"),
             "reply_version": task.get("reply_version"),
             "stale": stale,
+            "covered": covered,
             "progress": round(progress, 3),
             "elapsed": elapsed,
             "updated_ms": task.get("update_ms"),
@@ -1099,11 +1208,16 @@ def view(state: dict) -> dict:
         "tasks": active[:limit],
         "active": active,
         "all": rows,
+        # 实时计数只统计仍在覆盖范围内的会话；掉出列表的历史待办单独放在
+        # out_of_scope_count 里，不参与「在跑 / 待回复 / 卡住」的汇总
         "counts": {
-            **{s: sum(1 for r in rows if r["status"] == s and not r["stale"])
+            **{s: sum(1 for r in rows if r["status"] == s and not r["stale"] and r["covered"])
                for s in ("running", "stuck")},
-            **{s: sum(1 for r in rows if r["status"] == s) for s in ("attention", "done", "seen")},
+            **{s: sum(1 for r in rows if r["status"] == s and r["covered"])
+               for s in ("attention", "done", "seen")},
         },
+        "out_of_scope_count": sum(1 for r in rows if not r["covered"]),
+        "latency": _latency_stats(),
     }
 
 
@@ -1286,11 +1400,34 @@ def focus_tab(win: int, tab: int) -> bool:
 # 共用一个队列时，没开该会话的那个浏览器会先领到，然后自己新开一个标签。
 _cmd_queues: dict[str, "queue.Queue[dict]"] = {}
 _cmd_done: dict[str, float] = {}    # 已经执行或已过期，防止迟到的扩展再执行一次
+# 点了任务但还没确认切过去：cmd_id -> (cid, 点击那一刻的 update_ms)
+# 只有标签真的切过去才据此标已读，且用点击时的版本判定，新回复不会被顺带吃掉
+_open_pending: dict[str, tuple[str, int]] = {}
 _cmd_acks: dict[str, float] = {}
 _cmd_t0: dict[str, float] = {}      # cmd_id -> 入队时刻，用于量跳转耗时
 _cmd_waiters = 0                    # 当前有多少个扩展长轮询正挂着等命令
 _cmd_waiters_lock = threading.Lock()
 _ext_seen = 0.0          # 扩展最近一次长轮询的时间
+
+
+def _confirm_open(cid: str, clicked_update: int) -> None:
+    """标签确实切过去了，才算用户「看过这个会话的这一次回复」。
+
+    clicked_update 是点击时的 update_ms：如果这期间又来了新回复（update_ms
+    变大），那一次不算读过，留给用户自己看。
+    """
+    try:
+        with _lock:
+            state = load_state()
+            task = (state.get("tasks") or {}).get(str(cid))
+            if not task or task.get("muted"):
+                return
+            if (task.get("update_ms") or 0) > clicked_update:
+                return
+            mark_seen(task)
+            save_state(state)
+    except OSError as exc:
+        log(f"标记已读失败 cid={cid}: {exc}")
 
 
 def _cmd_queue(browser: str) -> "queue.Queue[dict]":
@@ -1312,10 +1449,13 @@ def _open_fallback(cid: str, cmd_id: str) -> None:
     # 兜底已经动过手了：命令作废，迟到的扩展即使领到也不要再执行一次
     _cmd_done[cmd_id] = time.time()
     t0 = _cmd_t0.pop(cmd_id, None)
+    pending = _open_pending.pop(cmd_id, None)
     try:
         r = open_conversation(cid)
         ms = int((time.time() - t0) * 1000) if t0 else -1
         log("open cid=%s via=applescript(%s) %dms" % (cid, r, ms))
+        if r in ("focused", "opened") and pending:
+            _confirm_open(*pending)
     except Exception as e:
         log("open fallback failed cid=%s: %s" % (cid, e))
 
@@ -1726,6 +1866,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/cmd/ack":
             _cmd_acks[cid] = time.time()
             _cmd_done[cid] = time.time()
+            pending = _open_pending.pop(cid, None)
+            if pending:
+                _confirm_open(*pending)
             t0 = _cmd_t0.pop(cid, None)
             if t0:
                 log("open ack id=%s %dms" % (cid, int((time.time() - t0) * 1000)))
@@ -1743,6 +1886,8 @@ class Handler(BaseHTTPRequestHandler):
             owner = _tab_browser.get(cid)
             if (url0 and owner and (time.time() - _ext_seen) < 20 and _cmd_waiters > 0):
                 _cmd_t0[cmd_id] = time.time()
+                # 记下点击那一刻的回复版本：之后到的新回复不能被这次「已读」吃掉
+                _open_pending[cmd_id] = (cid, task0.get("update_ms") or 0)
                 _cmd_queue(owner).put({"cmd": "focus", "cid": cid, "url": url0,
                                        "tabId": _tab_ids.get(cid), "id": cmd_id,
                                        "browser": owner,
@@ -1751,13 +1896,9 @@ class Handler(BaseHTTPRequestHandler):
                 result = "queued"
             else:
                 result = open_conversation(cid)
-            if result in ("focused", "opened", "queued"):
-                with _lock:
-                    state = load_state()
-                    task = (state.get("tasks") or {}).get(cid)
-                    if task and not task.get("muted"):
-                        mark_seen(task)
-                        save_state(state)
+            # 只有真的把标签切过去了才算读过；入队 / 排队中不算
+            if result in ("focused", "opened"):
+                _confirm_open(cid, task0.get("update_ms") or 0)
             self._json({"ok": True, "result": result})
             return
 
@@ -1805,6 +1946,7 @@ class Handler(BaseHTTPRequestHandler):
                         mark_seen(task)
                 else:
                     task.update(deadline=deadline, deadline_notified=0)
+                    _deadline_wake.set()
                 if changed:
                     save_state(state)
         self._json({"ok": changed})
@@ -1832,6 +1974,38 @@ def _mark_error(msg: str) -> None:
             save_state(state)
     except OSError as exc:
         log(f"记录取数故障失败：{exc}")
+
+
+def _check_deadlines() -> None:
+    """到点就提醒。只看本机时钟：上游取数连续失败时也必须照常触发。"""
+    stamp = now_ms()
+    fired: list[tuple[str, str]] = []
+    with _lock:
+        state = load_state()
+        changed = False
+        for task in (state.get("tasks") or {}).values():
+            deadline_ms = task.get("deadline")
+            if task.get("muted") or not deadline_ms or stamp < deadline_ms:
+                continue
+            if stamp - (task.get("deadline_notified") or 0) < DEADLINE_REMIND_SECONDS * 1000:
+                continue
+            task["deadline_notified"] = stamp
+            changed = True
+            fired.append((task.get("name") or "", str(task.get("id"))))
+        if changed:
+            save_state(state)
+    for name, cid in fired:
+        notify("任务已超时", f"{name} 超过你设定的时间", cid)
+
+
+def _deadline_forever() -> None:
+    while True:
+        try:
+            _check_deadlines()
+        except (Exception, SystemExit) as exc:   # noqa: BLE001
+            log(f"截止时间检查失败：{exc}")
+        if _deadline_wake.wait(1.0):
+            _deadline_wake.clear()
 
 
 def _sleep_until(delay: float) -> bool:
@@ -1993,6 +2167,7 @@ def main() -> int:
     # 取数循环常驻本进程：省掉每次都启动解释器的开销，也复用已建立的会话（少换 token）
     server = QuietServer(("127.0.0.1", PORT), Handler)
     threading.Thread(target=poll_loop, name="poller", daemon=True).start()
+    threading.Thread(target=_deadline_forever, name="deadline", daemon=True).start()
     log(f"TaskPulse serving on http://127.0.0.1:{PORT}")
     server.serve_forever()
     return 0

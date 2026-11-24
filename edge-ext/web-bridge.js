@@ -20,12 +20,32 @@
   let lastListAt = 0;
   let lastReportAt = 0;
   let busy = false;
+  let roleWanted = false;   // 后台是否把采集权给了这一页；没给就不该开定时器
+  let timer = null;
 
   const now = () => Date.now();
+
+  // 后台只在选主结果变化时发消息，稳定状态下这里不会被打扰
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg || msg.kind !== "tp-role") return;
+    roleWanted = !!msg.leader;
+    sync();
+  });
 
   function askConfig() {
     return new Promise((resolve) => {
       chrome.runtime.sendMessage({ kind: "get-config" }, (r) => resolve(r || null));
+    });
+  }
+
+  // 谁采集由后台选主决定：几十个同类标签页各自定时拉，等于把同一份数据拉几十遍
+  function askRole() {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ kind: "tp-role-ask" }, (r) => resolve(r || null));
+      } catch (_) {
+        resolve(null);
+      }
     });
   }
 
@@ -76,7 +96,9 @@
     if (lastMsgAt[cid] === updateTime) return;
     lastMsgAt[cid] = updateTime;
     try {
-      const data = await jfetch(CFG.api.prefix + "/conversations/" + cid + "/messages?pageNo=1&pageSize=1");
+      const path = (CFG.api.messages || "/conversations/{cid}/messages?pageNo=1&pageSize=1")
+        .replace("{cid}", cid);
+      const data = await jfetch(CFG.api.prefix + path);
       const list = ((data && data.data) || {}).list || [];
       const m = list[0];
       if (m) lastMessages[cid] = { sender: m.sender, content: (m.content || "").slice(0, 400) };
@@ -85,11 +107,13 @@
 
   function isBusy(cid) {
     const q = queues[cid];
-    if (!q) return null;
-    const st = q.sessionState;
+    if (!q || !CFG.api) return null;
+    // 字段名与 poller 同源（config.js 由 install.command 生成），不在这里写死
+    const st = q[CFG.api.state || "state"];
     if (st == null || st === "") return null;
-    const idle = (CFG.api && CFG.api.idle) || [];
-    return (Array.isArray(q.pending) && q.pending.length > 0) || idle.indexOf(st) < 0;
+    const pending = CFG.api.pending ? q[CFG.api.pending] : null;
+    const idle = CFG.api.idle || [];
+    return Boolean(pending) || idle.indexOf(st) < 0;
   }
 
   function report() {
@@ -141,13 +165,26 @@
     }
   }
 
+  function sync() {
+    const want = roleWanted && !!CFG;
+    if (want && !timer) {
+      tick();                                // 刚拿到采集权先补一轮，别干等 2 秒
+      timer = setInterval(tick, 2000);
+    } else if (!want && timer) {
+      clearInterval(timer);                  // 被换下来就立刻停：后面拉的数据没人要
+      timer = null;
+    }
+  }
+
   (async () => {
     CFG = await askConfig();
     if (!CFG || !CFG.api) return;
-    // 后台在页面被节流时靠这个口子来敲门
-    window.__tpWebBridgeTick = tick;
-    tick();
-    setInterval(tick, 2000);
-    document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
+    // 后台在页面被节流时靠这个口子来敲门；没采集权就不该被敲动
+    window.__tpWebBridgeTick = () => { if (roleWanted) tick(); };
+    // 先问一句「这一页要不要采集」，默认不采：判断权在后台，页面自己不开火
+    const r = await askRole();
+    roleWanted = !!(r && r.leader);
+    sync();
+    document.addEventListener("visibilitychange", () => { if (!document.hidden && timer) tick(); });
   })();
 })();

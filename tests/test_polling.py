@@ -353,8 +353,14 @@ class PollingTests(unittest.TestCase):
             poller.poll_tick(agent, full=False)
             self.stamp += 10_000
             poller.poll_tick(agent, full=False)
+        # 截止时间由独立线程检查（不依赖上游取数），这里直接驱动它一次
+        poller._check_deadlines()
         self.assertEqual([args[0] for args, _ in self.notifications.call_args_list],
                          ["任务疑似卡住", "任务已超时"])
+        # 同一份截止时间不重复提醒
+        self.stamp += 1_000
+        poller._check_deadlines()
+        self.assertEqual(len(self.notifications.call_args_list), 2)
 
     def test_missing_assistant_content_has_limited_retries(self):
         agent = FakeAgent([conversation()], busy=(1,))
