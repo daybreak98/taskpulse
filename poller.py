@@ -947,6 +947,19 @@ def _view_source() -> tuple[str, float | None]:
     return mode, (now_ms() - at) / 1000 if at else None
 
 
+def task_group(task: dict) -> str:
+    """任务显示在哪个组里——两种来源各有各的用处，不要混：
+
+    - web：数据是从那个 DataAgent 页面里取的，组就是会话在平台上的分组
+      （列表接口自带 groupName），和你在网页侧边栏看到的一致；
+    - api：进程直连接口、没有页面上下文，组用浏览器标签组——那是你自己
+      手动归类的标签，正合「我在盯哪几摊事」这个用途。
+    """
+    if source_mode() == "web":
+        return task.get("group_name") or ""
+    return _tab_groups.get(str(task.get("id")), "")
+
+
 def view(state: dict) -> dict:
     limit = DEFAULT_WINDOW_LIMIT
     stuck = DEFAULT_STUCK_SECONDS
@@ -971,9 +984,7 @@ def view(state: dict) -> dict:
         rows.append({
             "id": task["id"],
             "name": task.get("name"),
-            # 分组用会话在 DataAgent 里的分组（conversations 接口自带 groupName），
-            # 不是浏览器标签组：标签组是用户手动整理的标签，和业务分组经常对不上。
-            "group": task.get("group_name") or "",
+            "group": task_group(task),
             "status": task.get("status"),
             "prev": task.get("prev"),
             "reply_version": task.get("reply_version"),
@@ -1042,6 +1053,9 @@ def view(state: dict) -> dict:
 
 # ── 标签页映射（由浏览器扩展上报，仅存内存不落盘）─────────────────────
 
+# ── 标签页组名（由扩展上报，仅存内存不落盘）─────────────────────────
+
+_tab_groups: dict[str, str] = {}
 _tab_ids: dict[str, int] = {}       # conversationId -> 扩展给的 tabId，切标签时免查询
 # 用户此刻正停留在哪个会话的标签页上（窗口聚焦才算）
 _active_tab = {"cid": None, "focused": False, "ts": 0}
@@ -1124,6 +1138,11 @@ def ingest_tabs(payload: dict, ua: str = "") -> int:
         tid = t.get("tabId")
         if isinstance(tid, int):
             _tab_ids[cid] = tid
+        g = (t.get("group") or "").strip()
+        if g:
+            _tab_groups[cid] = g
+        else:
+            _tab_groups.pop(cid, None)      # 移出标签组后别再显示旧组名
         n += 1
     return n
 
