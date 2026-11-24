@@ -16,8 +16,9 @@ TaskPulse
 *.log
 state.json
 
-# 扩展的站点范围按本机配置生成，不入库
+# 扩展的站点范围按本机配置生成，不入库（模板见 edge-ext/manifest.template.json）
 edge-ext/config.js
+edge-ext/manifest.json
 
 # 团队内部包用的配置与额外依赖参数（含内部标识，不入库）
 packaging/internal/

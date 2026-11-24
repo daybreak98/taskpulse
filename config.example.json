@@ -36,14 +36,21 @@
   },
   "poll": {
     "interval_seconds": 60,
+    "discovery_interval_seconds": 5,
+    "active_interval_seconds": 5,
+    "active_watch_limit": 2,
+    "resume_probe_limit": 1,
+    "stuck_interval_seconds": 60,
+    "rate_limit_probe_seconds": 60,
     "watch_limit": 20,
-    "stuck_seconds": 600,
+    "stuck_seconds": 1800,
     "window_limit": 10,
     "archive_hours": 48
   },
   "ui": {
     "port": 8899
   },
+  "source": "api",
   "extension": {
     "scope": ""
   },

@@ -11,8 +11,18 @@ const ENDPOINT = BASE + "/tabs";
 const ACTIVE_ENDPOINT = BASE + "/active";
 const CMD_ENDPOINT = BASE + "/cmd";
 const ACK_ENDPOINT = BASE + "/cmd/ack";
+const WEBSTATE_ENDPOINT = BASE + "/webstate";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 上报里带上「我是哪个浏览器」：初装引导要据此判断「用户刚装的那个浏览器连上没有」。
+// 只看 UA，不涉及任何页面内容。
+const BROWSER = (() => {
+  const ua = (self.navigator && self.navigator.userAgent) || "";
+  if (ua.includes("Edg/")) return "edge";
+  if (ua.includes("Chrome/")) return "chrome";
+  return "unknown";
+})();
 
 async function snapshot() {
   if (!SCOPE) return [];
@@ -53,10 +63,22 @@ async function push() {
   if (!SCOPE) return;
   try {
     const [tabs, active] = await Promise.all([snapshot(), activeInfo()]);
+    // web 段是排障用的自检：装上报里就能看出「为什么浏览器内取数没起来」
+    let registered = [];
+    try {
+      registered = (await chrome.scripting.getRegisteredContentScripts({ ids: ["tp-web-bridge"] }))
+        .map((s) => s.matches.join(","));
+    } catch (_) {}
+    const web = {
+      hasApi: !!API_CFG,
+      scripting: !!chrome.scripting,
+      pages: tabs.length,
+      registered: registered,
+    };
     await fetch(ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ at: Date.now(), tabs, active })
+      body: JSON.stringify({ at: Date.now(), browser: BROWSER, tabs, active, web })
     });
   } catch (_) {
     // TaskPulse 没在跑时静默失败
@@ -152,8 +174,28 @@ chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === "tp-sync") {
     push();
     listen();   // service worker 被回收后在这里重新挂上长轮询
+    nudgeWebBridge();
   }
 });
+
+// 页面在后台时浏览器会把 setInterval 节流到分钟级，页面内取数就跟着停摆。
+// 由后台主动去敲一下（executeScript 不受页面定时器节流限制），只敲最前面几个，
+// 免得几十个标签页一起打接口。
+async function nudgeWebBridge() {
+  if (!SCOPE || !API_CFG || !chrome.scripting) return;
+  try {
+    const tabs = await chrome.tabs.query({ url: SCOPE });
+    // 只敲一个页面就够（各页数据相同），失败再换下一个
+    for (const t of tabs.slice(0, 2)) {
+      if (typeof t.id !== "number") continue;
+      const r = await chrome.scripting.executeScript({
+        target: { tabId: t.id },
+        func: () => { if (window.__tpWebBridgeTick) window.__tpWebBridgeTick(); }
+      }).catch(() => null);
+      if (r) break;
+    }
+  } catch (_) {}
+}
 
 // 只在上报「切到」这个标签时记已读。
 // 曾经这里还会补记「被切走的那个标签」，但它会把用户没看的会话误标已读：
@@ -185,3 +227,57 @@ for (const ev of [
 chrome.alarms.create("tp-sync", { periodInMinutes: 0.5 });
 push();
 listen();
+
+// ── 数据来源二：在开着的 DataAgent 页面里用 cookie 取数 ──────────────
+// 由 config.js 的 scope 决定注入哪些页面，manifest 里不写死域名。
+const API_CFG = CFG.api || null;
+
+async function ensureWebBridge() {
+  if (!SCOPE || !chrome.scripting) return;
+  try {
+    const old = await chrome.scripting.getRegisteredContentScripts({ ids: ["tp-web-bridge"] });
+    if (old.length) await chrome.scripting.unregisterContentScripts({ ids: ["tp-web-bridge"] });
+  } catch (_) {}
+  try {
+    await chrome.scripting.registerContentScripts([{
+      id: "tp-web-bridge",
+      matches: [SCOPE],
+      js: ["web-bridge.js"],
+      runAt: "document_idle",
+      persistAcrossSessions: true
+    }]);
+  } catch (_) {
+    // 页面已打开时需要手动刷新一次才会注入
+  }
+}
+
+async function injectIntoOpenTabs() {
+  if (!SCOPE || !chrome.scripting) return;
+  try {
+    const tabs = await chrome.tabs.query({ url: SCOPE });
+    for (const t of tabs) {
+      if (typeof t.id !== "number") continue;
+      // 已开着的页面收不到新注册的 content script，这里补一次；页面内自己会去重
+      chrome.scripting.executeScript({ target: { tabId: t.id }, files: ["web-bridge.js"] })
+        .catch(() => void 0);
+    }
+  } catch (_) {}
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
+  if (!msg) return;
+  if (msg.kind === "get-config") {
+    respond(API_CFG ? { api: API_CFG } : null);
+    return;
+  }
+  if (msg.kind === "webstate" && msg.payload) {
+    fetch(WEBSTATE_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(msg.payload)
+    }).then(() => respond({ ok: true })).catch(() => respond({ ok: false }));
+    return true;
+  }
+});
+
+ensureWebBridge().then(injectIntoOpenTabs);

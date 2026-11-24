@@ -17,8 +17,12 @@ rm -f "$APP/Contents/MacOS/"*.bak* 2>/dev/null || true
 # 通用二进制：Apple Silicon + Intel 都能跑
 TMPB="$(mktemp -d)"
 trap 'rm -rf "$TMPB"' EXIT
-swiftc -O -target arm64-apple-macos13.0 -o "$TMPB/TaskPulse-arm64" pulse.swift -framework Cocoa
-swiftc -O -target x86_64-apple-macos13.0 -o "$TMPB/TaskPulse-x86_64" pulse.swift -framework Cocoa
+# swiftc 只允许名为 main.swift 的文件写顶层代码，这里换名后再编译多文件
+cp pulse.swift "$TMPB/main.swift"
+for target in arm64 x86_64; do
+  swiftc -O -target "$target-apple-macos13.0" -o "$TMPB/TaskPulse-$target" \
+    "$TMPB/main.swift" onboarding.swift -framework Cocoa
+done
 lipo -create -output "$APP/Contents/MacOS/TaskPulse" "$TMPB/TaskPulse-arm64" "$TMPB/TaskPulse-x86_64"
 codesign --force --deep --sign - "$APP"
 echo "   -> $APP ($(lipo -archs "$APP/Contents/MacOS/TaskPulse"))"
@@ -27,10 +31,11 @@ echo "== 2/4 组装目录 =="
 rm -rf "$OUT" && mkdir -p "$OUT"
 cp -R "$APP" "$OUT/"
 cp poller.py "$OUT/"
-# edge-ext/config.js 是按本机配置生成的，不进包（install.command 会重新生成）
+# edge-ext/config.js 与 manifest.json 是按本机配置生成的，不进包（install.command 会重新生成）
+# *.bak* 是编辑器备份，同样不进包
 mkdir -p "$OUT/edge-ext"
 for f in "$PWD"/edge-ext/*; do
-  case "$(basename "$f")" in config.js) continue ;; esac
+  case "$(basename "$f")" in config.js|manifest.json|*.bak*) continue ;; esac
   cp -R "$f" "$OUT/edge-ext/"
 done
 cp packaging/install.command packaging/uninstall.command packaging/README.md "$OUT/"

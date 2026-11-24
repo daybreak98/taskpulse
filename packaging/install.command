@@ -28,12 +28,16 @@ if [ -z "$UV_BIN" ]; then
 fi
 echo "-- uv: $UV_BIN"
 
-# ---------- 2. 配置：包内带配置就沿用，否则问三个问题 ----------
+# ---------- 2. 配置：包内自带就直接用，不再提问 ----------
 mkdir -p "$HOME/.taskpulse"
 
 # 团队内部包会把 config.json 放在安装包根目录（该文件不入库）
 CFG_READY=0
-if [ ! -f "$CONFIG" ] && [ -f "./config.json" ]; then
+if [ -f "./config.json" ]; then
+  if [ -f "$CONFIG" ]; then
+    BAK="$CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$CONFIG" "$BAK" && echo "-- 旧配置已备份：$BAK"
+  fi
   cp "./config.json" "$CONFIG"
   echo "-- 使用安装包内自带的配置：$CONFIG"
   CFG_READY=1
@@ -135,7 +139,7 @@ else
   "poll": {
     "interval_seconds": 60,
     "watch_limit": 20,
-    "stuck_seconds": 600,
+    "stuck_seconds": 1800,
     "window_limit": 10,
     "archive_hours": 48
   },
@@ -171,33 +175,40 @@ cp -R edge-ext "$DEST/"
 # 去掉 Gatekeeper 隔离标记，避免「已损坏，无法打开」
 xattr -dr com.apple.quarantine "$HOME/Applications/$APP_NAME.app" 2>/dev/null
 
-# ---------- 4. 把域名和端口写进扩展（不声明 <all_urls>）----------
-if [ -n "$TP_SCOPE" ]; then
-  "$UV_BIN" run --quiet --no-project python - "$DEST/edge-ext" "$TP_SCOPE" "$TP_PORT" <<'PY'
+# ---------- 4. 把域名、端口和接口路径写进扩展（不声明 <all_urls>）----------
+"$UV_BIN" run --quiet --no-project python - "$DEST/edge-ext" "$CONFIG" "$TP_PORT" <<'PY'
 import json, os, sys
-d, scope, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+d, cfg_path, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+cfg = json.load(open(cfg_path))
+scope = (cfg.get("extension") or {}).get("scope") or ""
+plat = cfg.get("platform") or {}
+
+# 内容脚本在页面里取数时要用到的接口路径；同样是配置驱动，代码里不写死任何内部域名
+body = {}
+for k, v in (plat.get("conversations_body") or {}).items():
+    body[k] = list(plat.get("agent_ids") or []) if v == "{agent_ids}" else v
+api = {
+    "prefix": plat.get("api_prefix") or "",
+    "conv": (plat.get("endpoints") or {}).get("conversations") or "",
+    "queue": (plat.get("endpoints") or {}).get("queue") or "",
+    "idle": list((plat.get("queue_fields") or {}).get("idle") or []),
+    "body": body,
+}
+
 mpath = os.path.join(d, "manifest.json")
-m = json.load(open(mpath))
-m["host_permissions"] = ["http://127.0.0.1:%d/*" % port]
+m = json.load(open(os.path.join(d, "manifest.template.json")))
+# scope 同时给 host 权限：内容脚本（浏览器内取数）需要它才能注入页面
+m["host_permissions"] = ["http://127.0.0.1:%d/*" % port] + ([scope] if scope else [])
 json.dump(m, open(mpath, "w"), ensure_ascii=False, indent=2)
+
 with open(os.path.join(d, "config.js"), "w") as f:
     f.write("// 由 install.command 按你的配置生成，重新安装会覆盖\n")
-    f.write("self.TP_CONFIG = %s;\n" % json.dumps({"scope": scope, "port": port}))
+    f.write("self.TP_CONFIG = %s;\n" % json.dumps(
+        {"scope": scope, "port": port, "api": api if scope else None}))
 print("   -> manifest.json / config.js")
 PY
-else
-  echo "-- 跳过：extension.scope 为空，扩展装上也不会匹配任何页面"
-  "$UV_BIN" run --quiet --no-project python - "$DEST/edge-ext" "$TP_PORT" <<'PY'
-import json, os, sys
-d, port = sys.argv[1], int(sys.argv[2])
-mpath = os.path.join(d, "manifest.json")
-m = json.load(open(mpath))
-m["host_permissions"] = ["http://127.0.0.1:%d/*" % port]
-json.dump(m, open(mpath, "w"), ensure_ascii=False, indent=2)
-with open(os.path.join(d, "config.js"), "w") as f:
-    f.write("// 由 install.command 按你的配置生成，重新安装会覆盖\n")
-    f.write("self.TP_CONFIG = %s;\n" % json.dumps({"scope": "", "port": port}))
-PY
+if [ -z "$TP_SCOPE" ]; then
+  echo "-- 注意：extension.scope 为空，扩展装上也不会匹配任何页面"
 fi
 
 # ---------- 5. 写入 launchd 配置 ----------
@@ -250,11 +261,34 @@ cat > "$AGENTS/com.taskpulse.ui.plist" <<PLIST
 </plist>
 PLIST
 
-# ---------- 6. 启动 ----------
+# ---------- 6. 预热依赖（首次要联网装一次，提前跑完更省心）----------
+echo "-- 检查运行依赖（首次会联网安装，约 30 秒）..."
+UV_PREHEAT=()
+if [ -f "./uv-args.txt" ]; then
+  while IFS= read -r ARG; do
+    [ -n "$ARG" ] && UV_PREHEAT+=("$ARG")
+  done < ./uv-args.txt
+fi
+# bash 3.2（macOS 自带）在 set -u 下展开空数组会报错，分两条写
+if [ ${#UV_PREHEAT[@]} -gt 0 ]; then
+  "$UV_BIN" run --quiet --no-project "${UV_PREHEAT[@]}" python -c "print('   -> 依赖就绪')" || {
+    echo "!! 依赖安装失败（多见于公司网络未连内网）。装好后重跑本脚本即可。"
+  }
+else
+  "$UV_BIN" run --quiet --no-project python -c "print('   -> 依赖就绪')" || {
+    echo "!! 依赖安装失败。装好后重跑本脚本即可。"
+  }
+fi
+
+# ---------- 7. 启动 ----------
 if [ "${TP_DRY:-}" = "1" ]; then
   echo "-- 干跑模式：跳过 launchctl / open"
   exit 0
 fi
+
+# 全新安装要让 App 弹一次浏览器扩展引导（bundle id 换过一次，两个都清）
+defaults delete com.taskpulse.ui onboarded 2>/dev/null || true
+defaults delete com.hyj.taskpulse onboarded 2>/dev/null || true
 
 launchctl bootout "gui/$(id -u)/com.taskpulse.poller" 2>/dev/null
 launchctl bootout "gui/$(id -u)/com.taskpulse.ui" 2>/dev/null
@@ -270,19 +304,24 @@ else
   echo "-- 后台服务还没起来，看日志: $LOGS/taskpulse.poll.err"
 fi
 
-open -R "$HOME/Applications/$APP_NAME.app" 2>/dev/null
-
 cat <<TIPS
 
-===== 还需要手动完成的 2 步 =====
-1) 浏览器扩展
-   打开 Edge -> edge://extensions -> 打开「开发人员模式」-> 「加载解压缩的扩展」
-   选择目录：$DEST/edge-ext
-   （扩展只上报标签页标题与组名，只允许访问 127.0.0.1；页面访问范围：${TP_SCOPE:-未配置}）
+===== 接下来只需 2 步（窗口里会带你走）=====
+1) 屏幕中间会弹「装浏览器扩展」的引导：选 Edge 或 Chrome 后，它会自动
+   打开扩展页、自动把扩展目录路径复制到剪贴板、自动在 Finder 里打开该目录。
+   你只需要在扩展页里做两件事：
+     a. 右上角打开「开发人员模式」
+     b. 点「加载解压缩的扩展」→ 按 ⌘⇧G 粘贴路径 → 回车 → 选「选择」
+   装好后引导会自己检测到，自动变成「已连接」，不用点任何检查按钮。
 
-2) 首次授权
-   第一次点任务行跳转时，系统会弹「TaskPulse 想要控制 Microsoft Edge」，点「允许」。
-   若服务需要登录，按日志提示完成一次即可。
+2) 首次点任务行跳转时，系统会弹「TaskPulse 想要控制浏览器」，点「允许」。
+   数据服务用的是你浏览器里已登录的账号，不用另填 token。
+
+扩展只读标签页标题与标签组名，只发 127.0.0.1；页面访问范围：${TP_SCOPE:-未配置}
+扩展目录：$DEST/edge-ext
+
+想重新走一遍引导：
+  defaults delete com.taskpulse.ui onboarded; launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 
 想要卸载：运行 uninstall.command
 TIPS
