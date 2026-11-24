@@ -228,6 +228,8 @@ def notify(title: str, body: str, cid: str | None = None) -> None:
 # ── 存储 ────────────────────────────────────────────────────────────
 
 _lock = threading.Lock()
+# 唤醒取数循环：来源切换、页面新上报都要立刻重排，不能等原来的 sleep 走完
+_wake = threading.Event()
 
 
 def load_state() -> dict:
@@ -506,6 +508,14 @@ class WebProvider:
         pending = q.get(self.f_pending) if self.f_pending else None
         return bool(pending) or raw not in self.idle, raw
 
+    def queue_at(self, cid: int) -> int | None:
+        """这条队列的样本是哪一刻取到的；缓存里的旧值不允许当成刚观测。"""
+        at = (self._load().get("queueAt") or {}).get(str(cid))
+        try:
+            return int(at) if at else None
+        except (TypeError, ValueError):
+            return None
+
     def last_message(self, cid: int, timeout: float) -> dict:
         msg = (self._load().get("lastMessages") or {}).get(str(cid))
         return msg if isinstance(msg, dict) else {}
@@ -527,6 +537,9 @@ class QueueSample(NamedTuple):
     # 真的取数失败（超时/HTTP 错），和「这轮没问到这个会话」要分开：
     # 后者不是故障，不该把会话标成「待确认」
     error: bool = False
+    # at 是否来自数据源自己的取到时刻（web 模式的 queueAt）。是的话，同一份
+    # 缓存重复上报时 at 不变，可以据此判重；api 模式 at 是本轮时刻，无需判重
+    from_source: bool = False
 
 
 def running(task: dict) -> bool:
@@ -556,16 +569,28 @@ def fast_candidates(tasks: dict, stamp: int) -> list[dict]:
 
 
 def resuming_candidates(listed: list[dict], tasks: dict, limit: int) -> list[dict]:
-    """列表里 updateTime 已经跳变、状态却还停在「已查看」的会话：用户又起了新一轮，
-    只是还没人取过队列。发现周期顺带查一个，把这段 60 秒的长尾压到 5 秒级。"""
+    """列表里 updateTime 已经跳变、但还没人取过队列的会话：用户又起了新一轮。
+
+    - 已查看：说明上一轮交完了，新时间就是新一轮
+    - 待回复 / 已卡住但已经没有运行起点：同理，新一轮已经开跑
+      （以前只认 seen，这两类得等 60 秒的全量轮询才发现，和「5 秒发现」对不上）
+    发现周期顺带查一个，把这段长尾压到秒级。
+    """
     if limit <= 0:
         return []
     out = []
     for conv in listed:
         task = tasks.get(str(conv["id"]))
-        if not task or task.get("muted") or task.get("status") != "seen":
+        if not task or task.get("muted"):
             continue
-        if conv["updateTime"] <= (task.get("acked_update") or 0):
+        status = task.get("status")
+        if status == "seen":
+            base = task.get("acked_update") or 0
+        elif status in ("attention", "stuck") and not task.get("running_since"):
+            base = max(task.get("update_ms") or 0, task.get("acked_update") or 0)
+        else:
+            continue
+        if conv["updateTime"] <= base:
             continue
         out.append({"id": conv["id"], "updateTime": conv["updateTime"]})
         if len(out) >= limit:
@@ -644,7 +669,12 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
             break
         try:
             busy, raw = agent.queue(conv["id"], timeout)
-            samples[cid] = QueueSample(now_ms(), busy, raw)
+            # 观测时刻用「真正取到数据的时刻」，不是「这轮处理的时刻」：
+            # web 模式下页面可能几分钟没刷新队列，拿旧值当新样本会让
+            # 已经停掉的会话重新进入实时计数
+            observed = getattr(agent, "queue_at", None)
+            at = observed(conv["id"]) if callable(observed) else None
+            samples[cid] = QueueSample(at or now_ms(), busy, raw, from_source=bool(at))
         except NoSample:
             samples[cid] = QueueSample(now_ms(), None)
             continue
@@ -805,6 +835,8 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
 
 def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dict:
     deadline = time.monotonic() + ROUND_BUDGET_SECONDS
+    # 本轮的来源代号：落盘前要再核一次，避免旧来源的样本覆盖新来源
+    gen = source_mode()
     base = load_state()
     tasks = base.get("tasks") or {}
     stamp = now_ms()
@@ -890,6 +922,11 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             sample = samples.get(cid)
             if sample is None:
                 continue
+            # 同一份队列样本只落一次：web 模式下页面没刷新时上报的还是旧值，
+            # 重复提交会把「上次成功观测」一路往后推，等于给旧数据续期
+            if (sample.from_source and task.get("queue_checked_at")
+                    and sample.at <= task["queue_checked_at"]):
+                continue
             if (cid in fresh and sample.busy is False and not task.get("acked_update")
                     and update <= int(conv.get("createTime") or 0)):
                 # 刚建好、还没跑过任何一轮的空会话，没有「等你处理」这回事
@@ -931,7 +968,13 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             # 否则页面停了 100 秒，UI 还以为是刚更新过
             fresh_at = agent.last_at() if isinstance(agent, WebProvider) else None
             state["updated"] = fresh_at or stamp
-        save_state(state)
+        # 采样是在锁外做的，可能已经跑了几秒。期间来源被切走的话，这批样本
+        # 属于旧来源，落盘会把新来源的数据盖掉——直接丢弃，下一轮按新来源重来。
+        if source_mode() == gen:
+            save_state(state)
+        else:
+            log("来源已切换，丢弃这轮 %s 的采样结果" % gen)
+            return base
 
     for title, body, cid in notifications:
         notify(title, body, cid)
@@ -1607,7 +1650,8 @@ class Handler(BaseHTTPRequestHandler):
             if source_mode() != "web":
                 self._json({"ok": True, "ignored": "source is api"})
                 return
-            payload["at"] = now_ms()
+            # 只落盘，不动状态：重算交给常驻循环（它是唯一的写入方，
+            # 这样「心跳刷新整份快照」和用户操作互相覆盖的问题一并消失）
             try:
                 os.makedirs(os.path.dirname(WEBSTATE_FILE), exist_ok=True)
                 # 多个标签页会同时上报，临时文件名带线程号避免互相搬走
@@ -1618,10 +1662,7 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as exc:
                 self._json({"ok": False, "error": str(exc)}, 500)
                 return
-            try:
-                save_state(poll_tick(make_agent(), full=True))
-            except Exception as exc:  # noqa: BLE001
-                log(f"webstate 刷新失败: {exc}")
+            _wake.set()
             self._json({"ok": True})
             return
 
@@ -1637,13 +1678,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": str(exc)}, 500)
                 return
             log("数据来源切换为 %s" % mode)
-            # 别让用户干等一个轮询周期：立刻按新来源重算一次（后台跑，不卡这次请求）
-            def _refresh() -> None:
-                try:
-                    save_state(poll_tick(make_agent(), full=True))
-                except Exception as exc:  # noqa: BLE001
-                    log(f"切换来源后刷新失败: {exc}")
-            threading.Thread(target=_refresh, name="mode-switch", daemon=True).start()
+            # 交给常驻循环重排：退避、下一轮时间都由它自己重置，
+            # 另起线程再 save 一次会把用户刚做的操作盖掉
+            _wake.set()
             self._json({"ok": True, "source": mode})
             return
 
@@ -1755,6 +1792,15 @@ def _mark_error(msg: str) -> None:
         log(f"记录取数故障失败：{exc}")
 
 
+def _sleep_until(delay: float) -> bool:
+    """睡到下次该干活；被唤醒（来源切换、页面新上报）则提前返回 True。
+
+    单独抽成函数是为了让回归测试能接上假时钟——直接调用 time.sleep 的话，
+    被替换的 time 模块收不到这次等待，循环会原地卡死。
+    """
+    return _wake.wait(delay)
+
+
 def _poll_forever() -> None:
     agent = None
     failures = 0
@@ -1795,7 +1841,17 @@ def _poll_forever() -> None:
             next_full = time.monotonic() + backoff
             next_discovery = next_full if DISCOVERY_POLL_SECONDS else float("inf")
             next_fast = float("inf")
-        time.sleep(max(0.05, min(next_full, next_discovery, next_fast) - time.monotonic()))
+        # 来源切换或页面新上报会唤醒这里：立刻重排并清掉退避，
+        # 否则切过去之后还得等原来的 420 秒退避走完
+        delay = max(0.05, min(next_full, next_discovery, next_fast) - time.monotonic())
+        if _sleep_until(delay):
+            _wake.clear()
+            failures = 0
+            agent = None
+            now = time.monotonic()
+            next_full = now
+            next_discovery = now if DISCOVERY_POLL_SECONDS else float("inf")
+            next_fast = float("inf")
 
 
 DEMO_TASKS = [

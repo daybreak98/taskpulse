@@ -13,6 +13,7 @@
   let CFG = null;
   let convs = [];
   const queues = {};        // cid -> {sessionState, pending, ...}
+  const queueAt = {};       // cid -> 这条队列是哪一刻成功取到的
   const lastMessages = {};  // cid -> {sender, content}
   const lastQueueAt = {};   // cid -> 上次拉队列的时刻
   const lastMsgAt = {};     // cid -> 上次拉最后一条消息的 updateTime
@@ -58,7 +59,12 @@
     try {
       const data = await jfetch(CFG.api.prefix + CFG.api.queue.replace("{cid}", cid));
       const d = (data && data.data) || null;
-      if (d) queues[cid] = d;
+      if (d) {
+        queues[cid] = d;
+        // 成功取到的那一刻：后端据此判断「这条样本是新的还是沿用旧值」，
+        // 光靠上报时刻会把几分钟前的旧队列说成刚刚观测
+        queueAt[cid] = now();
+      }
       lastQueueAt[cid] = now();
     } catch (_) {
       lastQueueAt[cid] = now();
@@ -102,6 +108,7 @@
       url: location.href,
       conversations: pick,
       queues: queues,
+      queueAt: queueAt,
       lastMessages: lastMessages
     };
     chrome.runtime.sendMessage({ kind: "webstate", payload }, () => void 0);

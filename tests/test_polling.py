@@ -126,9 +126,11 @@ class PollingTests(unittest.TestCase):
                     self.stamp = NOW + int(elapsed * 1000)
                     if elapsed >= 60:
                         raise StopLoop
+                    return False        # 没被唤醒，照常按计划时间往下走
 
                 clock = SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep)
-                with patch.multiple(poller, time=clock, AgentClient=lambda: agent):
+                with patch.multiple(poller, time=clock, AgentClient=lambda: agent,
+                                    _sleep_until=sleep):
                     with self.assertRaises(StopLoop):
                         poller._poll_forever()
                 self.assertEqual(agent.list_calls, 12)
@@ -380,15 +382,152 @@ class PollingTests(unittest.TestCase):
             pauses.append(seconds)
             if len(pauses) == 2:
                 raise StopLoop
+            return False            # 没被唤醒，照常按退避时间往下走
 
         with patch.multiple(poller, AgentClient=lambda: agent,
-                            time=SimpleNamespace(monotonic=lambda: clock, sleep=sleep)):
+                            time=SimpleNamespace(monotonic=lambda: clock, sleep=sleep),
+                            _sleep_until=sleep):
             with self.assertRaises(StopLoop):
                 poller._poll_forever()
         self.assertEqual(pauses, [60, 120])
         self.assertEqual(agent.queue_calls, [1, 2, 1, 1])
         self.assertIn("429", poller.load_state()["poller_error"])
         self.assertEqual(poller.load_state()["updated"], NOW)
+
+    # ── 三条修复的回归 ──────────────────────────────────────────────
+
+    def test_deadline_set_during_slow_sample_is_kept(self):
+        """慢采样期间用户设的截止时间不能被采样结果覆盖。"""
+        agent = FakeAgent([conversation(1)], busy=(1,))
+        poller.poll_tick(agent, full=True)
+
+        with self.serve() as url:
+            def during_sample():
+                # 取数还在锁外跑的时候，用户点了「5 分钟后提醒」
+                agent.before_queue = None
+                requests.post(f"{url}/deadline?id=1&minutes=5", timeout=2)
+
+            agent.before_queue = during_sample
+            self.stamp += 60_000
+            poller.poll_tick(agent, full=True)
+
+        task = poller.load_state()["tasks"]["1"]
+        self.assertTrue(task.get("deadline"), "用户设的截止时间被采样落盘覆盖了")
+        self.assertGreater(task["deadline"], self.stamp)
+
+    def test_web_old_queue_sample_is_not_renewed(self):
+        """页面重复上报同一份旧队列，不能把观测时间一路往后推。"""
+        path = str(Path(self.directory) / "webstate.json")
+        old_at = NOW - 300_000          # 五分钟前取到的队列
+        payload = {
+            "at": self.stamp,
+            "conversations": [{"id": 1, "name": "会话 1", "updateTime": self.stamp - 1000}],
+            "queues": {"1": {"state": "RUNNING", "pending": []}},
+            "queueAt": {"1": old_at},
+        }
+        Path(path).write_text(json.dumps(payload), encoding="utf-8")
+
+        with patch.multiple(poller, WEBSTATE_FILE=path, source_mode=lambda: "web"):
+            provider = poller.WebProvider()
+            poller.poll_tick(provider, full=True)
+            first = poller.load_state()["tasks"]["1"]
+            self.assertEqual(first["queue_observed_at"], old_at)
+
+            # 页面下一轮报的还是同一份缓存：不应该再落一次，也不该续期
+            self.stamp += 4_000
+            poller.poll_tick(provider, full=True)
+            second = poller.load_state()["tasks"]["1"]
+            self.assertEqual(second["queue_observed_at"], old_at)
+            self.assertEqual(second["queue_checked_at"], first["queue_checked_at"])
+
+    def test_mode_switch_wakes_loop_out_of_backoff(self):
+        """来源切换要立刻重排；不能等原来的退避（这里模拟的是 60 秒起步）。"""
+        poller._wake.clear()
+        agent = FakeAgent([conversation(1)])
+        original = agent.conversations
+        attempt = {"n": 0}
+
+        def flaky(timeout):
+            attempt["n"] += 1
+            if attempt["n"] == 1:
+                raise requests.Timeout("upstream down")
+            return original(timeout)
+
+        agent.conversations = flaky
+        clock = {"t": 0.0}
+        steps = []
+
+        def sleep(seconds):
+            steps.append(seconds)
+            if len(steps) == 1:
+                # 退避期间用户切了来源：只推进 1 秒就唤醒
+                clock["t"] += 1
+                poller._wake.set()
+                return True
+            raise StopLoop
+
+        with patch.multiple(poller, AgentClient=lambda: agent,
+                            time=SimpleNamespace(monotonic=lambda: clock["t"], sleep=sleep),
+                            _sleep_until=sleep):
+            with self.assertRaises(StopLoop):
+                poller._poll_forever()
+
+        self.assertGreaterEqual(attempt["n"], 2, "被唤醒后没有立刻重试")
+        self.assertEqual(clock["t"], 1.0, "唤醒后仍按原退避等满")
+
+    def test_mode_route_sets_wake_event(self):
+        """切换来源的接口本身要负责唤醒常驻循环。"""
+        config = str(Path(self.directory) / "config.json")
+        Path(config).write_text("{}", encoding="utf-8")
+        with patch.multiple(poller, CONFIG_FILE=config):
+            with self.serve() as url:
+                poller._wake.clear()
+                r = requests.post(f"{url}/mode?value=web", timeout=2)
+                self.assertEqual(r.json(), {"ok": True, "source": "web"})
+                self.assertTrue(poller._wake.is_set())
+
+    # ── 三条链路的验收 ──────────────────────────────────────────────
+
+    def test_new_conversation_is_running_on_discovery_tick(self):
+        agent = FakeAgent([conversation(1)])
+        poller.poll_tick(agent, full=True)          # 建立回填分界线
+        created = self.stamp
+
+        self.stamp += 5_000
+        agent.items = [{"id": 2, "name": "会话 2", "updateTime": self.stamp,
+                        "createTime": created}, conversation(1)]
+        agent.busy.add(2)
+        state = poller.poll_tick(agent, full=False, discovery=True)
+        self.assertEqual(state["tasks"]["2"]["status"], "running")
+
+    def test_existing_conversation_starting_new_round_is_found_fast(self):
+        agent = FakeAgent([conversation(1)], busy=(1,))
+        poller.poll_tick(agent, full=True)
+
+        agent.busy.clear()                          # 跑完，转「等你回复」
+        self.stamp += 30_000
+        self.assertEqual(poller.poll_tick(agent, full=False)["tasks"]["1"]["status"], "attention")
+
+        # 用户在同一个会话里又起了一轮：只有发现周期能秒级看到
+        self.stamp += 30_000
+        agent.items = [conversation(1, updated=self.stamp)]
+        agent.busy.add(1)
+        agent.queue_calls.clear()
+        state = poller.poll_tick(agent, full=False, discovery=True)
+        self.assertEqual(agent.queue_calls, [1], "重跑的会话没被快探取到")
+        self.assertEqual(state["tasks"]["1"]["status"], "running")
+
+    def test_finished_task_leaves_live_counts(self):
+        agent = FakeAgent([conversation(1)], busy=(1,))
+        poller.poll_tick(agent, full=True)
+        self.assertEqual(poller.view(poller.load_state())["counts"]["running"], 1)
+
+        agent.busy.clear()                          # 任务结束
+        self.stamp += 30_000
+        poller.poll_tick(agent, full=False)
+        state = poller.view(poller.load_state())
+        self.assertEqual(state["counts"]["running"], 0)
+        self.assertEqual(state["tasks"][0]["status"], "attention")
 
 
 class ResponseTests(unittest.TestCase):
