@@ -524,6 +524,9 @@ class QueueSample(NamedTuple):
     raw: str | int | None = None
     checked_reply: str | None = None
     failed: bool | None = None
+    # 真的取数失败（超时/HTTP 错），和「这轮没问到这个会话」要分开：
+    # 后者不是故障，不该把会话标成「待确认」
+    error: bool = False
 
 
 def running(task: dict) -> bool:
@@ -650,7 +653,7 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
                 if exc.response.status_code in (401, 403, 429):
                     raise  # 认证或限流故障暂停整轮，避免继续发请求
             log(f"queue {cid} failed: {exc}")
-            samples[cid] = QueueSample(now_ms(), None)
+            samples[cid] = QueueSample(now_ms(), None, error=True)
 
     if not FAIL_MARKS:
         return samples
@@ -707,7 +710,12 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
 def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
                        notifications: list[tuple[str, str, str]]) -> None:
     task["queue_checked_at"] = sample.at
-    task["queue_error"] = sample.busy is None
+    # 只有真的取数失败才记为 error；「这轮没问到」保持原状，别把安静的会话
+    # 永久标成「待确认」
+    if sample.busy is not None:
+        task["queue_error"] = False
+    elif sample.error:
+        task["queue_error"] = True
     if sample.busy is None:
         return
     task["queue_observed_at"] = sample.at
@@ -973,9 +981,14 @@ def view(state: dict) -> dict:
         if (not task.get("muted")) and task.get("status") == "done" and stamp - (task.get("seen_ms") or 0) > 6 * 3600_000:
             continue
         observed = task.get("queue_observed_at", task.get("seen_ms")) or 0
+        # 「待确认」只对真在盯的会话有意义：运行中/待回复/已卡住这三种，
+        # 拿不到队列就等于不知道该不该报。安静的会话（已查看/完成）本来就没事，
+        # 落选监控窗口后拿不到样本是正常的，不能一直挂着「待确认」。
+        tracked = task.get("status") in ("running", "attention", "stuck")
         stale = task.get("status") != "done" and (
-            bool(task.get("queue_error")) or not observed
-            or (running(task) and stamp - observed > stale_after_seconds * 1000))
+            not observed
+            or (tracked and (bool(task.get("queue_error"))
+                             or stamp - observed > stale_after_seconds * 1000)))
         started = task.get("running_since") or 0
         phase = task.get("countdown_since") or started
         elapsed = max(0, ((observed if stale else stamp) - started) // 1000) if started else 0
