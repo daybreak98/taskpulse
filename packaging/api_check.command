@@ -93,6 +93,28 @@ if [ -n "$AUD" ] && [ "$AUD" != "-" ]; then
   esac
 fi
 
+# ── 1.5 配置项 & 目标域名连通性 ────────────────────────────────
+# 平台变量为空时 SDK 会静默跳过换票，表现也是 401；接口域名和 pypi 源不是同一台
+# 机器，内网源通不代表接口通，所以两者单独探。
+CFG_AUDIT="$(PY -c '
+import json, sys
+try:
+    a = (json.load(open(sys.argv[1])).get("auth") or {})
+    print("%s|%s" % (a.get("provider") or "-", (a.get("env") or {}).get("KS_AGENT_PLATFORM") or ""))
+except Exception:
+    print("-|")
+' "$CFG" 2>/dev/null)"
+say "配置" "provider=${CFG_AUDIT%%|*}  KS_AGENT_PLATFORM=${CFG_AUDIT##*|}"
+case "${CFG_AUDIT##*|}" in
+  "") say "注意" "KS_AGENT_PLATFORM 为空，SDK 会跳过换票，API 模式必然失败" ;;
+esac
+
+CODE="$(curl -s -o /dev/null -m 4 -w '%{http_code}' "https://${TARGET_DOMAIN}/" 2>/dev/null)"
+case "$CODE" in
+  000|"") say "接口域名" "${TARGET_DOMAIN} 无响应（内网或 VPN？）" ;;
+  *)      say "接口域名" "${TARGET_DOMAIN} 可达（HTTP ${CODE}）" ;;
+esac
+
 # ── 2. 直连取数（和常驻服务完全同一套参数）────────────────────────
 RESULT="$("$UV" run --quiet --no-project --python ">=3.10" \
   --with 'ks-aimate>=1.4.0' \
