@@ -643,7 +643,7 @@ class WebProvider:
             out.append({**c, "id": cid,
                         "updateTime": int(c.get("updateTime") or 0),
                         "createTime": int(c.get("createTime") or 0),
-                        "name": c.get("name") or f"会话 {cid}",
+                        "name": clean_name(c.get("name")) or f"会话 {cid}",
                         "groupName": c.get("groupName") or ""})
         out.sort(key=lambda c: c["updateTime"], reverse=True)
         return out
@@ -1082,7 +1082,7 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                 else:
                     task = tasks[cid] = {"status": "seen", "prev": "running", "acked_update": update}
             task.setdefault("queue_observed_at", task.get("seen_ms") or 0)
-            task.update(id=conv["id"], name=conv.get("name") or f"会话 {cid}",
+            task.update(id=conv["id"], name=clean_name(conv.get("name")) or f"会话 {cid}",
                         agent_id=agent_id,
                         update_ms=update, seen_ms=stamp,
                         # 会话在 DataAgent 里的分组；取消分组时也要覆盖成空
@@ -1099,7 +1099,7 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             task = tasks.get(str(conv["id"]))
             if task is None:
                 continue
-            task["name"] = conv.get("name") or task.get("name") or ""
+            task["name"] = clean_name(conv.get("name")) or task.get("name") or ""
             task["group_name"] = conv.get("groupName") or ""
 
         for conv in conversations:
@@ -1221,6 +1221,12 @@ def _latency_stats() -> dict:
         return ordered[idx]
     return {"samples": len(ordered), "p50_ms": pick(0.5),
             "p95_ms": pick(0.95), "max_ms": ordered[-1]}
+
+
+def clean_name(value) -> str:
+    """会话标题来自上游，可能带换行。界面一行一个任务，这里先压成单行。"""
+    text = str(value or "")
+    return " ".join(text.replace("\t", " ").split())
 
 
 def view(state: dict) -> dict:

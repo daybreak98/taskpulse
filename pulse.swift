@@ -286,6 +286,25 @@ struct GroupVM {
     var matched: Int = 0
 }
 
+/// 会话标题来自上游，可能带换行或制表符。一行一个任务的前提必须由这里保证：
+/// 带换行的字符串会被 draw(at:) 画成多行，直接压到相邻行上。
+func singleLine(_ s: String) -> String {
+    var out = ""
+    var pendingSpace = false
+    for ch in s {
+        if ch.isNewline || ch == "\t" {
+            pendingSpace = !out.isEmpty
+        } else if ch == " " {
+            pendingSpace = !out.isEmpty
+        } else {
+            if pendingSpace { out.append(" ") }
+            pendingSpace = false
+            out.append(ch)
+        }
+    }
+    return out
+}
+
 func middleEllipsis(_ s: String, maxWidth: CGFloat, attrs: [NSAttributedString.Key: Any]) -> String {
     let chars = Array(s)
     var best = "…"
@@ -639,7 +658,8 @@ final class GroupRowView: NSView {
         chevron.stroke()
 
         // 组名 + 会话数（参考的 h3 样式：粗体标题 + 淡色计数）
-        let name = vm.name.count > 10 ? String(vm.name.prefix(10)) + "…" : vm.name
+        let cleanName = singleLine(vm.name)
+        let name = cleanName.count > 10 ? String(cleanName.prefix(10)) + "…" : cleanName
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
             .foregroundColor: mainText.withAlphaComponent(badge > 0 ? 0.95 : 0.55),
@@ -710,7 +730,7 @@ final class TaskRowView: NSView {
         self.dimmed = dimmed
         self.checked = checked
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: TASK_ROW_H))
-        self.toolTip = item.name
+        self.toolTip = singleLine(item.name)
     }
     required init?(coder: NSCoder) { nil }
     override var isFlipped: Bool { true }
@@ -750,7 +770,7 @@ final class TaskRowView: NSView {
             .foregroundColor: mainText.withAlphaComponent(alpha),
             .strikethroughStyle: done ? 1 : 0,
         ]
-        var title = item.name
+        var title = singleLine(item.name)
         let avail = w - 34 - metaW - 38
         var size = (title as NSString).size(withAttributes: attrs)
         if size.width > avail {
