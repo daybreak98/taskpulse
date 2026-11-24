@@ -1051,8 +1051,6 @@ _tab_report_at = 0
 _tab_report_by_browser: dict = {}
 # browser -> 扩展自报的「浏览器内取数能力」（hasApi / scripting / pages / registered）
 _web_diag: dict = {}
-# 扩展在页面里抓到的会话接口请求（排障用，见 background.js 的 hookFetch）
-_web_cap: list = []
 
 
 def watching(cid: str, act: dict) -> bool:
@@ -1110,9 +1108,6 @@ def ingest_tabs(payload: dict, ua: str = "") -> int:
         _tab_report_by_browser[b] = _tab_report_at
     if isinstance(payload.get("web"), dict):
         _web_diag[b or "?"] = payload["web"]
-    if isinstance(payload.get("cap"), list):
-        global _web_cap
-        _web_cap = payload["cap"][-20:]
     act = payload.get("active") or {}
     aurl = act.get("url") or ""
     am = re.search(r"[?&]conversationId=(\d+)", aurl)
@@ -1516,8 +1511,7 @@ class Handler(BaseHTTPRequestHandler):
                         "watching_cid": _active_tab["cid"],
                         "watching_focused": _active_tab["focused"],
                         "watching_age": round((now_ms() - (_active_tab["ts"] or 0)) / 1000, 1),
-                        "web": dict(_web_diag),
-                        "cap": _web_cap})
+                        "web": dict(_web_diag)})
         elif path == "/cmd":
             global _cmd_waiters
             _ext_seen = time.time()
