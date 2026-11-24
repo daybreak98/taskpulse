@@ -445,6 +445,7 @@ final class CapsuleView: NSView {
         OnboardingController.shared.show()
     }
 
+
     override func mouseDown(with event: NSEvent) {
         guard event.clickCount == 1, let onPick else { return }
         let p = convert(event.locationInWindow, from: nil)
@@ -487,6 +488,48 @@ final class PinView: NSView {
             head.lineWidth = 1.2; c.setStroke(); head.stroke()
             stem.stroke()
         }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard event.clickCount == 1 else { return }
+        onClick?()
+    }
+}
+
+// MARK: - 关闭按钮
+
+/// 右上角的退出键：平时是暗色叉，鼠标移上来变珊瑚红——「关闭」这种破坏性操作
+/// 不该跟其它按钮一样低调，但也不该常亮抢注意力。
+final class CloseButton: NSView {
+    var onClick: (() -> Void)?
+    private var hovered = false { didSet { needsDisplay = true } }
+
+    override var isFlipped: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let c = hovered ? rgb(0xFF6F61) : secondaryText.withAlphaComponent(0.55)
+        let inset: CGFloat = 5.5
+        let path = NSBezierPath()
+        path.lineWidth = 1.4
+        path.lineCapStyle = .round
+        path.move(to: NSPoint(x: inset, y: inset))
+        path.line(to: NSPoint(x: bounds.width - inset, y: bounds.height - inset))
+        path.move(to: NSPoint(x: bounds.width - inset, y: inset))
+        path.line(to: NSPoint(x: inset, y: bounds.height - inset))
+        c.setStroke()
+        path.stroke()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -807,6 +850,7 @@ final class PulseView: NSView {
     var onFilterChange: ((String?) -> Void)?
     var onTogglePin: (() -> Void)?
     var onSetSource: ((String) -> Void)?
+    var onQuit: (() -> Void)?
     /// 刚点下去的来源：后端还没确认，先照它画，免得多等一个轮询周期
     var pendingSource: String?
     var onOpen: ((TaskItem) -> Void)?
@@ -1045,12 +1089,12 @@ final class PulseView: NSView {
             addSubview(cap)
         }
 
-        let chevron = NSTextField(labelWithString: showAll ? "⌃" : "⌄")
-        chevron.font = .systemFont(ofSize: 11, weight: .semibold)
-        chevron.textColor = secondaryText.withAlphaComponent(0.75)
-        chevron.alignment = .center
-        chevron.frame = NSRect(x: bounds.width - 24, y: 6, width: 14, height: 14)
-        addSubview(chevron)
+        // 这个位置原来是个纯装饰的展开箭头；换成退出按钮，正好是窗口右上角
+        let close = CloseButton(frame: NSRect(x: bounds.width - 26, y: (HEADER_H - 18) / 2,
+                                              width: 18, height: 18))
+        close.toolTip = "退出 TaskPulse（后台取数会一起停）"
+        close.onClick = { [weak self] in self?.onQuit?() }
+        addSubview(close)
 
         let pin = PinView(frame: NSRect(x: bounds.width - 48, y: (HEADER_H - 18) / 2, width: 18, height: 18))
         pin.pinned = pinned
@@ -1246,6 +1290,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // 退出按钮会摘掉 LaunchAgent，之后用户双击 App 是「手工启动」的。
+        // 若再登录，launchd 也会拉起一个——两个面板叠一起。这里保证只有一个。
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
+        if running.count > 1 {
+            NSApp.terminate(nil)
+            return
+        }
         buildPanel()
         applyLayout()
         refresh()
@@ -1360,6 +1411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.onToggleAll = { [weak self] in self?.toggleAll() }
         view.onTogglePin = { [weak self] in self?.togglePin() }
         view.onSetSource = { [weak self] mode in self?.setSource(mode) }
+        view.onQuit = { [weak self] in self?.quitApp() }
         view.onOpen = { [weak self] item in self?.open(item) }
         view.onCheck = { [weak self] item, on in on ? self?.ack(item) : self?.unack(item) }
         view.onDeadline = { [weak self] item, m in self?.setDeadline(item, minutes: m) }
@@ -1865,6 +1917,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 取消勾选：恢复对该会话的监控
     func unack(_ item: TaskItem) {
         post("/unack?id=\(item.id)")
+    }
+
+    /// 退出：先摘掉界面这个 LaunchAgent，否则 KeepAlive 会立刻把进程拉回来。
+    /// 只摘界面这一个——后台取数继续跑，下次打开浮窗立即就有数据。
+    @objc func quitApp() {
+        let boot = Process()
+        boot.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        boot.arguments = ["bootout", "gui/\(getuid())/com.taskpulse.ui"]
+        try? boot.run()
+        boot.waitUntilExit()
+        NSApp.terminate(nil)
     }
 
     /// 切换取数来源：api = 本机 token，web = 浏览器里用 cookie 取数
