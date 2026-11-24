@@ -64,6 +64,17 @@ say "客户端" "${APP}（票据签发方 ${ISSUER}）"
 say "登录账号" "${USER_NAME}"
 say "SDK" "ks-aimate ${SDK_VER:-未知}"
 say "票据范围" "${AUD}（目标域 ${TARGET_DOMAIN}，SDK 实际使用的那张）"
+
+SSO_STATE="${HOME}/.codeflicker/sso/.ks_sso/sso-state.json"
+COOKIES="$(PY -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(len(d.get("cookies") or []))
+except Exception:
+    print(0)
+' "$SSO_STATE" 2>/dev/null)"
+say "登录凭据" "${COOKIES} 条 cookie（${SSO_STATE}）"
 # 票的 aud 里没有目标域名 → 换到的是普通票，数据平台会以 401 拒掉
 if [ -n "$AUD" ] && [ "$AUD" != "-" ]; then
   case "$AUD" in
@@ -111,7 +122,12 @@ print("yes" if at and (time.time() * 1000 - at) < 180000 else "no")
 ' "$WEBSTATE" 2>/dev/null)"
 
 case "$DETAIL" in
-  *401*)  WHY="票据被数据平台拒绝（账号 ${USER_NAME}）" ;;
+  *401*)
+    if [ "${COOKIES:-0}" -lt 5 ]; then
+      WHY="本机没有登录凭据（cookie=${COOKIES}），需要扫码授权一次"
+    else
+      WHY="票据被数据平台拒绝（账号 ${USER_NAME}）"
+    fi ;;
   *403*)  WHY="账号 ${USER_NAME} 没有该接口权限" ;;
   *ModuleNotFoundError*) WHY="依赖没装上（内网源不通）" ;;
   *Connection*|*Timeout*|*timed*) WHY="连不上数据平台（网络）" ;;
@@ -126,5 +142,9 @@ else
   say "结论" "已切到 WEB。打开任意一个 DataAgent 页面即可开始，其余不用管。"
 fi
 echo
-echo "想用回 API 只需一步：在 ${APP} 里退出登录，用你自己的内网账号重登，然后重跑本脚本。"
+if [ "${COOKIES:-0}" -lt 5 ]; then
+  echo "想用 API 模式：双击同目录的 api_login.command，用快手 App 扫码授权一次（约 30 秒），之后长期可用。"
+else
+  echo "想用回 API 只需一步：在 ${APP} 里退出登录，用你自己的内网账号重登，然后重跑本脚本。"
+fi
 exit 0
