@@ -1,101 +1,131 @@
 const { chromium } = require("playwright");
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 
 const ext = path.resolve(__dirname, "../taskpulse-ext");
-const origin = "https://dataagent.corp.kuaishou.com";
-const app = origin + "/ai/data-agent";
-const home = app + "?demo=board";
-const existing = app + "?agentId=515&conversationId=11&openHistory=true";
-const unopen = { id: 12, agentId: 515, name: "订单链路字段核查" };
-const seed = Date.now() - 120000;
+const production = "https://dataagent.corp.kuaishou.com";
+const seed = Date.now() - 120_000;
 const task = { id: 11, agentId: 515, name: "验证 Spark 分区更新" };
+const unopened = { id: 12, agentId: 515, name: "订单链路字段核查" };
 const root = "#taskpulse-web-capsule";
-const dataKey = "tp-web-state-v1";
-async function trial() {
-  const profile = await fs.mkdtemp(path.join(os.tmpdir(), "taskpulse-web-"));
-  const channel = process.env.TP_TEST_BROWSER || "chromium";
-  const context = await chromium.launchPersistentContext(profile, {
-    channel, headless: true, viewport: { width: 1400, height: 880 },
-    ignoreDefaultArgs: ["--disable-extensions"],
-    args: ["--disable-extensions-except=" + ext, "--load-extension=" + ext,
-      "--disable-background-timer-throttling", "--disable-renderer-backgrounding"]
-  });
-  const fail = [];
+const stateKey = "tp-web-state-v1";
+const leaderKey = "tp-web-leader-v1";
+
+async function startFixture() {
   const requests = [];
-  const workers = [];
-  const track = worker => {
-    workers.push(worker.url());
-    worker.on("console", msg => {
-      if (msg.type() === "error" || msg.type() === "warning") console.log(channel, "worker:", msg.text());
-    });
-  };
-  context.serviceWorkers().forEach(track);
-  context.on("serviceworker", track);
-
   let updated = seed;
-  const json = (route, data) => route.fulfill({ json: { success: true, data } });
-  await context.route(origin + "/**", async route => {
-    const u = new URL(route.request().url());
-    if (u.pathname === "/ai/data-agent") {
-      return route.fulfill({ contentType: "text/html; charset=utf-8",
-        headers: { "Content-Security-Policy": "style-src 'unsafe-inline'; connect-src 'self'" }, body: `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>DataAgent · Test fixture</title>
-<style>body{background:#f2f6fa;margin:0;font:16px -apple-system,sans-serif;color:#20384d}header{height:59px;padding:23px 35px;border-bottom:1px solid #c9d9e6;background:#fff}aside{width:245px;top:106px;bottom:0;position:absolute;padding:35px;background:#e6edf4}article{margin:48px 0 0 342px}h1{font-size:32px}</style>
-<header>DataAgent</header><aside>会话<br><br>数据质量<br><br>验证 Spark 分区更新<br><br>订单链路字段核查</aside><article><h1>数据研发工作台</h1><p>用于浏览器自动化验收的示例会话。</p></article></html>` });
-    }
-    if (!u.pathname.startsWith("/rest/flow/api/v1/conversations/")) return route.fulfill({ status: 404 });
-    let from = "";
-    try { from = route.request().frame().url(); } catch {}
-    requests.push({ path: u.pathname, from });
-    if (u.pathname.endsWith("/list")) {
-      return json(route, {
-        groups: [{ name: "数据质量", conversations: [
-          { ...task, updateTime: updated, createTime: seed },
-          { ...unopen, updateTime: seed, createTime: seed }
-        ] }], ungrouped: { conversations: [] }
-      });
-    }
-    if (u.pathname.endsWith("/queue")) {
-      return json(route, { sessionState: u.pathname.includes("/11/") && updated === seed ? "BUSY" : "IDLE", pending: [] });
-    }
-    if (u.pathname.endsWith("/messages")) {
-      return json(route, { list: [{ sender: "assistant", id: "m" + updated,
-        createTime: u.pathname.includes("/11/") ? updated : seed, content: "Synthetic private reply" }] });
-    }
-    return route.fulfill({ status: 404 });
-  });
 
-  function monitor(page) {
-    page.on("pageerror", e => fail.push(e.message));
-    return page;
-  }
+  const server = http.createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    if (url.pathname === "/ai/data-agent") {
+      response.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "content-security-policy": "style-src 'self'; connect-src 'self'"
+      });
+      response.end('<!doctype html><meta charset="utf-8"><title>DataAgent fixture</title><h1>会话验收</h1>');
+      return;
+    }
+    if (!url.pathname.startsWith("/rest/flow/api/v1/conversations/")) {
+      response.writeHead(404).end();
+      return;
+    }
+    requests.push({ path: url.pathname, from: request.headers.referer || "" });
+    let data;
+    if (url.pathname.endsWith("/list")) {
+      data = { groups: [{ name: "数据质量", conversations: [
+        { ...task, updateTime: updated, createTime: seed },
+        { ...unopened, updateTime: seed, createTime: seed }
+      ] }], ungrouped: { conversations: [] } };
+    } else if (url.pathname.endsWith("/queue")) {
+      data = { sessionState: url.pathname.includes("/11/") && updated === seed ? "BUSY" : "IDLE", pending: [] };
+    } else if (url.pathname.endsWith("/messages")) {
+      const stamp = url.pathname.includes("/11/") ? updated : seed;
+      data = { list: [{ sender: "assistant", id: "m" + stamp, createTime: stamp, content: "Synthetic private reply" }] };
+    } else {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ success: true, data }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return {
+    server, requests, origin: "http://127.0.0.1:" + server.address().port,
+    releaseReply: () => { updated = Date.now() + 1; }
+  };
+}
+
+// Initial navigation from chrome.tabs.create can start before a Playwright route
+// attaches to the new tab. Serve the entire fixture as an actual local site.
+async function installFixtureCopy(dir, origin) {
+  const destination = path.join(dir, "extension");
+  await fs.cp(ext, destination, { recursive: true });
+  const host = new URL(origin).hostname;
+  const manifestPath = path.join(destination, "manifest.json");
+  const configPath = path.join(destination, "config.js");
+  const manifest = (await fs.readFile(manifestPath, "utf8")).replaceAll(production, "http://" + host);
+  const config = (await fs.readFile(configPath, "utf8")).replace(production, origin)
+    .replace('const match = page.href + "*";', 'const match = page.origin.replace(/:[0-9]+$/, "") + page.pathname + "*";');
+  await Promise.all([fs.writeFile(manifestPath, manifest), fs.writeFile(configPath, config)]);
+  return destination;
+}
+
+async function trial() {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "taskpulse-web-"));
+  const fixture = await startFixture();
+  const origin = fixture.origin;
+  const app = origin + "/ai/data-agent";
+  const home = app + "?demo=board";
+  const existing = app + "?agentId=515&conversationId=11&openHistory=true";
+  let context;
+  const pageErrors = [];
   try {
+    const extension = await installFixtureCopy(dir, origin);
+    context = await chromium.launchPersistentContext(path.join(dir, "profile"), {
+      channel: "chromium", headless: true, viewport: { width: 1400, height: 880 },
+      ignoreDefaultArgs: ["--disable-extensions"],
+      args: ["--disable-extensions-except=" + extension, "--load-extension=" + extension,
+        "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--no-proxy-server"]
+    });
+    const monitor = page => {
+      page.on("pageerror", error => pageErrors.push(error.message));
+      return page;
+    };
+    const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 10_000 });
     const page = monitor(context.pages()[0]);
     await page.goto(home);
-    await page.locator(root + " button.running").filter({ hasText: /^1$/ }).waitFor({ timeout: 16000 });
-    console.log(channel, "initial collection and styled capsule verified", workers);
+    await page.locator(root + " button.running").filter({ hasText: /^1$/ }).waitFor({ timeout: 16_000 });
+    console.log("Chromium installed the extension and rendered the page capsule");
+
+    const currentLeader = () => worker.evaluate(async key => (await chrome.storage.session.get(key))[key], leaderKey);
+    const leader = await currentLeader();
+    assert.ok(leader?.tabId);
+    const listReads = () => fixture.requests.filter(r => r.path.endsWith("/list")).length;
     const other = monitor(await context.newPage());
     await other.goto(existing);
     await page.bringToFront();
     await page.locator(root + " .all").click();
-    await page.locator(root + " [data-cid='11']").waitFor();
-    assert.equal((await page.locator(root + " [data-cid='11']").textContent()).trim(), task.name);
-
-    const prior = requests.filter(r => r.path.endsWith("/list") && r.from === home).length;
-    assert.equal(prior, 1);
-    assert.ok(requests.every(r => r.from !== existing), JSON.stringify(requests));
-    const browserWorker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker");
-    assert.equal(await browserWorker.evaluate(async () =>
+    const first = page.locator(root + " [data-cid='11']");
+    await first.waitFor();
+    assert.equal((await first.textContent()).trim(), task.name);
+    assert.equal((await currentLeader()).tabId, leader.tabId);
+    assert.equal(listReads(), 1);
+    assert.equal(await worker.evaluate(async () =>
       (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]?.url), home);
-    updated = Date.now() + 1;
-    await page.locator(root + " button.attention").filter({ hasText: /^1$/ }).waitFor({ timeout: 39000 });
-    const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker");
-    const saved = await worker.evaluate(async key => (await chrome.storage.local.get(key))[key], dataKey);
+
+    fixture.releaseReply();
+    await page.locator(root + " button.attention").filter({ hasText: /^1$/ }).waitFor({ timeout: 42_000 });
+    const saved = await worker.evaluate(async key => (await chrome.storage.local.get(key))[key], stateKey);
     assert.equal(saved.tasks["11"].status, "attention");
-    assert.ok(saved.tasks["11"].notified, JSON.stringify(saved.tasks["11"]));
+    assert.ok(saved.tasks["11"].notified);
     assert.ok(!JSON.stringify(saved).includes("Synthetic private reply"));
+
     const notifications = async () => Object.keys(await worker.evaluate(() => chrome.notifications.getAll()))
       .filter(id => id.startsWith("tp-reply:11/"));
     let notices = await notifications();
@@ -105,41 +135,45 @@ async function trial() {
     }
     assert.equal(notices.length, 1);
 
-    await page.locator(root + " [data-cid='11']").click();
-    await page.locator(root + " button.attention").filter({ hasText: /^0$/ }).waitFor({ timeout: 8000 });
+    await first.click();
+    await page.locator(root + " button.attention").filter({ hasText: /^0$/ }).waitFor({ timeout: 8_000 });
     assert.equal(context.pages().length, 2);
-    const activated = await worker.evaluate(async () => (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]?.url);
-    assert.equal(activated, existing);
-    console.log(channel, "single collector, system notification registration, existing-tab navigation and ack verified");
+    assert.equal(await worker.evaluate(async () =>
+      (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]?.url), existing);
+    console.log("Single collector, system notification registration, existing-tab jump and acknowledgement passed");
 
     await page.bringToFront();
     await page.locator(root + " .panel").waitFor({ state: "hidden" });
     await page.locator(root + " .all").click();
-    const newTab = context.waitForEvent("page");
+    const newTab = context.waitForEvent("page", { timeout: 10_000 });
     await page.locator(root + " [data-cid='12']").click();
     const created = monitor(await newTab);
-    await created.waitForURL(/conversationId=12/);
+    await created.waitForURL(/conversationId=12/, { timeout: 12_000 });
     assert.equal(new URL(created.url()).origin, origin);
     assert.equal(new URL(created.url()).searchParams.get("agentId"), "515");
+
+    const beforeClosing = listReads();
     await page.close();
-    for (let i = 0; i < 80 && !requests.some(r => r.path.endsWith("/list") && r.from !== home); i++) {
+    for (let i = 0; i < 80 && listReads() <= beforeClosing; i++) {
       await new Promise(resolve => setTimeout(resolve, 125));
     }
-    assert.ok(requests.some(r => r.path.endsWith("/list") && r.from !== home), JSON.stringify(requests));
-    assert.deepEqual(fail, []);
-    console.log(channel, "new-tab navigation and handoff to a remaining collector verified");
+    const replacement = await currentLeader();
+    assert.ok(replacement?.tabId);
+    assert.notEqual(replacement.tabId, leader.tabId);
+    assert.ok(listReads() > beforeClosing);
+    assert.deepEqual(pageErrors, []);
+    console.log("New-tab jump and handoff to a remaining collector passed");
   } catch (error) {
-    const worker = context.serviceWorkers()[0];
-    const debug = await worker?.evaluate(async key => ({
-      state: (await chrome.storage.local.get(key))[key],
-      tabs: (await chrome.tabs.query({})).map(({ url, active }) => ({ url, active }))
-    }), dataKey).catch(() => null);
-    console.error("Browser fixture state:", JSON.stringify(debug));
-    console.error("Recent fixture requests:", JSON.stringify(requests.slice(-20)));
+    console.error("Fixture pages:", context?.pages().map(page => page.url()));
+    const worker = context?.serviceWorkers()[0];
+    const state = await worker?.evaluate(async key => (await chrome.storage.local.get(key))[key], stateKey).catch(() => null);
+    console.error("Fixture state:", JSON.stringify(state));
+    console.error("Recent fixture requests:", JSON.stringify(fixture.requests.slice(-16)));
     throw error;
   } finally {
-    await context.close();
-    await fs.rm(profile, { recursive: true, force: true });
+    await context?.close();
+    await new Promise(resolve => fixture.server.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
   }
 }
 
