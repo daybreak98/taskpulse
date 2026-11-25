@@ -1394,8 +1394,13 @@ def view(state: dict) -> dict:
 
     # 「已查看」的任务继续以暗色留在列表里，直到用户勾选（done）或关掉对应标签页。
     # 标签快照超过 5 分钟没更新时（Edge 没开/脚本失败）不退化成整片消失。
-    live = _edge_tabs.get("live") or set()
-    live_fresh = bool(_edge_tabs.get("ts")) and stamp - _edge_tabs["ts"] < 300_000
+    # 两个浏览器的标签快照合并判断：只用其中一个会把另一个里的任务当成「标签已关」
+    live: set[str] = set()
+    live_ts = 0
+    for cache in _tab_caches.values():
+        live |= cache.get("live") or set()
+        live_ts = max(live_ts, cache.get("ts") or 0)
+    live_fresh = bool(live_ts) and stamp - live_ts < 300_000
 
     def visible(r):
         if r["status"] == "done":
@@ -1564,8 +1569,8 @@ def ingest_tabs(payload: dict, ua: str = "") -> int:
 
 _edge_tabs = {"ts": 0, "map": {}, "live": set()}
 
-EDGE_TABS_SCRIPT = """
-tell application "Microsoft Edge"
+TABS_SCRIPT = """
+tell application "%(app)s"
   set out to ""
   set wi to 0
   repeat with w in windows
@@ -1585,11 +1590,22 @@ tell application "Microsoft Edge"
 end tell
 """
 
+# 会话标签可能开在 Edge 也可能开在 Chrome：缓存与 AppleScript 都按浏览器分开
+BROWSER_APP = {"edge": "Microsoft Edge", "chrome": "Google Chrome"}
+_tab_caches: dict[str, dict] = {}
 
-def snapshot_edge_tabs(timeout: float = 10) -> dict:
-    """一次取回所有标签的 (窗口序号, 标签序号)，供点击时 O(1) 定位。"""
+
+def _tabs_cache(app: str) -> dict:
+    return _tab_caches.setdefault(app, {"ts": 0, "map": {}, "live": set()})
+
+
+_edge_tabs = _tabs_cache(BROWSER_APP["edge"])
+
+
+def snapshot_edge_tabs(timeout: float = 10, app: str = BROWSER_APP["edge"]) -> dict:
+    """一次取回该浏览器所有标签的 (窗口序号, 标签序号)，供点击时 O(1) 定位。"""
     try:
-        out = subprocess.run(["osascript", "-e", EDGE_TABS_SCRIPT],
+        out = subprocess.run(["osascript", "-e", TABS_SCRIPT % {"app": app}],
                              capture_output=True, text=True, timeout=timeout, check=True).stdout
     except Exception:
         return {}
@@ -1611,29 +1627,81 @@ def snapshot_edge_tabs(timeout: float = 10) -> dict:
         if m:
             mapping["cid:" + m.group(1)] = pos
             live.add(m.group(1))
-    _edge_tabs["map"] = mapping
-    _edge_tabs["live"] = live
-    _edge_tabs["ts"] = now_ms()
+    cache = _tabs_cache(app)
+    cache["map"] = mapping
+    cache["live"] = live
+    cache["ts"] = now_ms()
     return mapping
 
 
-def focus_tab(win: int, tab: int) -> bool:
-    """一次 AppleScript 精确切到某窗口的第 N 个标签，不遍历。"""
-    script = (
-        'tell application "Microsoft Edge"\n'
-        f'  set index of window {win} to 1\n'
-        f'  set active tab index of window {win} to {tab}\n'
-        '  activate\n'
-        'end tell'
-    )
+FOCUS_TAB_SCRIPT = """
+tell application "%(app)s"
+  set u to ""
+  try
+    set u to (URL of tab %(tab)d of window %(win)d as text)
+  end try
+  if u does not contain "conversationId=%(cid)s" then return "stale"
+  set index of window %(win)d to 1
+  set active tab index of window %(win)d to %(tab)d
+  activate
+  return "ok"
+end tell
+"""
+
+FIND_TAB_SCRIPT = """
+tell application "%(app)s"
+  set wi to 0
+  repeat with w in windows
+    set wi to wi + 1
+    set ti to 0
+    repeat with t in tabs of w
+      set ti to ti + 1
+      set u to ""
+      try
+        set u to (URL of t as text)
+      end try
+      if u contains "conversationId=%(cid)s" then
+        set index of w to 1
+        set active tab index of w to ti
+        activate
+        return "ok"
+      end if
+    end repeat
+  end repeat
+  return "absent"
+end tell
+"""
+
+
+def _run_osa(script: str, timeout: float = 6) -> str:
     try:
-        done = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=6)
-        if done.returncode != 0:
-            log("focus_tab 失败 win=%s tab=%s: %s" % (win, tab, (done.stderr or b"").decode()[:120]))
-            return False
-        return True
+        done = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
     except Exception:
-        return False
+        return ""
+    if done.returncode != 0:
+        return ""
+    return (done.stdout or "").strip()
+
+
+def focus_tab(win: int, tab: int, app: str = BROWSER_APP["edge"], cid: str = "") -> bool:
+    """切到 (窗口序号, 标签序号)。
+
+    切之前先读一次那个位置的 URL 核对 conversationId：标签开开关关会让缓存的
+    序号漂移，直接 set active tab index 就可能停在别人的会话上——看起来就是
+    「点了 A 却跳到 B」。核对不上就当 miss，交给 find_tab 重新定位。
+    """
+    script = FOCUS_TAB_SCRIPT % {"app": app, "win": win, "tab": tab, "cid": cid}
+    out = _run_osa(script)
+    if out == "ok":
+        return True
+    if out != "stale":
+        log("focus_tab 失败 app=%s win=%s tab=%s: %s" % (app, win, tab, out[:120]))
+    return False
+
+
+def find_tab(cid: str, app: str = BROWSER_APP["edge"]) -> bool:
+    """按 conversationId 全量扫一遍再切（缓存 miss / 序号漂移时的兜底）。"""
+    return _run_osa(FIND_TAB_SCRIPT % {"app": app, "cid": cid}, timeout=10) == "ok"
 
 
 # ── 扩展命令通道：长轮询，避免 AppleScript 的一百多毫秒开销 ──────────
@@ -1721,20 +1789,32 @@ def open_conversation(cid: str) -> str:
     if not url:
         return "missing"
 
+    # 这个会话的标签在哪个浏览器里，由扩展上报决定；不知道时就两个都找
+    owner = _tab_browser.get(cid) or ""
+    app = BROWSER_APP.get(owner, "")
+    candidates = [app] if app else [BROWSER_APP["edge"], BROWSER_APP["chrome"]]
+
     key = "cid:" + cid
-    hit = _edge_tabs["map"].get(key)
-    if hit and focus_tab(*hit):
-        return "focused"
+    for a in candidates:
+        hit = _tabs_cache(a)["map"].get(key)
+        if hit and focus_tab(*hit, app=a, cid=cid):
+            return "focused"
 
-    # 缓存没命中：刷新一次全量再试（仍只调一次 AppleScript）
-    fresh = snapshot_edge_tabs()
-    hit = fresh.get(key) or fresh.get(url)
-    if hit and focus_tab(*hit):
-        return "focused"
+    # 缓存没命中或序号漂移：让 AppleScript 自己按 conversationId 定位，
+    # 成功后刷新该浏览器的快照，后面几次点击还是 O(1)
+    for a in candidates:
+        if find_tab(cid, app=a):
+            snapshot_edge_tabs(timeout=3, app=a)
+            return "focused"
 
+    # 兜底新开也要开在「这个会话所在的浏览器」：走系统默认浏览器的话，
+    # 会在另一个没登录的浏览器里打开，看起来像是跳错了页面
     log(f"open {cid}: no tab match, falling back to new tab")
+    args = ["open"] + (["-a", app] if app else [])
     try:
-        done = subprocess.run(["open", url], capture_output=True, timeout=10)
+        done = subprocess.run(args + [url], capture_output=True, timeout=10)
+        if done.returncode != 0 and app:
+            done = subprocess.run(["open", url], capture_output=True, timeout=10)
         if done.returncode != 0:
             log("open url 失败 cid=%s: %s" % (cid, (done.stderr or b"").decode()[:120]))
             return "failed"

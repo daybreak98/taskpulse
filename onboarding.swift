@@ -349,6 +349,12 @@ final class OnboardingController {
         pathRow.addArrangedSubview(linkButton("重新打开扩展页", #selector(reopenExtensions)))
         s.addArrangedSubview(pathRow)
 
+        // 引导一次只带一个浏览器：两个都用的用户需要知道另一边上同一套动作
+        let other = browserName.contains("Edge") ? "Chrome" : "Edge"
+        s.addArrangedSubview(label(
+            "两个浏览器都用？在 \(other) 的扩展页里重复这两步就行，选的是同一个 edge-ext 目录。",
+            size: 10.5, color: secondaryText))
+
         let hint = label("正在检测扩展上报…装好后这里会自动跳到「已连接」。",
                          size: 10.5, color: secondaryText)
         hint.identifier = NSUserInterfaceItemIdentifier("hint")
