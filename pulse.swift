@@ -1875,7 +1875,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let bin = target + "/Contents/MacOS/TaskPulse"
             cmd = "nohup sh -c 'sleep 1; exec \"\(bin)\"' >/dev/null 2>&1 &"
         } else {
-            cmd = "nohup sh -c \"sleep 1; open -a '\(target)'\" >/dev/null 2>&1 &"
+            // -n：强制新实例；open 失败（LaunchServices 还没登记这个新副本）时
+            // 直接执行二进制兜底——否则用户看到的是「窗口一闪，什么都没起来」。
+            let bin = target + "/Contents/MacOS/TaskPulse"
+            cmd = "nohup sh -c \"sleep 1; open -n '\(target)' || exec '\(bin)'\" >/dev/null 2>&1 &"
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
