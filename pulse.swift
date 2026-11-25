@@ -490,11 +490,27 @@ final class CapsuleView: NSView {
 final class PinView: NSView {
     var pinned = false { didSet { needsDisplay = true } }
     var onClick: (() -> Void)?
+    private var hovered = false { didSet { needsDisplay = true } }
 
     override var isFlipped: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
 
     override func draw(_ dirtyRect: NSRect) {
-        let c = pinned
+        // 悬浮时预览「点下去之后会变成什么样」：未固定的先给黄色实心，
+        // 已固定的先给取消后的灰色描边，省得点之前还要猜
+        let preview = hovered ? !pinned : pinned
+        let c = preview
             ? palette["attention"]!
             : secondaryText.withAlphaComponent(0.75)
         let cx = bounds.midX, cy = bounds.midY
@@ -506,7 +522,7 @@ final class PinView: NSView {
         stem.lineWidth = 1.3
         stem.lineCapStyle = .round
 
-        if pinned {
+        if preview {
             c.setFill(); head.fill()
             c.setStroke(); stem.stroke()
         } else {
