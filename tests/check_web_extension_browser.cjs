@@ -86,6 +86,9 @@ async function trial() {
     const prior = requests.filter(r => r.path.endsWith("/list") && r.from === home).length;
     assert.equal(prior, 1);
     assert.ok(requests.every(r => r.from !== existing), JSON.stringify(requests));
+    const browserWorker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker");
+    assert.equal(await browserWorker.evaluate(async () =>
+      (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]?.url), home);
     updated = Date.now() + 1;
     await page.locator(root + " button.attention").filter({ hasText: /^1$/ }).waitFor({ timeout: 39000 });
     const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker");
@@ -125,6 +128,15 @@ async function trial() {
     assert.ok(requests.some(r => r.path.endsWith("/list") && r.from !== home), JSON.stringify(requests));
     assert.deepEqual(fail, []);
     console.log(channel, "new-tab navigation and handoff to a remaining collector verified");
+  } catch (error) {
+    const worker = context.serviceWorkers()[0];
+    const debug = await worker?.evaluate(async key => ({
+      state: (await chrome.storage.local.get(key))[key],
+      tabs: (await chrome.tabs.query({})).map(({ url, active }) => ({ url, active }))
+    }), dataKey).catch(() => null);
+    console.error("Browser fixture state:", JSON.stringify(debug));
+    console.error("Recent fixture requests:", JSON.stringify(requests.slice(-20)));
+    throw error;
   } finally {
     await context.close();
     await fs.rm(profile, { recursive: true, force: true });

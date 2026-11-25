@@ -77,6 +77,22 @@ test("短任务回归：队列先空闲仍保留运行中，列表和回复补�
   assert.equal(repeated.task.replyKey, changed.task.replyKey);
 });
 
+test("回复接口比列表先返回新消息时，列表补齐后仍能通知", () => {
+  const { next } = timeline();
+  next(report(now, row(), { busy: true }));
+  const updated = now + 4_000;
+  const early = next(report(now + 6_000, row(), {
+    message: message(old, now + 6_000, "reply", { atMessage: updated })
+  }));
+  assert.equal(early.task.status, "running");
+  assert.equal(early.replies.length, 0);
+  const complete = next(report(now + 30_000, row(updated), {
+    message: message(updated, now + 30_000, "reply", { atMessage: updated })
+  }));
+  assert.equal(complete.task.status, "attention");
+  assert.equal(complete.replies.length, 1);
+});
+
 test("仅有用户消息或未知队列时不发新回复通知", () => {
   const { next } = timeline();
   next(report(now, row()));

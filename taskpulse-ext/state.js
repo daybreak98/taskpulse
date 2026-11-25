@@ -150,7 +150,10 @@
       const message = latestMessage(report, task, at);
       if (busy !== null && sampleAt > task.observedAt && sampleAt <= at) {
         applyQueue(task, sampleAt, busy, message);
-        if (busy === false && message?.sender === "assistant" && !task.pending && update <= task.acked) {
+        // A new assistant message can arrive before the list timestamp catches up.
+        // While a run is settling, the current list version is still historical.
+        if (busy === false && message?.sender === "assistant" && task.status === "seen" &&
+            update <= task.acked && time(message.atMessage) <= task.acked) {
           task.lastAssistant = message.messageId || task.lastAssistant;
         }
       }
