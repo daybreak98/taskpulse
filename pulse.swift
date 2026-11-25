@@ -2,6 +2,7 @@
 // 编译：swiftc -O pulse.swift -o TaskPulse
 
 import AppKit
+import Darwin
 import Foundation
 
 /// 后台服务的端口跟 poller 共用 ~/.taskpulse/config.json，没配就用 8899
@@ -75,19 +76,17 @@ func dbg(_ s: String) {
     let dir = Bootstrap.home + "/Library/Logs"
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     let path = dir + "/taskpulse-app.log"
-    if !FileManager.default.fileExists(atPath: path) {
-        FileManager.default.createFile(atPath: path, contents: nil)
-    }
     // 长期运行别把磁盘写满：超过 1MB 只留最后 200KB
     if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
        let size = attrs[.size] as? Int, size > 1_000_000,
        let data = FileManager.default.contents(atPath: path) {
         try? data.suffix(200_000).write(to: URL(fileURLWithPath: path))
     }
-    guard let h = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) else { return }
-    h.seekToEndOfFile()
-    h.write("(\(Int(Date().timeIntervalSince1970 * 1000))) \(s)\n".data(using: .utf8)!)
-    try? h.close()
+    // 安装器与新 App 交接时可能同时写日志，追加写避免互相覆盖。
+    let fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o600)
+    guard fd >= 0 else { return }
+    let h = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    try? h.write(contentsOf: Data("(\(Int(Date().timeIntervalSince1970 * 1000))) \(s)\n".utf8))
 }
 
 let CARD_W: CGFloat = 240
@@ -1713,25 +1712,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        // 从「下载」里双击运行：先把自己装到 ~/Applications，
-        // 这样启动台和 Spotlight 才找得到，之后用户从那里打开。
-        if installSelfIfNeeded() { return }
-        // 退出按钮会摘掉 LaunchAgent，之后用户双击 App 是「手工启动」的。
-        // 若再登录，launchd 也会拉起一个——两个面板叠一起。这里保证只有一个。
-        let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
-        // 自检开关：两台实例同 bundle id 时，隔离测试会被这条挡掉
-        let skipInstanceCheck = ProcessInfo.processInfo.environment["TP_SKIP_INSTANCE_CHECK"] == "1"
-        if running.count > 1 && !skipInstanceCheck {
-            // 同上：先把已有窗口叫到前面，避免看起来像闪退
-            running.first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier })?
-                .activate(options: [.activateAllWindows])
-            dbg("已有实例在运行（running=\(running.count)），激活并退出")
-            NSApp.terminate(nil)
+        if !isInstalledCopy {
+            installSelf()
             return
         }
         dbg("进入主流程 ready=\(Bootstrap.isReady())")
         buildPanel()
         applyLayout()
+        dbg("TaskPulse 界面已启动：\(Bundle.main.bundlePath)")
         refresh()
         // 首次打开：先把运行环境准备到用户目录（原来由 install.command 做），
         // 之后再起后台。已经初始化过的机器直接起，跳过一次额外检查。
@@ -1790,101 +1778,129 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    private var installedSelf = false
-
-    /// 把当前这份 App 复制到 ~/Applications 并重启到那里。
-    /// 返回 true 表示本次启动到此为止（调用方直接 return）。
-    ///
-    /// 不覆盖更新的副本：从下载目录又双击了旧 ZIP 时，直接启动已装好的那份，
-    /// 避免把新版盖掉。版本号用 Info.plist 的 CFBundleVersion（构建日期）。
-    private func installSelfIfNeeded() -> Bool {
-        let selfPath = Bundle.main.bundlePath
-        let target = Bootstrap.home + "/Applications/TaskPulse.app"
-        if selfPath == target { return false }
-
-        let fm = FileManager.default
+    /// 安装器在目标 App 启动前保持可见，失败时允许重试。
+    private func installSelf() {
+        let source = Bundle.main.bundleURL
+        let target = installedAppURL
         let mine = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? ""
-        let existing = (Bundle(path: target)?.infoDictionary?["CFBundleVersion"] as? String) ?? ""
-
-        // 只有磁盘上那份「更新」才跳过；版本相同也覆盖，避免同一天多次构建
-        // 时双击下载目录里的包却启动了旧副本
-        if !existing.isEmpty && existing > mine {
-            dbg("已安装 \(existing)（当前 \(mine)），直接启动它")
-            launchLater(target)
-            NSApp.terminate(nil)
-            return true
+        let config = target.appendingPathComponent("Contents/Info.plist")
+        let metadata = (try? Data(contentsOf: config)).flatMap {
+            (try? PropertyListSerialization.propertyList(from: $0, format: nil)) as? [String: Any]
+        }
+        let existing = metadata?["CFBundleVersion"] as? String ?? ""
+        if existing.compare(mine, options: .numeric) == .orderedDescending,
+           FileManager.default.isExecutableFile(atPath: target.appendingPathComponent("Contents/MacOS/TaskPulse").path) {
+            dbg("已安装较新版本 \(existing)（当前 \(mine)）")
+            openInstalledApp()
+            return
         }
 
-        dbg("自我安装：\(selfPath) -> \(target)（当前 \(mine)，已装 \(existing.isEmpty ? "无" : existing)）")
+        dbg("自我安装：\(source.path) -> \(target.path)（当前 \(mine)，已装 \(existing.isEmpty ? "无" : existing)）")
         OnboardingController.shared.showInstalling()
         DispatchQueue.global(qos: .userInitiated).async {
-            // 升级时旧版本可能正在运行：先让它退出，否则新实例启动会被
-            // 单实例检查（running.count > 1）直接挡回去，看起来像「没装上」
-            Self.stopOtherInstances()
             do {
-                if fm.fileExists(atPath: target) { try fm.removeItem(atPath: target) }
-                try fm.createDirectory(atPath: (target as NSString).deletingLastPathComponent,
-                                       withIntermediateDirectories: true)
-                try fm.copyItem(atPath: selfPath, toPath: target)
+                try Self.replaceInstalledApp(from: source, to: target)
                 dbg("自我安装：复制完成，准备启动新位置")
-                DispatchQueue.main.async {
-                    self.launchLater(target)
-                    NSApp.terminate(nil)
-                }
+                DispatchQueue.main.async { self.openInstalledApp() }
             } catch {
-                dbg("自我安装失败：\(error)")
-                DispatchQueue.main.async {
-                    // 装不过去也不耽误用：继续在当前路径跑
-                    self.installedSelf = true
-                    OnboardingController.shared.hidePanel()
-                    if Bootstrap.isReady() {
-                        self.poller.startIfNeeded()
-                    } else {
-                        self.runBootstrap()
-                    }
+                DispatchQueue.main.async { self.installFailed(error.localizedDescription) }
+            }
+        }
+    }
+
+    private func installFailed(_ message: String) {
+        OnboardingController.shared.showInstallFailure(message) { [weak self] in self?.installSelf() }
+        dbg("自我安装失败：\(message)")
+    }
+
+    private static func replaceInstalledApp(from source: URL, to target: URL) throws {
+        let fm = FileManager.default
+        let applications = target.deletingLastPathComponent()
+        try fm.createDirectory(at: applications, withIntermediateDirectories: true)
+        let staging = applications.appendingPathComponent(".taskpulse-install-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: staging, withIntermediateDirectories: false)
+        var keepBackup = false
+        defer {
+            if !keepBackup { try? fm.removeItem(at: staging) }
+        }
+        let incoming = staging.appendingPathComponent("TaskPulse.app", isDirectory: true)
+        try fm.copyItem(at: source, to: incoming)
+        guard fm.isExecutableFile(atPath: incoming.appendingPathComponent("Contents/MacOS/TaskPulse").path) else {
+            throw installError("复制的 App 缺少可执行文件。")
+        }
+
+        // 先完整复制，再结束正在使用安装路径的旧进程。别结束其他目录里的安装器。
+        let others = taskPulseInstances().filter { $0.bundleURL.map(bundlePath) == bundlePath(target) }
+        for instance in others { instance.terminate() }
+        let deadline = Date().addingTimeInterval(3)
+        while others.contains(where: { !$0.isTerminated }) {
+            guard Date() < deadline else {
+                throw installError("旧版 TaskPulse 尚未退出。请退出旧版后重试。")
+            }
+            usleep(100_000)
+        }
+
+        if !fm.fileExists(atPath: target.path) {
+            try fm.moveItem(at: incoming, to: target)
+            return
+        }
+        let backup = staging.appendingPathComponent("Previous.app", isDirectory: true)
+        try fm.moveItem(at: target, to: backup)
+        do {
+            try fm.moveItem(at: incoming, to: target)
+        } catch let installFailure {
+            do {
+                try fm.moveItem(at: backup, to: target)
+            } catch {
+                keepBackup = true
+                throw installError("替换失败：\(installFailure.localizedDescription)。旧版备份：\(backup.path)")
+            }
+            throw installFailure
+        }
+    }
+
+    private static func installError(_ description: String) -> NSError {
+        NSError(domain: "TaskPulse.Install", code: 1, userInfo: [NSLocalizedDescriptionKey: description])
+    }
+
+    private func openInstalledApp() {
+        OnboardingController.shared.showInstalling("打开已安装的 TaskPulse…")
+        if let running = taskPulseInstances().first(where: { $0.bundleURL.map(bundlePath) == bundlePath(installedAppURL) }) {
+            confirmInstalledLaunch(running, until: Date().addingTimeInterval(8))
+            return
+        }
+        let options = NSWorkspace.OpenConfiguration()
+        options.createsNewApplicationInstance = true
+        if let home = ProcessInfo.processInfo.environment["TP_HOME"] {
+            options.environment = ["TP_HOME": home]
+        }
+        NSWorkspace.shared.openApplication(at: installedAppURL, configuration: options) { app, error in
+            DispatchQueue.main.async {
+                if let error {
+                    self.installFailed("无法打开已安装的 App：\(error.localizedDescription)")
+                } else if let app, app.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+                    self.confirmInstalledLaunch(app, until: Date().addingTimeInterval(8))
+                } else {
+                    self.installFailed("系统未启动已安装的 TaskPulse。")
                 }
             }
         }
-        return true
     }
 
-    /// 结束同 bundle id 的其他实例（升级时旧版本还开着）
-    private static func stopOtherInstances() {
-        let me = ProcessInfo.processInfo.processIdentifier
-        let others = NSRunningApplication
-            .runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
-            .filter { $0.processIdentifier != me }
-        for app in others { app.terminate() }
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            let alive = NSRunningApplication
-                .runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
-                .filter { $0.processIdentifier != me && !$0.isTerminated }
-            if alive.isEmpty { break }
-            usleep(120_000)
+    private func confirmInstalledLaunch(_ app: NSRunningApplication, until deadline: Date) {
+        guard !app.isTerminated, Date() < deadline else {
+            installFailed("已安装的 TaskPulse 在启动完成前退出或未响应。")
+            return
         }
-        dbg("自我安装：已结束 \(others.count) 个旧实例")
-    }
-
-    /// 延迟 1 秒再启动目标 App：本实例要先退出，否则目标的单实例检查会把它挡回去
-    private func launchLater(_ target: String) {
-        let env = ProcessInfo.processInfo.environment
-        let cmd: String
-        if let tpHome = env["TP_HOME"], !tpHome.isEmpty {
-            // 自检：open 不传递环境变量，直接起二进制才能把隔离家目录带过去
-            let bin = target + "/Contents/MacOS/TaskPulse"
-            cmd = "nohup sh -c 'sleep 1; exec \"\(bin)\"' >/dev/null 2>&1 &"
-        } else {
-            // -n：强制新实例；open 失败（LaunchServices 还没登记这个新副本）时
-            // 直接执行二进制兜底——否则用户看到的是「窗口一闪，什么都没起来」。
-            let bin = target + "/Contents/MacOS/TaskPulse"
-            cmd = "nohup sh -c \"sleep 1; open -n '\(target)' || exec '\(bin)'\" >/dev/null 2>&1 &"
+        if app.isFinishedLaunching, app.bundleURL.map(bundlePath) == bundlePath(installedAppURL) {
+            app.activate(options: [.activateAllWindows])
+            dbg("自我安装：已打开目标 App")
+            NSApp.terminate(nil)
+            return
         }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", cmd]
-        try? p.run()
-        p.waitUntilExit()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            self.confirmInstalledLaunch(app, until: deadline)
+        }
     }
 
     private var bootstrapRunning = false
@@ -2656,27 +2672,33 @@ if CommandLine.arguments.contains("--bootstrap-check") {
     }
 }
 
-// 启动埋点：闪退时这行是唯一线索，所以放在最前面
+private func bundlePath(_ url: URL) -> String {
+    url.standardizedFileURL.resolvingSymlinksInPath().path
+}
+
+private func taskPulseInstances() -> [NSRunningApplication] {
+    let me = ProcessInfo.processInfo.processIdentifier
+    return NSRunningApplication.runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
+        .filter { $0.processIdentifier != me && !$0.isTerminated }
+}
+
+private let installedAppURL = URL(fileURLWithPath: Bootstrap.home, isDirectory: true)
+    .appendingPathComponent("Applications/TaskPulse.app", isDirectory: true)
+private let isInstalledCopy = bundlePath(Bundle.main.bundleURL) == bundlePath(installedAppURL)
+
+// 启动埋点：在实例锁前记录进程与 App 路径。
 dbg("启动 pid=\(getpid()) path=\(Bundle.main.bundlePath)")
 
-// 单实例：两把锁分开。
-//   - 已安装的那份（~/Applications）用 ui.lock，保证「只开一个窗口」
-//   - 从下载目录双击的那份用 installer.lock，它的职责是装/升级
-// 如果共用一把锁，升级时安装器会被正在运行的旧版本直接挡在 main 里，
-// 表现为「双击新包没反应」。
-try? FileManager.default.createDirectory(atPath: Bootstrap.stateDir,
-                                         withIntermediateDirectories: true)
-let isInstalledCopy = Bundle.main.bundlePath == Bootstrap.home + "/Applications/TaskPulse.app"
+// 安装器与已安装 App 持有不同的锁，可以同时完成交接。
+try? FileManager.default.createDirectory(atPath: Bootstrap.stateDir, withIntermediateDirectories: true)
 let lockPath = Bootstrap.stateDir + (isInstalledCopy ? "/ui.lock" : "/installer.lock")
-if !FileManager.default.fileExists(atPath: lockPath) {
-    FileManager.default.createFile(atPath: lockPath, contents: nil)
-}
-let appLock = try? FileHandle(forWritingTo: URL(fileURLWithPath: lockPath))
-if let appLock, flock(appLock.fileDescriptor, LOCK_EX | LOCK_NB) != 0 {
-    // 已经有一个在跑：把它叫到前面来再退出。
-    // 以前这里是静默 exit(0)，用户双击第二次时看到的就是「闪退」。
-    NSRunningApplication.runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
-        .first?.activate(options: [.activateAllWindows])
+let lockFD = open(lockPath, O_CREAT | O_WRONLY | O_CLOEXEC, 0o600)
+let appLock = lockFD >= 0 ? FileHandle(fileDescriptor: lockFD, closeOnDealloc: true) : nil
+if let appLock, flock(appLock.fileDescriptor, LOCK_EX | LOCK_NB) != 0, errno == EWOULDBLOCK {
+    taskPulseInstances().first(where: {
+        guard let url = $0.bundleURL else { return false }
+        return (bundlePath(url) == bundlePath(installedAppURL)) == isInstalledCopy
+    })?.activate(options: [.activateAllWindows])
     dbg("已有实例在运行（\(isInstalledCopy ? "ui" : "installer")），激活它并退出")
     exit(0)
 }

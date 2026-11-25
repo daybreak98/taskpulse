@@ -288,16 +288,21 @@ final class OnboardingController {
     }
 
     /// 首次从「下载」里运行时，先把 App 自己装进 ~/Applications
-    func showInstalling() {
+    func showInstalling(_ step: String = "安装到「应用程序」文件夹…") {
         show()
-        renderBootstrapping("安装到「应用程序」文件夹…")
+        renderBootstrapping(step)
     }
 
-    /// 自我安装失败时收尾，回到正常流程（名字避开已有的 @objc dismiss）
-    func hidePanel() {
-        panel?.orderOut(nil)
-        panel = nil
-        NSApp.setActivationPolicy(.accessory)
+    func showInstallFailure(_ message: String, retry: @escaping () -> Void) {
+        bootstrapRetry = retry
+        show()
+        let s = newBody()
+        s.addArrangedSubview(label("TaskPulse 安装没完成", size: 16, weight: .semibold,
+                                   color: palette["attention"] ?? mainText))
+        s.addArrangedSubview(label(message, size: 11.5, color: mainText))
+        s.addArrangedSubview(actionButton("重试", #selector(retryBootstrap), key: "\r"))
+        s.addArrangedSubview(linkButton("打开日志目录", #selector(revealLogs)))
+        fitHeight()
     }
 
     private func beginBootstrap() {

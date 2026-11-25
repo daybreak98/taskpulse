@@ -27,6 +27,8 @@ jobs:
             swiftc -O -target "$arch-apple-macos13.0" "$RUNNER_TEMP/main.swift" onboarding.swift Bootstrap.swift \
               -framework Cocoa -o "$RUNNER_TEMP/TaskPulse-$arch"
           done
+      - name: Smoke test app self-installation
+        run: bash tests/check_self_install.sh "$RUNNER_TEMP/TaskPulse-$(uname -m)"
       - name: Check extension and package script syntax
         run: |
           node --check edge-ext/background.js
