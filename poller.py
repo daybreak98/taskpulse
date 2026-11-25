@@ -1290,6 +1290,8 @@ def view(state: dict) -> dict:
             "url": task.get("url"),
             "deadline": task.get("deadline"),
             "important": bool(task.get("important")),
+            # 浏览器里是否有这个会话的标签页：菜单要用它算「能关多少个」
+            "has_tab": str(task["id"]) in _tab_ids,
             "deadline_left": (int((task["deadline"] - stamp) / 1000)
                               if task.get("deadline") else None),
             "overdue": bool(task.get("deadline") and stamp >= task["deadline"]),
@@ -1536,6 +1538,8 @@ _cmd_done: dict[str, float] = {}    # 已经执行或已过期，防止迟到的
 # 只有标签真的切过去才据此标已读，且用点击时的版本判定，新回复不会被顺带吃掉
 _open_pending: dict[str, tuple[str, int]] = {}
 _cmd_acks: dict[str, float] = {}
+# cmd_id -> 扩展回报的执行结果（如 {"result": "closed", "n": 12}）
+_cmd_results: dict[str, dict] = {}
 _cmd_t0: dict[str, float] = {}      # cmd_id -> 入队时刻，用于量跳转耗时
 _cmd_waiters = 0                    # 当前有多少个扩展长轮询正挂着等命令
 _cmd_waiters_lock = threading.Lock()
@@ -2047,6 +2051,10 @@ class Handler(BaseHTTPRequestHandler):
                 _confirm_open(*pending)
             t0 = _cmd_t0.pop(cid, None)
             how = (query.get("result") or [""])[0]
+            try:
+                _cmd_results[cid] = {"result": how, "n": int(query.get("n", ["0"])[0])}
+            except ValueError:
+                _cmd_results[cid] = {"result": how, "n": 0}
             if t0:
                 # 带上扩展实际怎么做的：focused 聚焦已有标签、navigated 在现有页面
                 # 里切会话、created 新开、expired 命令已过期未执行
@@ -2102,6 +2110,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "无效的截止时间"}, 400)
                 return
 
+        if parsed.path == "/tabs/close":
+            mode = (query.get("mode") or ["24h"])[0]
+            closed = close_conversation_tabs(mode)
+            self._json({"ok": closed is not None, "closed": closed or 0, "mode": mode})
+            return
+
         if parsed.path not in ("/ack", "/unack", "/active", "/deadline", "/important"):
             self._json({"error": "not found"}, 404)
             return
@@ -2136,6 +2150,61 @@ class Handler(BaseHTTPRequestHandler):
                 if changed:
                     save_state(state)
         self._json({"ok": changed})
+
+
+# ── 批量关闭会话标签 ────────────────────────────────────────────────
+
+# mode -> 最长空闲小时数；0 表示不看空闲时长，只按「没在工作」筛
+CLOSE_TAB_MODES = {"idle": 0, "1h": 1, "6h": 6, "24h": 24}
+
+
+def closeable_tabs(mode: str) -> list[tuple[str, int]]:
+    """挑出可以关标签的会话，返回 [(cid, tabId)]。
+
+    只关「浏览器里有标签」且「没在跑」的会话：正在跑的任务把标签关掉，
+    用户就看不到中间过程了。空闲时长按 update_ms 算——那是会话最后一次
+    有更新的时刻，比我们自己记录的采样时间更贴近真实。
+    """
+    hours = CLOSE_TAB_MODES.get(mode, CLOSE_TAB_MODES["24h"])
+    stamp = now_ms()
+    tasks = load_state().get("tasks") or {}
+    out: list[tuple[str, int]] = []
+    for cid, tab in list(_tab_ids.items()):
+        task = tasks.get(cid) or {}
+        if not task:
+            continue
+        if task.get("status") in ("running", "stuck"):
+            continue
+        last = max(task.get("update_ms") or 0, task.get("acked_at") or 0)
+        if hours and last and stamp - last < hours * 3600_000:
+            continue
+        out.append((cid, tab))
+    return out
+
+
+def close_conversation_tabs(mode: str) -> int | None:
+    """把要关的标签交给扩展执行；返回实际关闭数，扩展不在线返回 None。"""
+    targets = closeable_tabs(mode)
+    if not targets:
+        return 0
+    owner = _tab_browser.get(targets[0][0]) or ""
+    if not owner or (time.time() - _ext_seen) >= 20 or _cmd_waiters <= 0:
+        return None
+    cmd_id = "close-%d" % int(time.time() * 1000)
+    _cmd_queue(owner).put({
+        "cmd": "closeTabs",
+        "tabIds": {cid: tab for cid, tab in targets},
+        "id": cmd_id,
+        "expires": int(time.time() * 1000) + 15000,
+    })
+    # 等扩展回报实际关了几个；超过 5 秒就当作没关成
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        got = _cmd_results.pop(cmd_id, None)
+        if got is not None:
+            return int(got.get("n") or 0)
+        time.sleep(0.05)
+    return 0
 
 
 # ── 主循环 ──────────────────────────────────────────────────────────

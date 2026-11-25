@@ -111,6 +111,37 @@ async function notifyActive(tabId) {
 }
 
 // 按 conversationId 找到标签并切过去；找不到才新开
+// 批量关闭会话标签：TaskPulse 已经按「没在工作 / 多久没更新」筛好了名单，
+// 这里只负责关，并在关之前核对 URL——用户可能在两次上报之间又切了别的会话。
+async function closeTabsFor(map, expires) {
+  if (!!expires && Date.now() > expires) return 0;
+  let closed = 0;
+  for (const cid of Object.keys(map || {})) {
+    const wanted = map[cid];
+    let hit = null;
+    if (typeof wanted === "number") {
+      try {
+        const t = await chrome.tabs.get(wanted);
+        const re = new RegExp("[?&]conversationId=" + cid + "(?:[&#]|$)");
+        if (t && t.url && re.test(t.url)) hit = t;
+      } catch (_) {}
+    }
+    if (!hit && SCOPE) {
+      try {
+        const tabs = await chrome.tabs.query({ url: SCOPE });
+        const re = new RegExp("[?&]conversationId=" + cid + "(?:[&#]|$)");
+        hit = tabs.find((t) => t.url && re.test(t.url));
+      } catch (_) {}
+    }
+    if (!hit) continue;
+    try {
+      await chrome.tabs.remove(hit.id);
+      closed += 1;
+    } catch (_) {}
+  }
+  return closed;
+}
+
 async function focusConversation(cid, url, tabId, stale) {
   const re = new RegExp("[?&]conversationId=" + cid + "(?:[&#]|$)");
   let hit = null;
@@ -156,6 +187,19 @@ async function listen() {
       const r = await fetch(CMD_ENDPOINT, { cache: "no-store", headers: authHeaders() });
       if (r.status === 200) {
         const cmd = await r.json();
+        if (cmd && cmd.cmd === "closeTabs") {
+          let n = 0;
+          try {
+            n = await closeTabsFor(cmd.tabIds || {}, cmd.expires);
+          } catch (_) {}
+          if (cmd.id) {
+            try {
+              await fetch(ACK_ENDPOINT + "?id=" + encodeURIComponent(cmd.id)
+                          + "&result=closed&n=" + n,
+                { method: "POST", headers: authHeaders() });
+            } catch (_) {}
+          }
+        }
         if (cmd && cmd.cmd === "focus" && cmd.cid) {
           const stale = !!cmd.expires && Date.now() > cmd.expires;
           let how = "unknown";

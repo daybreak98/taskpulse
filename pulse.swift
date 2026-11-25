@@ -109,6 +109,8 @@ struct TaskItem: Decodable, Equatable {
     let reply_version: String?
     /// 用户手动标的「完成后提醒我」：行更亮，回话弹窗常驻
     let important: Bool?
+    /// 浏览器里是否有这个会话的标签页（清理菜单据此算能关几个）
+    let has_tab: Bool?
 }
 struct Counts: Decodable, Equatable {
     let running: Int
@@ -727,6 +729,9 @@ final class TaskRowView: NSView {
     var onCheck: ((TaskItem, Bool) -> Void)?
     var onDeadline: ((TaskItem, Int?) -> Void)?
     var onImportant: ((TaskItem, Bool) -> Void)?
+    /// 菜单里的「清理标签页」：给出各档位能关几个，选中后执行
+    var onCloseTabCounts: (() -> [String: Int])?
+    var onCloseTabs: ((String) -> Void)?
     private var hovered = false
 
     init(item: TaskItem, width: CGFloat, checked: Bool, snapshotStale: Bool, dimmed: Bool = false) {
@@ -873,10 +878,43 @@ final class TaskRowView: NSView {
         menu.addItem(.separator())
         let clear = NSMenuItem(title: "清除截止时间", action: #selector(pickDeadline(_:)), keyEquivalent: "")
         clear.target = self; clear.tag = -1; menu.addItem(clear)
+
+        // 一批标签页越开越多，给个显式入口清理。四项同一级，彼此独立，
+        // 都只关「没在跑」的会话——正在跑的把标签关掉就看不到中间过程了。
+        menu.addItem(.separator())
+        for (title, mode) in closeTabModes() {
+            let n = closeTabCount(mode)
+            // 标题里带上会关掉几个：这是不可撤销的操作，先让人看清影响面
+            let mi = NSMenuItem(title: n > 0 ? "\(title)（\(n)）" : title,
+                                action: #selector(closeTabs(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = mode
+            mi.isEnabled = n > 0
+            menu.addItem(mi)
+        }
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
     @objc func pickDeadline(_ sender: NSMenuItem) {
         onDeadline?(item, sender.tag < 0 ? nil : sender.tag)
+    }
+
+    /// 四个清理档位：不指定时间（只关没在工作的）/ 1 / 6 / 24 小时未更新
+    private func closeTabModes() -> [(String, String)] {
+        [("关闭未工作的标签页", "idle"),
+         ("关闭 1 小时未查看的", "1h"),
+         ("关闭 6 小时未查看的", "6h"),
+         ("关闭 24 小时未查看的", "24h")]
+    }
+
+    /// 本地估算「这一档会关掉几个」，标题里带上，避免点了才发现影响面
+    private func closeTabCount(_ mode: String) -> Int {
+        guard let all = onCloseTabCounts?() else { return 0 }
+        return all[mode] ?? 0
+    }
+
+    @objc func closeTabs(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? String else { return }
+        onCloseTabs?(mode)
     }
 }
 
@@ -904,6 +942,9 @@ final class PulseView: NSView {
     var onCheck: ((TaskItem, Bool) -> Void)?
     var onDeadline: ((TaskItem, Int?) -> Void)?
     var onImportant: ((TaskItem, Bool) -> Void)?
+    /// 菜单里的「清理标签页」：给出各档位能关几个，选中后执行
+    var onCloseTabCounts: (() -> [String: Int])?
+    var onCloseTabs: ((String) -> Void)?
     var onToggleGroup: ((String) -> Void)?
 
     override var isFlipped: Bool { true }
@@ -1020,6 +1061,21 @@ final class PulseView: NSView {
         return h + 8
     }
 
+    /// 四个清理档位各自能关几个（只算浏览器里真的有标签、且没在跑、且够久没更新）
+    func closeTabCounts() -> [String: Int] {
+        let items = payload?.all ?? []
+        func count(hours: Int?) -> Int {
+            items.filter { t in
+                guard t.has_tab == true else { return false }
+                if t.status == "running" || t.status == "stuck" { return false }
+                guard let h = hours else { return true }
+                return t.idle_minutes >= h * 60
+            }.count
+        }
+        return ["idle": count(hours: nil), "1h": count(hours: 1),
+                "6h": count(hours: 6), "24h": count(hours: 24)]
+    }
+
     func contentWidth() -> CGFloat { compact ? COMPACT_W : CARD_W }
 
     func rebuild() {
@@ -1093,6 +1149,8 @@ final class PulseView: NSView {
                 t.onCheck = { [weak self] it, on in self?.onCheck?(it, on) }
                 t.onDeadline = { [weak self] it, m in self?.onDeadline?(it, m) }
                 t.onImportant = { [weak self] it, on in self?.onImportant?(it, on) }
+                t.onCloseTabCounts = { [weak self] in self?.closeTabCounts() ?? [:] }
+                t.onCloseTabs = { [weak self] mode in self?.onCloseTabs?(mode) }
                 addSubview(t)
                 y += TASK_ROW_H
             }
@@ -1117,6 +1175,8 @@ final class PulseView: NSView {
                 t.onCheck = { [weak self] it, on in self?.onCheck?(it, on) }
                 t.onDeadline = { [weak self] it, m in self?.onDeadline?(it, m) }
                 t.onImportant = { [weak self] it, on in self?.onImportant?(it, on) }
+                t.onCloseTabCounts = { [weak self] in self?.closeTabCounts() ?? [:] }
+                t.onCloseTabs = { [weak self] mode in self?.onCloseTabs?(mode) }
                 addSubview(t)
                 y += TASK_ROW_H
             }
@@ -1445,7 +1505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self?.showToast(TaskItem(id: 0, name: "测试提示条", group: nil, status: "attention",
                                              prev: nil, progress: 0, elapsed: 0, idle_minutes: 0,
                                              overdue: false, failed: nil, muted: nil, stale: nil,
-                                             reply_version: nil, important: nil),
+                                             reply_version: nil, important: nil, has_tab: nil),
                                    title: "测试提示条", body: "如果你看到这条，说明提示条正常")
                     return
                 }
@@ -1552,6 +1612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.onCheck = { [weak self] item, on in on ? self?.ack(item) : self?.unack(item) }
         view.onDeadline = { [weak self] item, m in self?.setDeadline(item, minutes: m) }
         view.onImportant = { [weak self] item, on in self?.setImportant(item, on) }
+        view.onCloseTabs = { [weak self] mode in self?.closeTabs(mode) }
         view.onDragStart = { [weak self] in self?.dragBegan() }
         view.onDragEnd = { [weak self] in self?.endDrag("mouseUp") }
         view.onToggleGroup = { [weak self] _ in self?.applyLayout() }
@@ -2123,6 +2184,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }.resume()
     }
 
+    /// 批量关掉没在用的会话标签；服务端按同一套规则再筛一次。
+    /// 单独实现而不用 post()：要把实际关掉的条数回显出来，用户才知道生效了。
+    func closeTabs(_ mode: String) {
+        guard let url = URL(string: endpoint + "/tabs/close?mode=\(mode)") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 12
+        withToken(&req)
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            let result = data.flatMap { try? JSONDecoder().decode(CloseResult.self, from: $0) }
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if code == 200, let n = result?.closed {
+                    self.view.actionMessage = n > 0 ? "已关闭 \(n) 个标签页" : "没有可关闭的标签页"
+                } else {
+                    self.view.actionMessage = "清理未完成，请重试"
+                }
+                self.applyLayout()
+                // 提示只是回执，别一直挂在标题栏
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    self?.view.actionMessage = nil
+                    self?.applyLayout()
+                }
+                self.nextReadAt = 0
+                self.refresh()
+            }
+        }.resume()
+    }
+
     /// 「完成后提醒我」：只影响展示与弹窗，不改状态判定
     func setImportant(_ item: TaskItem, _ on: Bool) {
         post("/important?id=\(item.id)&value=\(on ? 1 : 0)")
@@ -2136,6 +2227,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 private struct ActionResult: Decodable {
     let ok: Bool
+}
+
+private struct CloseResult: Decodable {
+    let ok: Bool
+    let closed: Int?
 }
 
 // 单实例
