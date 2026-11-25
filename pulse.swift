@@ -799,11 +799,16 @@ final class TaskRowView: NSView {
 
         let meta = metaText()
         let metaAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium),
-            .foregroundColor: item.overdue ? palette["stuck"]! : secondaryText.withAlphaComponent(0.92 * alpha),
+            // 和标题同字号：一眼看名次靠时间是第几近的交互
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium),
+            .foregroundColor: item.overdue ? palette["stuck"]! : secondaryText.withAlphaComponent(0.95 * alpha),
         ]
-        let metaW = (meta as NSString).size(withAttributes: metaAttrs).width
-        (meta as NSString).draw(at: NSPoint(x: w - 34 - metaW, y: TASK_ROW_H / 2 - 5.5), withAttributes: metaAttrs)
+        let metaSize = (meta as NSString).size(withAttributes: metaAttrs)
+        let metaW = metaSize.width
+        // 字号和标题一致（11.5），垂直居中按实际高度算，别用固定偏移
+        (meta as NSString).draw(at: NSPoint(x: w - 34 - metaW,
+                                            y: (TASK_ROW_H - metaSize.height) / 2),
+                                withAttributes: metaAttrs)
 
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11.5, weight: .medium),

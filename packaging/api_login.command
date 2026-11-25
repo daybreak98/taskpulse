@@ -79,6 +79,14 @@ echo
 read -r -p "准备好了按回车开始..." _
 
 rm -f "$HOME/.codeflicker/sso/.ks_sso/reauth.lock" 2>/dev/null
+
+# SDK 如果已有一个「无头」daemon 在跑，新的 headed 设置不会生效，窗口始终不出现。
+# 先把它关掉，让带界面的浏览器重新起来——用户更愿意相信自己在浏览器里看到的二维码，
+# 而不是一张图片。关不掉也不影响：后面还有截图兜底。
+if command -v agent-browser >/dev/null 2>&1; then
+  agent-browser --session ks-aimate-sso close >/dev/null 2>&1 || true
+  sleep 1
+fi
 # SDK 默认拿 headless 浏览器取二维码，然后打印一段 markdown 让「AI 助手」去展示——
 # 终端里的人根本看不到图。这里强制开可见窗口，用户直接扫；
 # --terminal 则改成在终端里画二维码（依赖 segno）。两条路都不需要额外操作。
