@@ -426,6 +426,8 @@ cat <<TIPS
 判断「限流」的关键词匹配也在页面内完成，消息原文不出浏览器。
 页面访问范围：${TP_SCOPE:-未配置}
 扩展目录：$DEST/edge-ext
+  ↑ 加载扩展时选这个目录。解压包 / Kim 缓存里那份没有 manifest.json，
+    选错了会报「清单文件缺失或不可读取」。
 
 想要卸载：运行 uninstall.command
 TIPS

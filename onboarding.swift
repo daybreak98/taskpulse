@@ -363,6 +363,13 @@ final class OnboardingController {
         pathRow.addArrangedSubview(linkButton("重新打开扩展页", #selector(reopenExtensions)))
         s.addArrangedSubview(pathRow)
 
+        // 用户最常踩的坑：跑去 Kim/下载目录里那份 edge-ext 上加载。
+        // 那份只有模板，没有 manifest.json，Chrome 会报「清单文件缺失」。
+        s.addArrangedSubview(label(
+            "加载时选的就是上面这个目录。解压包或 Kim / 下载目录里的 edge-ext 只有模板，"
+            + "没有 manifest.json，会报「清单文件缺失或不可读取」。",
+            size: 10.5, color: palette["attention"] ?? secondaryText))
+
         // 引导一次只带一个浏览器：两个都用的用户需要知道另一边上同一套动作
         let other = browserName.contains("Edge") ? "Chrome" : "Edge"
         s.addArrangedSubview(label(

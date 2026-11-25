@@ -135,6 +135,10 @@ xattr -dr com.apple.quarantine . && ./install.command
 
 > 拖拽方式也行：把访达里选中的 `edge-ext` 直接拖进扩展页中间的空区域。
 
+**⚠️ 最容易选错的地方**：要选的是 `~/Applications/TaskPulse/edge-ext`（引导窗口里显示的那个路径），
+**不是**解压包里的、也不是 Kim / 下载目录里的那份。那两份只有模板文件，没有 `manifest.json`，
+加载会报「清单文件缺失或不可读取」。
+
 引导窗口里会**完整显示**扩展目录路径（可选中复制），方便你在文件选择框里逐级找：
 
 ```
@@ -149,6 +153,7 @@ xattr -dr com.apple.quarantine . && ./install.command
 
 一直显示「正在检测扩展上报…」的话：
 
+- 确认加载的是 `~/Applications/TaskPulse/edge-ext`（不是解压包/Kim 缓存里那份）
 - 确认扩展在扩展页里是「已启用」（不是灰的）
 - 确认这个浏览器里**开着至少一个 DataAgent 会话页面**
 - 仍不行就点「重新打开扩展页」，点扩展卡片上的 ⟳ 重新加载一次
@@ -271,6 +276,7 @@ curl -s -H "X-TP-Token: $(cat ~/.taskpulse/token)" http://127.0.0.1:8899/state
 | 「依赖安装失败」 | 连上公司网络后重跑 `install.command`，已有安装不会被动 |
 | 细条不见了 | 双击 `~/Applications/TaskPulse.app`（没打开就没有进程，这是预期行为） |
 | 数字一直不动 | 确认浏览器里有 DataAgent 页面、扩展是启用状态；看 `~/Library/Logs/taskpulse.log` |
+| 加载扩展报「清单文件缺失或不可读取」 | 选错目录了：要选 `~/Applications/TaskPulse/edge-ext`，不是解压包里那份 |
 | 分组全是「未分组」 | 扩展没连上，或那些会话没有开着的标签 |
 | 点任务没反应 | 系统设置 → 隐私与安全性 → 自动化，把 TaskPulse 对浏览器的开关打开 |
 | 点任务跳到错误页面 | 把 `~/Library/Logs/taskpulse.log` 尾部发我，里面有 `focus_tab` / `no tab match` 的具体行 |
