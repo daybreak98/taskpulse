@@ -294,6 +294,12 @@ seen 且 48 小时内没有任何新进展（update_ms/acked_update 都不变）
 （不信任端上算的结果），再交给扩展按 tabId 关；扩展关之前还会核对 URL 里的
 `conversationId`，防止两次上报之间用户已经切走了。
 
+**只关会话页**：标签 URL 必须在 `conversation_url` 的路径前缀下（本机是
+`https://dataagent.corp.kuaishou.com/ai/data-agent`），且前缀后必须结束或紧跟
+`?` / `#` / `/`。同域下的其它页面（登录页、`/ai/data-agent-history` 这类）
+即使 URL 里恰好带 `conversationId` 也不会被当成会话标签——既不进标签映射，
+也不会被批量关闭。前缀由 `install.command` 从配置生成，代码里不写死域名。
+
 ### 6.5 延迟指标
 
 `/state` 的 `latency` 是**取数落定延迟**，不是跳转延迟：会话在上游列表里露出新状态

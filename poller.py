@@ -506,6 +506,38 @@ def _render(obj, agent_ids):
     return obj
 
 
+def conv_page_prefix() -> str:
+    """会话页的 URL 前缀，如 https://host/ai/data-agent。
+
+    标签映射与批量关标签都要求 URL 落在这个前缀下：同一域名下还有别的页面，
+    只按「URL 里含 conversationId」判断不够严。
+    """
+    if not CONV_URL:
+        return ""
+    head = CONV_URL.split("?")[0].replace("{host}", HOST)
+    # 模板里可能还有 {agent}/{cid} 等占位，取第一个占位之前的部分
+    for mark in ("{", "}"):
+        idx = head.find(mark)
+        if idx > 0:
+            head = head[:idx]
+            break
+    return head.rstrip("/")
+
+
+CONV_PAGE_PREFIX = conv_page_prefix()
+
+
+def _is_conv_page(url: str) -> bool:
+    """URL 是否是会话页。前缀后必须结束或紧跟 ? / # / /，
+    否则 /ai/data-agent-history 这类也会被误判。"""
+    if not CONV_PAGE_PREFIX:
+        return True
+    if not url.startswith(CONV_PAGE_PREFIX):
+        return False
+    rest = url[len(CONV_PAGE_PREFIX):]
+    return rest == "" or rest[0] in "?#/"
+
+
 def conv_url(agent_id, cid) -> str:
     if not CONV_URL:
         return ""
@@ -1501,6 +1533,9 @@ def ingest_tabs(payload: dict, ua: str = "") -> int:
     n = 0
     for t in payload.get("tabs") or []:
         url = t.get("url") or ""
+        # 只收会话页：同域其它页面即使带 conversationId 也不参与跳转/清理
+        if CONV_PAGE_PREFIX and not _is_conv_page(url):
+            continue
         m = re.search(r"[?&]conversationId=(\d+)", url)
         if not m:
             continue

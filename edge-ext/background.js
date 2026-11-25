@@ -113,24 +113,37 @@ async function notifyActive(tabId) {
 // 按 conversationId 找到标签并切过去；找不到才新开
 // 批量关闭会话标签：TaskPulse 已经按「没在工作 / 多久没更新」筛好了名单，
 // 这里只负责关，并在关之前核对 URL——用户可能在两次上报之间又切了别的会话。
+const CONV_PAGE = String((CFG.api && CFG.api.convPage) || "").replace(/\/+$/, "");
+
+// 只认会话页：同域下还有登录页、分享页等，只判断 URL 里有没有 conversationId
+// 不够严，批量关标签时可能误伤
+function isConversationTab(url) {
+  if (!url) return false;
+  if (!CONV_PAGE) return true;        // 没配置前缀时保持旧行为
+  if (!url.startsWith(CONV_PAGE)) return false;
+  // 边界：前缀后必须结束、或紧跟 ? / # / /，
+  // 否则 /ai/data-agent-history 这种也会被当成对话页
+  const rest = url.slice(CONV_PAGE.length);
+  return rest === "" || rest[0] === "?" || rest[0] === "#" || rest[0] === "/";
+}
+
 async function closeTabsFor(map, expires) {
   if (!!expires && Date.now() > expires) return 0;
   let closed = 0;
   for (const cid of Object.keys(map || {})) {
     const wanted = map[cid];
     let hit = null;
+    const re = new RegExp("[?&]conversationId=" + cid + "(?:[&#]|$)");
     if (typeof wanted === "number") {
       try {
         const t = await chrome.tabs.get(wanted);
-        const re = new RegExp("[?&]conversationId=" + cid + "(?:[&#]|$)");
-        if (t && t.url && re.test(t.url)) hit = t;
+        if (t && isConversationTab(t.url) && re.test(t.url)) hit = t;
       } catch (_) {}
     }
     if (!hit && SCOPE) {
       try {
         const tabs = await chrome.tabs.query({ url: SCOPE });
-        const re = new RegExp("[?&]conversationId=" + cid + "(?:[&#]|$)");
-        hit = tabs.find((t) => t.url && re.test(t.url));
+        hit = tabs.find((t) => isConversationTab(t.url) && re.test(t.url));
       } catch (_) {}
     }
     if (!hit) continue;

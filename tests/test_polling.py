@@ -75,6 +75,8 @@ class PollingTests(unittest.TestCase):
             # 身份密钥也指到临时目录：绝不能碰本机真实的那一份
             TOKEN_FILE=str(Path(self.directory) / "token"),
             CONV_URL="https://agent.example.com/chat?conversationId={cid}",
+            # 标签只认会话页前缀，这里跟着测试用的 URL 一起 patch
+            CONV_PAGE_PREFIX="https://agent.example.com/chat",
             POLL_SECONDS=60,
             ACTIVE_POLL_SECONDS=10,
             DISCOVERY_POLL_SECONDS=5,

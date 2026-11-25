@@ -244,7 +244,21 @@ for k, v in (plat.get("conversations_body") or {}).items():
 eps = plat.get("endpoints") or {}
 qf = plat.get("queue_fields") or {}
 # 扩展与 poller 必须按同一套字段/路径解析：写死任何一处，换平台配置就会两边不一致
+# 会话页的 URL 前缀：扩展据此判断「这个标签是不是对话页」，
+# 避免批量关标签时误伤同域下的其它页面
+conv_page = ""
+tpl = plat.get("conversation_url") or ""
+if tpl:
+    head = tpl.split("?")[0].replace("{host}", (plat.get("base_url") or "").rstrip("/"))
+    for mark in ("{", "}"):
+        idx = head.find(mark)
+        if idx > 0:
+            head = head[:idx]
+            break
+    conv_page = head.rstrip("/")
+
 api = {
+    "convPage": conv_page,
     "prefix": plat.get("api_prefix") or "",
     "conv": eps.get("conversations") or "",
     "queue": eps.get("queue") or "",
