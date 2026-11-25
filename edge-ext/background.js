@@ -132,11 +132,33 @@ async function focusConversation(cid, url, tabId, stale) {
       jobs.push(chrome.windows.update(hit.windowId, { focused: true }).catch(() => {}));
     }
     await Promise.all(jobs);
-  } else if (url && !stale) {
-    // 命令已经过期（TaskPulse 那边用兜底路径处理过了）：别再新开一个标签，
-    // 否则一次点击会看到两个标签页
-    await chrome.tabs.create({ url, active: true });
+    return "focused";
   }
+
+  // 命令已过期（TaskPulse 那边已经用兜底路径处理过）：什么都别做，
+  // 否则一次点击会看到两个标签页
+  if (!url || stale) return "expired";
+
+  // 这个会话没有独立标签页。原来直接 new tab，结果是每点一次就多一个——
+  // 而用户要的是「在已经打开的 DataAgent 页面里切到那个对话」。
+  // 所以在现有 dataagent 标签页里就地导航：优先当前激活的，否则最近访问的。
+  try {
+    const tabs = SCOPE ? await chrome.tabs.query({ url: SCOPE }) : [];
+    const usable = tabs.filter((t) => typeof t.id === "number" && !t.discarded);
+    if (usable.length) {
+      const target = usable.find((t) => t.active)
+        || usable.slice().sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+      // DataAgent 是单页应用，换 URL 就等于切会话；同一标签页不丢登录态
+      await chrome.tabs.update(target.id, { url, active: true });
+      if (typeof target.windowId === "number") {
+        await chrome.windows.update(target.windowId, { focused: true }).catch(() => {});
+      }
+      return "navigated";
+    }
+  } catch (_) {}
+
+  await chrome.tabs.create({ url, active: true });
+  return "created";
 }
 
 // 长轮询：TaskPulse 点提示条时，命令在这里被毫秒级接走
@@ -151,10 +173,14 @@ async function listen() {
         const cmd = await r.json();
         if (cmd && cmd.cmd === "focus" && cmd.cid) {
           const stale = !!cmd.expires && Date.now() > cmd.expires;
-          await focusConversation(String(cmd.cid), cmd.url || "", cmd.tabId, stale);
+          let how = "unknown";
+          try {
+            how = await focusConversation(String(cmd.cid), cmd.url || "", cmd.tabId, stale);
+          } catch (_) {}
           if (cmd.id) {
             try {
-              await fetch(ACK_ENDPOINT + "?id=" + encodeURIComponent(cmd.id),
+              await fetch(ACK_ENDPOINT + "?id=" + encodeURIComponent(cmd.id)
+                          + "&result=" + encodeURIComponent(how),
                 { method: "POST", headers: authHeaders() });
             } catch (_) {}
           }

@@ -2046,8 +2046,12 @@ class Handler(BaseHTTPRequestHandler):
             if pending:
                 _confirm_open(*pending)
             t0 = _cmd_t0.pop(cid, None)
+            how = (query.get("result") or [""])[0]
             if t0:
-                log("open ack id=%s %dms" % (cid, int((time.time() - t0) * 1000)))
+                # 带上扩展实际怎么做的：focused 聚焦已有标签、navigated 在现有页面
+                # 里切会话、created 新开、expired 命令已过期未执行
+                log("open ack id=%s %dms%s" % (cid, int((time.time() - t0) * 1000),
+                                               (" via=" + how) if how else ""))
             if len(_cmd_acks) > 200:
                 _cmd_acks.clear()
                 _cmd_acks[cid] = time.time()
