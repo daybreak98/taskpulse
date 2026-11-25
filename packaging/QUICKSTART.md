@@ -88,3 +88,4 @@ API 凭据过期时，展开小窗会看到「API 凭据已失效」和一个「
 | 启动台搜不到 | 确认 `~/Applications/TaskPulse.app` 存在；没有的话重新双击解压目录里的那份 |
 | 数字不动 | 确认浏览器里开着 DataAgent 页面、扩展是启用状态 |
 | 想彻底删掉 | 运行 `~/Applications/TaskPulse/uninstall.command`，再在扩展页移除 TaskPulse |
+| 要发给开发者排查 | `~/Library/Logs/taskpulse-app.log`（App 行为）、`taskpulse.log`（取数）、`taskpulse.poll.err`（启动失败） |
