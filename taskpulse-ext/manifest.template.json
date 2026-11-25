@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "TaskPulse Tab Bridge",
+  "version": "1.0.0",
+  "description": "把目标站点标签页所在的标签组名同步给本机 TaskPulse。只读标题与组名，不读页面内容、不联网外传。",
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "alarms",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8899/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

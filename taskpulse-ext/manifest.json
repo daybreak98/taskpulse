@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "TaskPulse",
+  "version": "2.0.0",
+  "description": "在浏览器右侧栏看所有 DataAgent 会话状态：谁在跑、谁在等你、谁卡住了。点一下跳到对应标签。",
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "alarms",
+    "storage",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://dataagent.corp.kuaishou.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://dataagent.corp.kuaishou.com/*"
+      ],
+      "js": [
+        "web-bridge.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "side_panel": {
+    "default_path": "panel.html"
+  },
+  "action": {
+    "default_title": "TaskPulse"
+  }
+}

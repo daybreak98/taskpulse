@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <header>
+    <div class="counts">
+      <button class="count running" data-kind="running"><span>运行中</span><output id="c-running">–</output></button>
+      <button class="count attention" data-kind="attention"><span>等我</span><output id="c-attention">–</output></button>
+      <button class="count stuck" data-kind="stuck"><span>卡住</span><output id="c-stuck">–</output></button>
+    </div>
+    <div class="meta"><span id="status">正在读取…</span></div>
+  </header>
+
+  <main id="list"></main>
+
+  <footer>
+    <span id="hint">数据来自当前打开的 DataAgent 页面</span>
+  </footer>
+
+  <script src="panel.js"></script>
+</body>
+</html>
