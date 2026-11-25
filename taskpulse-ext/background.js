@@ -1,212 +1,278 @@
-// 纯扩展版 TaskPulse：没有本机进程、没有 Python、没有签名。
-//
-// 数据链路：
-//   页面里的 web-bridge.js 用页面自己的 cookie 拉会话与队列
-//     → 发给本 service worker
-//     → 存进 chrome.storage.local
-//     → 侧边栏 panel.html 读出来算状态、渲染
-//
-// 这里只做三件事：选一个页面负责采集、把数据落盘、给面板提供标签映射。
+// Manifest V3 service worker. Collection stays in one DataAgent tab.
+importScripts("config.js", "state.js");
 
-const SCOPE = "https://dataagent.corp.kuaishou.com/*";
+const web = globalThis.TaskPulseWeb;
+const rules = globalThis.TaskPulseState;
+const ALARM = "tp-web-sync";
+const REPLY_NOTICE = "tp-reply:";
+const contentFiles = chrome.runtime.getManifest().content_scripts[0].js;
+const opening = new Map();
 
-// 配置内置：不依赖安装脚本生成，装上就能跑。
-// 换环境时改这份对象即可（api 的字段名与平台一致）。
-const CONFIG = {
-  scope: SCOPE,
-  api: {
-    convPage: "https://dataagent.corp.kuaishou.com/ai/data-agent",
-    prefix: "/rest/flow/api/v1",
-    conv: "/conversations/list",
-    queue: "/conversations/{cid}/queue",
-    messages: "/conversations/{cid}/messages?pageNo=1&pageSize=1",
-    state: "sessionState",
-    pending: "pending",
-    idle: ["IDLE"],
-    body: {
-      agentIdList: [515, 2528, 4033],
-      isCurAgent: false,
-      searchKey: "",
-      ungroupedPageNo: 1,
-      ungroupedPageSize: 60
-    },
-    marks: ["当前服务繁忙", "tpm limit"]
-  }
-};
-
-const LEADER_KEY = "tp-leader-tab";
-const SNAPSHOT_KEY = "tp-tabs";
-const WEBSTATE_KEY = "tp-webstate";
-
-// ---------- 标签快照：给面板做 conversationId → tabId 映射 ----------
-
-function cidOf(url) {
-  const m = /[?&]conversationId=(\d+)/.exec(url || "");
-  return m ? m[1] : "";
+const info = error => console.warn("TaskPulse:", error?.message ?? error);
+let lane = Promise.resolve();
+function serialize(work) {
+  const result = lane.then(work);
+  lane = result.catch(info);
+  return result;
 }
 
-async function snapshotTabs() {
-  const tabs = await chrome.tabs.query({ url: SCOPE });
-  const out = [];
-  for (const t of tabs) {
-    const cid = cidOf(t.url);
-    let group = "";
-    if (typeof t.groupId === "number" && t.groupId >= 0) {
-      try {
-        group = (await chrome.tabGroups.get(t.groupId)).title || "";
-      } catch (_) {}
-    }
-    out.push({
-      tabId: t.id,
-      windowId: t.windowId,
-      cid,
-      title: t.title || "",
-      url: t.url || "",
-      group,
-      active: !!t.active
-    });
-  }
-  await chrome.storage.local.set({ [SNAPSHOT_KEY]: { at: Date.now(), tabs: out } });
-  return out;
+async function getState() {
+  return (await chrome.storage.local.get(web.keys.state))[web.keys.state] ?? rules.blank();
 }
 
-// ---------- 选主：几十个标签页只让一个去采集 ----------
-
-function isConversationTab(t) {
-  return !!cidOf(t.url);
+function saveState(state) {
+  return chrome.storage.local.set({ [web.keys.state]: state });
 }
 
-async function pickLeader() {
-  const tabs = (await chrome.tabs.query({ url: SCOPE })).filter(isConversationTab);
-  if (!tabs.length) return null;
-  // 优先用户正在看的那一页；没有就取第一个
-  return tabs.find((t) => t.active) || tabs[0];
+async function getLeader() {
+  return (await chrome.storage.session.get(web.keys.leader))[web.keys.leader];
 }
 
-let leaderTabId = null;
+const isPage = tab => web.conversationPage(tab?.url) !== null;
+const isReady = tab => isPage(tab) && tab.status === "complete" && !tab.discarded && !tab.frozen;
+const pages = () => chrome.tabs.query({ url: web.match });
 
-async function syncLeader(force = false) {
-  const leader = await pickLeader();
-  const next = leader ? leader.id : null;
-  if (!force && next === leaderTabId) return;
-  leaderTabId = next;
-  await chrome.storage.local.set({ [LEADER_KEY]: next });
-  const tabs = await chrome.tabs.query({ url: SCOPE });
-  for (const t of tabs) {
-    try {
-      chrome.tabs.sendMessage(t.id, { kind: "tp-role", leader: t.id === next }, () => void 0);
-    } catch (_) {}
-  }
-}
-
-// 页面被浏览器节流时定时器会停摆，靠这里每 30 秒敲一下
-async function nudge() {
-  if (leaderTabId == null) return;
+async function signal(tabId, message) {
+  let timeout;
   try {
-    chrome.tabs.sendMessage(leaderTabId, { kind: "tp-nudge" }, () => void 0);
-  } catch (_) {}
+    return await Promise.race([
+      chrome.tabs.sendMessage(tabId, message, { frameId: 0 }).catch(() => null),
+      new Promise(resolve => { timeout = setTimeout(resolve, 750, null); })
+    ]);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-// ---------- 消息 ----------
+async function syncLeader({ install = false, nudge = false } = {}) {
+  const old = await getLeader();
+  const candidates = (await pages()).filter(isReady);
+  if (install) {
+    await Promise.allSettled(candidates.map(tab =>
+      chrome.scripting.executeScript({ target: { tabId: tab.id }, files: contentFiles })
+    ));
+  }
+
+  const current = candidates.find(tab => tab.id === old?.tabId);
+  if (current) {
+    const answer = await signal(current.id, { kind: "tp.probe" });
+    if (answer?.pageId === old.pageId) {
+      if (answer.lease !== old.lease) {
+        const restored = await signal(old.tabId, { kind: "tp.role", pageId: old.pageId, lease: old.lease });
+        if (restored?.pageId === old.pageId) return;
+      } else {
+        if (nudge) await signal(old.tabId, { kind: "tp.nudge", pageId: old.pageId });
+        return;
+      }
+    }
+  }
+
+  candidates.sort((a, b) => Number(b.active) - Number(a.active));
+  for (const tab of candidates) {
+    const answer = await signal(tab.id, { kind: "tp.probe" });
+    if (!answer?.pageId) continue;
+    const next = { tabId: tab.id, pageId: answer.pageId, lease: crypto.randomUUID() };
+    await chrome.storage.session.set({ [web.keys.leader]: next });
+    if (old) await signal(old.tabId, { kind: "tp.role", pageId: old.pageId, lease: "" });
+    const accepted = await signal(tab.id, { kind: "tp.role", pageId: next.pageId, lease: next.lease });
+    if (accepted?.pageId === next.pageId) return;
+  }
+  await chrome.storage.session.remove(web.keys.leader);
+}
+
+let refreshTimer = null;
+function refreshLeader() {
+  if (refreshTimer !== null) return;
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    void serialize(syncLeader).catch(() => {});
+  }, 80);
+}
+
+async function activeConversation() {
+  const win = await chrome.windows.getLastFocused({}).catch(() => null);
+  if (!win?.focused || !Number.isInteger(win.id) || win.id < 0) return "";
+  const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
+  const id = web.conversationId(tab?.url);
+  return opening.has(id) ? "" : id;
+}
+
+async function updateBadge(state) {
+  const { counts } = rules.view(state, Date.now());
+  const total = counts.attention + counts.stuck;
+  await chrome.action.setBadgeText({ text: total ? String(Math.min(total, 99)) : "" });
+}
+
+async function sendNotices(tasks) {
+  if (!tasks.length || await chrome.notifications.getPermissionLevel() !== "granted") return;
+  for (const task of tasks) {
+    await chrome.notifications.create(REPLY_NOTICE + rules.revision(task), {
+      type: "basic",
+      iconUrl: chrome.runtime.getURL("icon.png"),
+      title: "TaskPulse · 有新回复",
+      message: task.name
+    }).catch(info);
+  }
+}
+
+async function acceptReport(msg, sender) {
+  const leader = await getLeader();
+  if (!leader || leader.tabId !== sender.tab.id || leader.pageId !== msg.pageId || leader.lease !== msg.lease) {
+    return { ok: false };
+  }
+  const state = await getState();
+  const active = await activeConversation();
+  const { state: next, replies } = rules.absorb(state, msg.payload, Date.now(), active);
+  if (next !== state) {
+    // Record reply identities before emitting OS notifications so a worker restart cannot replay them.
+    await saveState(next);
+    await Promise.allSettled([sendNotices(replies), updateBadge(next)]);
+  }
+  return { ok: true };
+}
+
+async function markVisited() {
+  const id = await activeConversation();
+  if (!id) return;
+  const state = await getState();
+  const task = state.tasks[id];
+  if (!task?.pending || task.status !== "attention" || opening.has(id) ||
+      Date.now() - task.observedAt > web.timing.queueStale) return;
+  state.tasks[id] = rules.acknowledge(task);
+  await saveState(state);
+  await updateBadge(state);
+}
+
+async function raiseWindow(tab) {
+  if (!Number.isInteger(tab.windowId)) return false;
+  const window = await chrome.windows.update(tab.windowId, { focused: true }).catch(() => null);
+  return window?.focused === true;
+}
+
+async function focusTab(tab) {
+  const current = await chrome.tabs.update(tab.id, { active: true });
+  return { tab: current, focused: await raiseWindow(current) };
+}
+
+async function focusConversation(id, agentId) {
+  // Re-read the tab before using it. A stored ID can now point to a different conversation.
+  for (const candidate of await pages()) {
+    if (web.conversationId(candidate.url) !== id) continue;
+    const actual = await chrome.tabs.get(candidate.id).catch(() => null);
+    if (web.conversationId(actual?.url) !== id) continue;
+    const result = await focusTab(actual).catch(() => null);
+    if (web.conversationId(result?.tab.url) === id) return { opened: true, seen: result.focused };
+  }
+  const url = web.conversationUrl(id, agentId);
+  if (!url) return { opened: false };
+  const created = await chrome.tabs.create({ url, active: true });
+  const focused = await raiseWindow(created);
+  return { opened: true, seen: focused && web.conversationId(created.url) === id };
+}
+
+async function openTask(id, revision, allowSavedId = false) {
+  if (!web.id(id) || typeof revision !== "string" || revision.split("/")[0] !== id) return { ok: false };
+  if (opening.has(id)) return opening.get(id);
+
+  const job = (async () => {
+    const state = await getState();
+    const task = state.tasks[id];
+    if (!task && !allowSavedId) return { ok: false };
+    const agentId = task?.agentId ?? web.id(revision.split("/")[1]);
+    const result = await focusConversation(id, agentId);
+    if (result.seen) {
+      await serialize(async () => {
+        const fresh = await getState();
+        const current = fresh.tasks[id];
+        if (!current || rules.revision(current) !== revision) return;
+        fresh.tasks[id] = rules.acknowledge(current);
+        await saveState(fresh);
+        await updateBadge(fresh);
+      });
+    }
+    return { ok: result.opened };
+  })();
+  opening.set(id, job);
+  try {
+    return await job;
+  } finally {
+    opening.delete(id);
+  }
+}
+
+function senderIsPage(sender) {
+  return sender.id === chrome.runtime.id && sender.frameId === 0 &&
+    Number.isInteger(sender.tab?.id) && web.conversationPage(sender.url ?? sender.tab.url) !== null;
+}
 
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-  if (!msg || !msg.kind) return;
-
-  if (msg.kind === "get-config") {
-    respond(CONFIG);
-    return true;
+  if (!msg || !senderIsPage(sender)) return false;
+  let reply;
+  if (msg.kind === "tp.ready") {
+    refreshLeader();
+    respond({ ok: true });
+    return false;
   }
-
-  if (msg.kind === "tp-role-ask") {
-    respond({ leader: sender.tab && sender.tab.id === leaderTabId });
-    return true;
-  }
-
-  if (msg.kind === "webstate") {
-    chrome.storage.local.set({ [WEBSTATE_KEY]: msg.payload }, () => respond({ ok: true }));
-    updateBadge(msg.payload);
-    return true;
-  }
-  return false;
+  if (msg.kind === "tp.webstate") reply = serialize(() => acceptReport(msg, sender));
+  if (msg.kind === "tp.open") reply = openTask(msg.id, msg.revision);
+  if (!reply) return false;
+  reply.then(respond, error => { info(error); respond({ ok: false }); });
+  return true;
 });
 
-// ---------- 徽章：待我处理的数量 ----------
+chrome.notifications.onClicked.addListener(id => {
+  if (!id.startsWith(REPLY_NOTICE)) return;
+  const revision = id.slice(REPLY_NOTICE.length);
+  void openTask(revision.split("/")[0], revision, true).then(result => {
+    if (result.ok) return chrome.notifications.clear(id);
+  }).catch(info);
+});
 
-async function updateBadge(payload) {
-  try {
-    const { [WEBSTATE_KEY]: snap, tpSeen } = await chrome.storage.local.get([WEBSTATE_KEY, "tpSeen"]);
-    const counts = countStates(snap || payload, tpSeen || {});
-    const n = counts.attention + counts.stuck;
-    await chrome.action.setBadgeText({ text: n ? String(n) : "" });
-    await chrome.action.setBadgeBackgroundColor({ color: "#F6BD68" });
-  } catch (_) {}
+function wake(install = false) {
+  void serialize(async () => {
+    if (!await chrome.alarms.get(ALARM)) await chrome.alarms.create(ALARM, { periodInMinutes: 0.5 });
+    if (install) await chrome.alarms.clear("tp-sync");
+    await syncLeader({ install, nudge: true });
+    await updateBadge(await getState());
+  }).catch(() => {});
 }
 
-// 与面板共用的一套判定（保持简单版：只看忙不忙 + updateTime 是否新）
-function countStates(snap, seen) {
-  const convs = (snap && snap.conversations) || [];
-  const queues = (snap && snap.queues) || {};
-  const out = { running: 0, attention: 0, stuck: 0 };
-  const now = Date.now();
-  for (const c of convs) {
-    const cid = String(c.id);
-    const q = queues[cid];
-    const st = q ? q[CONFIG.api.state] : null;
-    const pending = q ? q[CONFIG.api.pending] : null;
-    const busy = q ? (Boolean(pending) || CONFIG.api.idle.indexOf(st) < 0) : null;
-    const updated = c.updateTime || 0;
-    const acked = seen[cid] || 0;
-    if (busy === true) {
-      if (now - updated > 30 * 60 * 1000) out.stuck += 1;
-      else out.running += 1;
-    } else if (updated > acked) {
-      out.attention += 1;
+chrome.runtime.onInstalled.addListener(() => wake(true));
+chrome.runtime.onStartup.addListener(() => wake());
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === ALARM) wake();
+});
+
+chrome.tabs.onUpdated.addListener((id, change, tab) => {
+  if (change.url || change.discarded !== undefined || change.frozen !== undefined || change.status === "complete") {
+    if (isPage(tab)) {
+      refreshLeader();
+      if (tab.active && (change.url || change.status === "complete")) void serialize(markVisited).catch(() => {});
+    } else {
+      void getLeader().then(leader => { if (leader?.tabId === id) refreshLeader(); }).catch(info);
     }
   }
-  return out;
-}
-
-// ---------- 生命周期 ----------
-
-async function refreshAll() {
-  await snapshotTabs();
-  await syncLeader(true);
-  await nudge();
-}
-
-chrome.runtime.onInstalled.addListener(async () => {
-  chrome.alarms.create("tp-sync", { periodInMinutes: 0.5 });
-  try {
-    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
-  } catch (_) {}
-  refreshAll();
 });
-
-chrome.runtime.onStartup.addListener(() => {
-  chrome.alarms.create("tp-sync", { periodInMinutes: 0.5 });
-  refreshAll();
+chrome.tabs.onRemoved.addListener(id => {
+  void getLeader().then(leader => { if (leader?.tabId === id) refreshLeader(); }).catch(info);
 });
+chrome.tabs.onActivated.addListener(() => { void serialize(markVisited).catch(() => {}); });
+chrome.windows.onFocusChanged.addListener(() => { void serialize(markVisited).catch(() => {}); });
 
-chrome.alarms.onAlarm.addListener((a) => {
-  if (a.name === "tp-sync") refreshAll();
+chrome.action.onClicked.addListener(tab => {
+  void (async () => {
+    const target = isPage(tab) ? tab : (await pages()).filter(isPage)[0];
+    if (!target) {
+      await chrome.tabs.create({ url: web.page, active: true });
+      return;
+    }
+    if (target.id !== tab.id) await focusTab(target);
+    const shown = await signal(target.id, { kind: "tp.show" });
+    if (!shown && isReady(target)) {
+      await chrome.scripting.executeScript({ target: { tabId: target.id }, files: contentFiles });
+      await signal(target.id, { kind: "tp.show" });
+    }
+  })().catch(info);
 });
-
-chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
-  if (!info.url && !info.status && !info.groupId) return;
-  if (tab.url && tab.url.startsWith("https://dataagent.corp.kuaishou.com/")) refreshAll();
-});
-
-chrome.tabs.onRemoved.addListener(() => refreshAll());
-chrome.tabGroups.onUpdated.addListener(() => refreshAll());
-chrome.tabGroups.onRemoved.addListener(() => refreshAll());
-
-// 点扩展图标时打开侧边栏（部分版本不支持 setPanelBehavior 的兜底）
-chrome.action.onClicked.addListener(async (tab) => {
-  try {
-    await chrome.sidePanel.open({ windowId: tab.windowId });
-  } catch (_) {
-    chrome.windows.create({ url: "panel.html", type: "popup", width: 380, height: 760 });
-  }
-});
-
-refreshAll();

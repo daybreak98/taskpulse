@@ -1,57 +1,32 @@
-# 纯扩展版（pilot）· 已冻结
+# TaskPulse 网页版
 
-状态：**冻结**，不继续开发，不参与打包，不影响现有的 App 版（`TaskPulse.app` + `poller.py`）。
+原纯扩展试验版升级为独立的 Chrome / Edge 扩展，代码在 `taskpulse-ext/`。加载整个目录即可使用，数据来源是当前浏览器里已登录的 DataAgent 页面。
 
-目标读者：后续接手这块的人。
+## 安装与使用
 
----
+1. 在 Chrome 打开 `chrome://extensions`，在 Edge 打开 `edge://extensions`。
+2. 打开开发人员模式，点「加载解压缩的扩展」，选择含 `manifest.json` 的 `taskpulse-ext/`。
+3. 打开并登录 DataAgent。在页面右上方点胶囊展开会话列表。若原有标签页还没显示，刷新一次。
 
-## 为什么要做
+蓝、金、粉三个数字分别对应运行中、待处理、疑似卡住。点数字按状态筛选，点左侧图标查看全部。点列表或新回复通知时，会优先切到已有会话标签，没有则新建标签。系统通知采用浏览器和系统的通知权限。保留至少一个已登录的 DataAgent 页面。
 
-现有版本安装链路重：Gatekeeper 放行未签名脚本 + 解压 130MB 运行时 + 终端跑脚本。
-纯扩展是唯一能做到「解压 → 加载扩展 → 能用」的形态（扩展是 JS，不受签名/公证限制）。
+## 逻辑来源
 
-## 做了什么
+| 模块 | 处理方式 |
+| --- | --- |
+| WEB 采集 | 沿用 `edge-ext/web-bridge.js` 的同源接口、字段和采样窗口。会话列表约 30 秒，忙碌和刚变化的队列约 5 秒，空闲队列约 60 秒。每轮最多查 6 个队列，从最近 24 个会话选最久未查的候选。 |
+| 浏览器后台 | 从存活网页中保留一个采集页。采集页切换时生成新授权标识，只接收当前页的结果。30 秒闹钟用于检查采集页和提醒后台标签。 |
+| 状态 | 根据 `poller.py` 的 WEB 规则整理成一个 JS 状态模块，胶囊、角标和通知均使用它。重复上报旧队列不延长证据的有效期。短任务的队列先变空时，等待列表和回复补齐。超过阶段阈值或命中限流标记可进入疑似卡住状态。 |
+| 通知与跳转 | 首次接入的历史回复静默。新回复按任务版本去重，验证最新消息的发送方后发送系统通知。点击核对实际会话标签，成功后只确认对应版本。在前台查看的会话可以直接记为已查看。 |
+| 视觉 | 沿用桌面版冷蓝灰玻璃、数字胶囊和状态色，使用 Shadow DOM 将样式限定在胶囊内。 |
 
-代码在 `taskpulse-ext/`，约 600 行，无任何本机依赖：
+这是站点内的网页胶囊。收起浏览器、切到其他 App 或其他网站时，仍可由系统通知提示新回复。浏览器暂停后台标签时，刷新可能延后。打开两个浏览器实例或同时启用桌面 WEB 桥接，会各自产生采集请求。
 
-| 文件 | 作用 |
-|---|---|
-| `manifest.json` | MV3，`side_panel` + `tabs` / `tabGroups` / `alarms` / `storage` |
-| `background.js` | 选主（几十个标签只一个采集）、标签快照（cid → tabId + 组名）、落 `chrome.storage.local` |
-| `web-bridge.js` | 从现有 `edge-ext/web-bridge.js` 原样搬来，多一个 `tp-nudge` 处理（对抗后台标签定时器节流） |
-| `panel.html/css/js` | 侧边栏：状态判定（running / attention / stuck / seen / done）+ 渲染 + 点行切标签 + 勾选完成 |
+## 验证与打包
 
-打包产物：`dist/TaskPulse-ext.zip`（16 KB，9 文件）。
-
-## 与 App 版的差别（已确认接受）
-
-1. **没有屏幕边缘浮窗** —— 只能在浏览器侧边栏看，切到别的 App 就看不见
-2. **必须开着至少一个 DataAgent 页面** —— 所有数据从页面同源接口取
-3. **没有 API 模式** —— 扩展拿不到 dataagent 的 userToken（只有 Python 侧 SDK 能换）
-4. 没有提示条、截止时间、批量关标签
-
-## 已验证到什么程度
-
-- `node --check` 三个 JS 全通过
-- 状态判定逻辑用 node 单测覆盖五态：
-
-```
-["正在跑:running:营销号:-","等我回:attention:组A:42","已看过:seen:-:-","卡住了:stuck:-:-"]
-{"running":1,"attention":1,"stuck":1,"seen":1}
+```sh
+node --test tests/test_web_extension.cjs
+zip -qr TaskPulse-Web-2.1.0.zip taskpulse-ext/
 ```
 
-- **未做**：真实浏览器加载验证（需要人在 `edge://extensions` 点「加载解压缩的扩展」）
-
-## 继续做的话，从哪开始
-
-1. 在 Edge 里加载 `taskpulse-ext/`，刷新一个 DataAgent 页面，确认 sidePanel 能出数据
-2. 补「Agent 回话了」的提示：background 里比较前后快照，`chrome.notifications` 弹
-3. 补截止时间 / 批量关标签：迁移 `poller.py` 里的 `close_conversation_tabs` 逻辑
-4. MV3 的坑：service worker 30 秒闲置会被回收，所有状态必须落 `chrome.storage`，定时靠 `chrome.alarms`（最小 30 秒）
-
-## 与 App 版的关系
-
-- 两套并存，互不干扰：扩展版写 `chrome.storage`，App 版写 `~/.taskpulse/`
-- 但**同一个页面**会同时被两个扩展注入 `web-bridge.js`，采集请求翻倍。测试时只启用一个
-- App 版仍然是主形态（屏幕边缘浮窗 + API 模式）
+测试复用了旧队列不续期、短任务等待、过期与活跃状态、已读版本检查等回归场景，并覆盖通知去重及会话跳转失败。

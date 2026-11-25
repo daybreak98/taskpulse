@@ -1,36 +1,21 @@
 {
   "manifest_version": 3,
-  "name": "TaskPulse",
-  "version": "2.0.0",
-  "description": "在浏览器右侧栏看所有 DataAgent 会话状态：谁在跑、谁在等你、谁卡住了。点一下跳到对应标签。",
-  "permissions": [
-    "tabs",
-    "tabGroups",
-    "alarms",
-    "storage",
-    "sidePanel"
-  ],
-  "host_permissions": [
-    "https://dataagent.corp.kuaishou.com/*"
-  ],
-  "background": {
-    "service_worker": "background.js"
-  },
-  "content_scripts": [
-    {
-      "matches": [
-        "https://dataagent.corp.kuaishou.com/*"
-      ],
-      "js": [
-        "web-bridge.js"
-      ],
-      "run_at": "document_idle"
-    }
-  ],
-  "side_panel": {
-    "default_path": "panel.html"
-  },
-  "action": {
-    "default_title": "TaskPulse"
-  }
+  "name": "TaskPulse · 网页版",
+  "version": "2.1.0",
+  "minimum_chrome_version": "120",
+  "description": "在 DataAgent 网页看任务状态，新回复时收系统通知，点一下直达会话。",
+  "permissions": ["alarms", "notifications", "scripting", "storage"],
+  "host_permissions": ["https://dataagent.corp.kuaishou.com/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{
+    "matches": ["https://dataagent.corp.kuaishou.com/ai/data-agent*"],
+    "js": ["config.js", "state.js", "web-bridge.js", "capsule.js"],
+    "run_at": "document_idle"
+  }],
+  "web_accessible_resources": [{
+    "resources": ["capsule.css"],
+    "matches": ["https://dataagent.corp.kuaishou.com/*"]
+  }],
+  "icons": { "128": "icon.png" },
+  "action": { "default_title": "TaskPulse · 打开 DataAgent", "default_icon": "icon.png" }
 }
