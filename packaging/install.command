@@ -278,6 +278,7 @@ cat > "$AGENTS/com.taskpulse.poller.plist" <<PLIST
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
+  <key>AssociatedBundleIdentifiers</key><array><string>com.hyj.taskpulse</string></array>
   <key>StandardOutPath</key><string>$LOGS/taskpulse.poll.out</string>
   <key>StandardErrorPath</key><string>$LOGS/taskpulse.poll.err</string>
 </dict>
@@ -295,6 +296,7 @@ cat > "$AGENTS/com.taskpulse.ui.plist" <<PLIST
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Interactive</string>
+  <key>AssociatedBundleIdentifiers</key><array><string>com.hyj.taskpulse</string></array>
   <key>StandardOutPath</key><string>$LOGS/taskpulse.stdout</string>
   <key>StandardErrorPath</key><string>$LOGS/taskpulse.stderr</string>
 </dict>
