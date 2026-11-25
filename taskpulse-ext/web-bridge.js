@@ -30,7 +30,7 @@
     request = controller;
     const timeout = setTimeout(() => controller.abort(), Math.min(remaining, timing.request));
     try {
-      const response = await fetch(path, {
+      const response = await fetch(new URL(path, location.origin), {
         ...init, credentials: "same-origin", cache: "no-store",
         redirect: "error", signal: controller.signal
       });

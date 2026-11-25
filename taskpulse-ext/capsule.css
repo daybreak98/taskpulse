@@ -99,5 +99,14 @@ header strong { font-weight: 650; }
 .row:hover { border-color: var(--accent); }
 .row i { width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--accent); }
 .row span:first-of-type { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row .jump { flex: none; color: var(--secondary); }
+.row .jump {
+  flex: none;
+  position: relative;
+  width: 9px;
+  height: 9px;
+  color: var(--secondary);
+}
+.jump::before, .jump::after { content: ""; position: absolute; }
+.jump::before { inset: 0 0 auto auto; width: 6px; height: 6px; border-top: 1px solid; border-right: 1px solid; }
+.jump::after { right: 0; top: 0; width: 9px; border-top: 1px solid; transform: rotate(-45deg); transform-origin: right; }
 .empty { margin: 5px; padding: 5px 0; color: var(--secondary); font-size: 12px; }

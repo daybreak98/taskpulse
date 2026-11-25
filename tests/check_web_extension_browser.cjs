@@ -40,7 +40,8 @@ async function trial() {
   await context.route(origin + "/**", async route => {
     const u = new URL(route.request().url());
     if (u.pathname === "/ai/data-agent") {
-      return route.fulfill({ contentType: "text/html; charset=utf-8", body: `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>DataAgent · Test fixture</title>
+      return route.fulfill({ contentType: "text/html; charset=utf-8",
+        headers: { "Content-Security-Policy": "style-src 'unsafe-inline'; connect-src 'self'" }, body: `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>DataAgent · Test fixture</title>
 <style>body{background:#f2f6fa;margin:0;font:16px -apple-system,sans-serif;color:#20384d}header{height:59px;padding:23px 35px;border-bottom:1px solid #c9d9e6;background:#fff}aside{width:245px;top:106px;bottom:0;position:absolute;padding:35px;background:#e6edf4}article{margin:48px 0 0 342px}h1{font-size:32px}</style>
 <header>DataAgent</header><aside>会话<br><br>数据质量<br><br>验证 Spark 分区更新<br><br>订单链路字段核查</aside><article><h1>数据研发工作台</h1><p>用于浏览器自动化验收的示例会话。</p></article></html>` });
     }
@@ -80,7 +81,7 @@ async function trial() {
     await page.bringToFront();
     await page.locator(root + " .all").click();
     await page.locator(root + " [data-cid='11']").waitFor();
-    assert.equal((await page.locator(root + " [data-cid='11']").textContent()).trim(), task.name + "↗");
+    assert.equal((await page.locator(root + " [data-cid='11']").textContent()).trim(), task.name);
 
     const prior = requests.filter(r => r.path.endsWith("/list") && r.from === home).length;
     assert.equal(prior, 1);
@@ -92,8 +93,14 @@ async function trial() {
     assert.equal(saved.tasks["11"].status, "attention");
     assert.ok(saved.tasks["11"].notified, JSON.stringify(saved.tasks["11"]));
     assert.ok(!JSON.stringify(saved).includes("Synthetic private reply"));
-    const notices = await worker.evaluate(() => chrome.notifications.getAll());
-    assert.equal(Object.keys(notices).filter(id => id.startsWith("tp-reply:11/")).length, 1);
+    const notifications = async () => Object.keys(await worker.evaluate(() => chrome.notifications.getAll()))
+      .filter(id => id.startsWith("tp-reply:11/"));
+    let notices = await notifications();
+    for (let i = 0; !notices.length && i < 20; i++) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      notices = await notifications();
+    }
+    assert.equal(notices.length, 1);
 
     await page.locator(root + " [data-cid='11']").click();
     await page.locator(root + " button.attention").filter({ hasText: /^0$/ }).waitFor({ timeout: 8000 });

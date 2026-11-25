@@ -13,7 +13,6 @@
   host.id = hostId;
   const root = host.attachShadow({ mode: "open" });
   root.innerHTML = `
-    <link rel="stylesheet">
     <aside hidden aria-label="TaskPulse">
       <div class="capsule" role="group" aria-label="任务状态">
         <button class="all" type="button" data-filter="all" aria-label="全部会话" title="全部会话"><i></i><i></i><i></i></button>
@@ -28,10 +27,16 @@
       </section>
     </aside>`;
   const box = root.querySelector("aside");
-  const style = root.querySelector("link");
-  style.addEventListener("load", () => { box.hidden = false; });
-  style.href = chrome.runtime.getURL("capsule.css");
   document.documentElement.append(host);
+  fetch(chrome.runtime.getURL("capsule.css")).then(response => {
+    if (!response.ok) throw new Error("无法读取胶囊样式");
+    return response.text();
+  }).then(css => {
+    const style = new CSSStyleSheet();
+    style.replaceSync(css);
+    root.adoptedStyleSheets = [style];
+    box.hidden = false;
+  }).catch(error => console.warn("TaskPulse:", error.message));
 
   const panel = root.querySelector(".panel");
   const note = root.querySelector(".note");
@@ -72,7 +77,6 @@
     const jump = document.createElement("span");
     jump.className = "jump";
     jump.setAttribute("aria-hidden", "true");
-    jump.textContent = "↗";
     row.append(dot, title, jump);
     row.addEventListener("click", async () => {
       try {
