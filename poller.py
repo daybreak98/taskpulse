@@ -220,17 +220,18 @@ def source_mode() -> str:
 def set_source_mode(mode: str) -> None:
     """只在配置文件里改这一项，其余原样写回。"""
     global _source_epoch
-    try:
-        with open(CONFIG_FILE, encoding="utf-8") as f:
-            cfg = json.load(f)
-    except Exception:
-        cfg = {}
-    cfg["source"] = mode
-    _source_epoch += 1          # 版本先加，随后落盘
-    tmp = CONFIG_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, CONFIG_FILE)
+    with _lock:
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+        cfg["source"] = mode
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_FILE)
+        _source_epoch += 1
 ACTIVE_POLL_SECONDS = max(0, int(CFG["poll"]["active_interval_seconds"]))
 DISCOVERY_POLL_SECONDS = max(0, int(CFG["poll"].get("discovery_interval_seconds", 5)))
 ACTIVE_WATCH_LIMIT = min(WATCH_LIMIT, max(0, int(CFG["poll"]["active_watch_limit"])))
@@ -543,6 +544,16 @@ def _is_conv_page(url: str) -> bool:
     return rest == "" or rest[0] in "?#/"
 
 
+def conversation_id(url: str) -> str:
+    if not isinstance(url, str) or not _is_conv_page(url):
+        return ""
+    try:
+        values = parse_qs(urlparse(url).query).get("conversationId", [])
+        return values[0] if len(values) == 1 and re.fullmatch(r"[0-9]+", values[0]) else ""
+    except ValueError:
+        return ""
+
+
 def conv_url(agent_id, cid) -> str:
     if not CONV_URL:
         return ""
@@ -687,16 +698,16 @@ class WebProvider:
 
     def age_seconds(self) -> float | None:
         """缓存多久没更新了；用于判定「页面都关了」。"""
-        at = self._load().get("at") or 0
+        at = self._snap().get("at") or 0
         return None if not at else (now_ms() - int(at)) / 1000
 
     def last_at(self) -> int | None:
         """浏览器里那份数据的生成时刻（毫秒）。"""
-        at = self._load().get("at") or 0
+        at = self._snap().get("at") or 0
         return int(at) or None
 
     def conversations(self, timeout: float) -> list[dict]:
-        items = self._load().get("conversations") or []
+        items = self._snap().get("conversations") or []
         out: list[dict] = []
         seen = set()
         for c in items:
@@ -716,8 +727,12 @@ class WebProvider:
         return out
 
     def queue(self, cid: int, timeout: float) -> tuple[bool, str | int]:
-        q = (self._snap().get("queues") or {}).get(str(cid))
-        if not isinstance(q, dict):
+        snap = self._snap()
+        q = (snap.get("queues") or {}).get(str(cid))
+        error_at = int((snap.get("queueErrors") or {}).get(str(cid)) or 0)
+        if error_at > (self.queue_at(cid) or 0):
+            raise NoSample(str(cid))
+        if not isinstance(q, dict) or not self.queue_at(cid):
             raise NoSample(str(cid))
         raw = q.get(self.f_state)
         if raw in (None, ""):
@@ -734,8 +749,12 @@ class WebProvider:
             return None
 
     def last_message(self, cid: int, timeout: float) -> dict:
-        msg = (self._snap().get("lastMessages") or {}).get(str(cid))
-        return msg if isinstance(msg, dict) else {}
+        snap = self._snap()
+        msg = (snap.get("lastMessages") or {}).get(str(cid))
+        if not isinstance(msg, dict) or not msg.get("updateTime"):
+            return {}
+        row = next((c for c in snap.get("conversations", []) if str(c.get("id")) == str(cid)), None)
+        return msg if row and int(row.get("updateTime") or 0) == int(msg["updateTime"]) else {}
 
 
 def make_agent():
@@ -899,7 +918,9 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
             at = observed(conv["id"]) if callable(observed) else None
             samples[cid] = QueueSample(at or now_ms(), busy, raw, from_source=bool(at))
         except NoSample:
-            samples[cid] = QueueSample(now_ms(), None)
+            # A missing cached sample must not advance the successful-sample watermark.
+            error_at = (agent._snap().get("queueErrors") or {}).get(cid) if isinstance(agent, WebProvider) else None
+            samples[cid] = QueueSample(int(error_at or now_ms()), None, error=bool(error_at), from_source=bool(error_at))
             continue
         except Exception as exc:
             if isinstance(exc, requests.HTTPError) and exc.response is not None:
@@ -950,7 +971,7 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
             message = agent.last_message(conv["id"], timeout)
             # 扩展在页面里就把关键词匹配做完了，只回一个布尔：消息原文不出浏览器。
             # 老版本扩展回的是截断后的原文，走下面的兼容分支。
-            if isinstance(message.get("failed"), bool):
+            if message.get("sender") == "assistant" and isinstance(message.get("failed"), bool):
                 failed = message["failed"]
             else:
                 content = message.get("content")
@@ -970,7 +991,8 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
     # 先把「上一次真正观测到状态」的时刻抓出来：下面几行会把它覆盖成本次，
     # 事后再读就永远读到新值，间隔判断会退化成死代码
     previous = task.get("queue_observed_at") or 0
-    task["queue_checked_at"] = sample.at
+    if sample.busy is not None or sample.error:
+        task["queue_checked_at"] = sample.at
     # 只有真的取数失败才记为 error；「这轮没问到」保持原状，别把安静的会话
     # 永久标成「待确认」
     if sample.busy is not None:
@@ -991,10 +1013,12 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
         started = 0
         task["run_restarted_at"] = sample.at
     if sample.busy:
-        if not started:
+        if not started or task.get("settle_until"):
             started = sample.at
             task["running_since"] = started
             task["countdown_since"] = started
+            task["failed"] = False
+        task.pop("settle_until", None)
         # 运行中也可能被限流卡住：这一轮翻过消息就把结论落在状态上，别等它转空闲。
         run_reply = f"run:{started}"
         checked = sample.checked_reply == run_reply
@@ -1007,8 +1031,8 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
                 task["classified_reply"] = run_reply
         # 没翻到新消息时保留上一轮结论：否则「已判限流」会被下一次纯队列采样
         # 抹成 False，状态从卡住退回运行中
-        if checked:
-            task["failed"] = bool(sample.failed)
+        if checked and sample.failed is not None:
+            task["failed"] = sample.failed
         task["reply_pending"] = False
         elapsed = (sample.at - started) // 1000
         # 卡住判定看的是「这一阶段」的倒计时：运行中从起跑算，转入待回复后重新起算
@@ -1029,7 +1053,9 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
     reply = pending_reply(task, update, sample.at)
     was_attention = task.get("status") == "attention"
     task["running_since"] = 0
-    task["stuck_notified"] = 0
+    # Preserve the notification marker during repeated idle samples.
+    if started:
+        task["stuck_notified"] = 0
 
     if not reply:
         # 这一轮刚跑完，但列表还没补上来（列表 60s/30s 才刷一次）。此刻定「已查看」
@@ -1057,7 +1083,9 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
 
     if started:
         task["reply_completed_at"] = sample.at
-    if reply != task.get("reply_version"):
+    task.pop("settle_until", None)
+    new_reply = reply != task.get("reply_version")
+    if new_reply:
         task["failed"] = False
     task["reply_version"] = reply
     task["reply_pending"] = True
@@ -1074,7 +1102,7 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
     task["status"] = "stuck" if (task.get("failed") or stuck_for_same_reply) else "attention"
     # 从「运行中」转入「待回复」的那一刻重新计；同一条回复不重置，
     # 否则每次采样都把倒计时推回原点，「等你回复超时」永远等不到
-    if not was_attention and not stuck_for_same_reply:
+    if new_reply or (not was_attention and not stuck_for_same_reply):
         task["countdown_since"] = sample.at
     waited = (sample.at - (task.get("countdown_since") or sample.at)) // 1000
     if task["status"] == "attention" and waited >= DEFAULT_STUCK_SECONDS:
@@ -1095,8 +1123,13 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
     deadline = time.monotonic() + ROUND_BUDGET_SECONDS
     # 本轮的来源身份：模式名 + 版本号。版本号能识别「切走又切回来」，
     # 光比 api/web 会把往返之后的旧样本当成当前的
-    gen = (source_mode(), _source_epoch)
-    base = load_state()
+    with _lock:
+        gen = (source_mode(), _source_epoch)
+        base = load_state()
+    # Freeze before reading the list, not just before reading the queues.
+    begin = getattr(agent, "begin_round", None)
+    if callable(begin):
+        begin()
     tasks = base.get("tasks") or {}
     stamp = now_ms()
     listed: list[dict] = []
@@ -1123,10 +1156,6 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             conv for conv in fast_candidates(tasks, stamp) if str(conv["id"]) not in picked]
     else:
         conversations = fast_candidates(tasks, stamp)
-    # WEB 侧每轮只读一份缓存：否则队列与观测时刻可能来自不同批次
-    begin = getattr(agent, "begin_round", None)
-    if callable(begin):
-        begin()
     samples = sample_queues(agent, conversations, tasks, deadline)
     if not full and not samples:
         return base
@@ -1152,6 +1181,8 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             task = tasks.get(cid)
             if task is not None:
                 old_agent = task.get("agent_id")
+                if str(old_agent or "") == str(agent_id or "") and update < (task.get("update_ms") or 0):
+                    continue
                 # 同一个会话 ID 落到了另一个数据范围：不能覆盖旧记录（会连带把
                 # 勾选、截止时间带过去），旧记录降级归档，新范围从干净状态开始
                 if old_agent and agent_id and str(old_agent) != str(agent_id):
@@ -1169,7 +1200,7 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                 if created and created >= baseline:
                     task = tasks[cid] = {"status": "running", "prev": "running", "acked_update": 0}
                 else:
-                    task = tasks[cid] = {"status": "seen", "prev": "running", "acked_update": update}
+                    task = tasks[cid] = {"status": "seen", "prev": "running", "acked_update": min(update, baseline)}
             task.setdefault("queue_observed_at", task.get("seen_ms") or 0)
             task.update(id=conv["id"], name=clean_name(conv.get("name")) or f"会话 {cid}",
                         agent_id=agent_id,
@@ -1179,7 +1210,8 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             if carried:
                 task.update(carried)
             task["url"] = conv_url(task["agent_id"], cid)
-            task["listed_at"] = stamp          # 最后一次出现在监控窗口里
+            task["listed_at"] = (int(agent._snap().get("listAt") or agent.last_at() or 0)
+                                 if isinstance(agent, WebProvider) else stamp)
             if task.get("archived") and update > (task.get("acked_update") or 0):
                 task.update(archived=False, muted=False, auto_archived=0, prev="running", status="seen")
 
@@ -1189,6 +1221,10 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             task = tasks.get(str(conv["id"]))
             if task is None:
                 continue
+            if conv["updateTime"] < (task.get("update_ms") or 0):
+                continue
+            if conv.get("agentId") and task.get("agent_id") and str(conv["agentId"]) != str(task["agent_id"]):
+                continue
             task["name"] = clean_name(conv.get("name")) or task.get("name") or ""
             task["group_name"] = conv.get("groupName") or ""
 
@@ -1197,6 +1233,8 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             update = conv["updateTime"]
             task = tasks.get(cid)
             if not task:
+                continue
+            if update < (task.get("update_ms") or 0):
                 continue
             if task.get("muted"):
                 task["status"] = "done"
@@ -1259,15 +1297,11 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                         state["poller_error"] = ("没有可用的 DataAgent 页面："
                                                  "请打开一个页面并确认扩展已加载、已登录")
             # 页面自己报上来的采集错误（解析失败、接口报错）优先展示
-            web_err = ""
-            try:
-                with open(WEBSTATE_FILE, encoding="utf-8") as f:
-                    web_err = str((json.load(f) or {}).get("error") or "")
-            except (OSError, ValueError):
-                web_err = ""
-            if web_err:
-                state["poller_error"] = "页面采集失败：%s" % web_err[:100]
-                state["poller_error_at"] = stamp
+            if isinstance(agent, WebProvider):
+                web_err = str(agent._snap().get("error") or "")
+                if web_err:
+                    state["poller_error"] = "页面采集失败：%s" % web_err[:100]
+                    state["poller_error_at"] = stamp
         if full or any(sample.busy is not None for sample in samples.values()):
             # web 模式的「更新时间」是浏览器里那份数据的生成时刻，不是本次落盘的时刻——
             # 否则页面停了 100 秒，UI 还以为是刚更新过
@@ -1482,12 +1516,16 @@ _tab_report_at = 0
 _tab_report_by_browser: dict = {}
 # browser -> 扩展自报的「浏览器内取数能力」（hasApi / scripting / pages / registered）
 _web_diag: dict = {}
+_tab_ingest_lock = threading.Lock()
+_tab_sample_at: dict[str, int] = {}
+_active_browser = ""
 
 
 def watching(cid: str, act: dict) -> bool:
     """用户此刻就在这个会话的标签页上看（窗口聚焦、上报不超过 2 分钟）。"""
     return (bool(act.get("focused"))
             and act.get("cid") == str(cid)
+            and time.monotonic() >= _open_visit_until.get(str(cid), 0)
             and now_ms() - (act.get("ts") or 0) < 120_000)
 
 
@@ -1532,18 +1570,29 @@ def browser_of(ua: str, declared: str = "") -> str:
 
 def ingest_tabs(payload: dict, ua: str = "") -> int:
     """payload.tabs = [{url, group, tabId}]，按 URL 里的 conversationId 建映射。"""
-    global _tab_report_at
+    with _tab_ingest_lock:
+        return _ingest_tabs(payload, ua)
+
+
+def _ingest_tabs(payload: dict, ua: str = "") -> int:
+    global _tab_report_at, _active_browser
     _tab_report_at = now_ms()
     b = browser_of(ua, payload.get("browser") or "")
+    sample_at = int(payload.get("at") or _tab_report_at)
+    if sample_at < _tab_sample_at.get(b, 0):
+        return 0
+    _tab_sample_at[b] = sample_at
     if b:
         _tab_report_by_browser[b] = _tab_report_at
     if isinstance(payload.get("web"), dict):
         _web_diag[b or "?"] = payload["web"]
     act = payload.get("active") or {}
-    aurl = act.get("url") or ""
-    am = re.search(r"[?&]conversationId=(\d+)", aurl)
-    save_active({"cid": am.group(1) if am else None,
-                 "focused": bool(act.get("focused"))})
+    active_cid = conversation_id(act.get("url") or "")
+    focused = bool(act.get("focused"))
+    # A heartbeat from an unfocused browser must not clear the focused browser's session.
+    if focused or not _active_browser or _active_browser == b:
+        _active_browser = b if focused else ""
+        save_active({"cid": active_cid or None, "focused": focused})
 
     # 整份快照替换：同一次上报里没出现的会话，说明它的标签已经不在了。
     # 不清理的话旧 tabId 会一直留着，点任务时先「聚焦」到不存在的标签再新开。
@@ -1554,10 +1603,9 @@ def ingest_tabs(payload: dict, ua: str = "") -> int:
         # 只收会话页：同域其它页面即使带 conversationId 也不参与跳转/清理
         if CONV_PAGE_PREFIX and not _is_conv_page(url):
             continue
-        m = re.search(r"[?&]conversationId=(\d+)", url)
-        if not m:
+        cid = conversation_id(url)
+        if not cid:
             continue
-        cid = m.group(1)
         tid = t.get("tabId")
         if isinstance(tid, int):
             _tab_ids[cid] = tid
@@ -1571,7 +1619,7 @@ def ingest_tabs(payload: dict, ua: str = "") -> int:
             _tab_groups.pop(cid, None)      # 移出标签组后别再显示旧组名
         n += 1
     # 这次没报上来的会话：标签已关，映射和组名一起作废
-    for cid in [c for c in _tab_ids if c not in seen]:
+    for cid in [c for c in _tab_ids if c not in seen and (not b or _tab_browser.get(c) == b)]:
         _tab_ids.pop(cid, None)
         _tab_browser.pop(cid, None)
         _tab_groups.pop(cid, None)
@@ -1636,10 +1684,10 @@ def snapshot_edge_tabs(timeout: float = 10, app: str = BROWSER_APP["edge"]) -> d
         mapping[url] = pos
         # 会话 ID 索引：同一会话的 URL 参数可能各不相同（openHistory/formPage 等），
         # 精确比对 URL 会大量 miss 并退回「新开标签」，所以按 conversationId 匹配
-        m = re.search(r"[?&]conversationId=(\d+)", url)
-        if m:
-            mapping["cid:" + m.group(1)] = pos
-            live.add(m.group(1))
+        cid = conversation_id(url)
+        if cid:
+            mapping["cid:" + cid] = pos
+            live.add(cid)
     cache = _tabs_cache(app)
     cache["map"] = mapping
     cache["live"] = live
@@ -1647,13 +1695,48 @@ def snapshot_edge_tabs(timeout: float = 10, app: str = BROWSER_APP["edge"]) -> d
     return mapping
 
 
-FOCUS_TAB_SCRIPT = """
+APPLESCRIPT_TARGET = """
+on targetURL(u, prefix, cid)
+  if u is missing value then return false
+  if prefix is not "" then
+    if not (u starts with (prefix & "?") or u starts with (prefix & "/")) then return false
+  end if
+  set savedDelimiters to AppleScript's text item delimiters
+  try
+    set AppleScript's text item delimiters to "#"
+    set baseURL to text item 1 of u
+    set AppleScript's text item delimiters to "?"
+    if (count of text items of baseURL) < 2 then
+      set AppleScript's text item delimiters to savedDelimiters
+      return false
+    end if
+    set queryString to text item 2 of baseURL
+    set AppleScript's text item delimiters to "&"
+    set params to text items of queryString
+    set AppleScript's text item delimiters to savedDelimiters
+    set matches to 0
+    repeat with param in params
+      if (param as text) starts with "conversationId=" then
+        if (param as text) is not ("conversationId=" & cid) then return false
+        set matches to matches + 1
+      end if
+    end repeat
+    return matches = 1
+  on error
+    set AppleScript's text item delimiters to savedDelimiters
+    return false
+  end try
+end targetURL
+"""
+
+
+FOCUS_TAB_SCRIPT = APPLESCRIPT_TARGET + """
 tell application "%(app)s"
   set u to ""
   try
     set u to (URL of tab %(tab)d of window %(win)d as text)
   end try
-  if u does not contain "conversationId=%(cid)s" then return "stale"
+  if not my targetURL(u, %(prefix)s, "%(cid)s") then return "stale"
   set index of window %(win)d to 1
   set active tab index of window %(win)d to %(tab)d
   activate
@@ -1661,7 +1744,7 @@ tell application "%(app)s"
 end tell
 """
 
-FIND_TAB_SCRIPT = """
+FIND_TAB_SCRIPT = APPLESCRIPT_TARGET + """
 tell application "%(app)s"
   set wi to 0
   repeat with w in windows
@@ -1673,7 +1756,7 @@ tell application "%(app)s"
       try
         set u to (URL of t as text)
       end try
-      if u contains "conversationId=%(cid)s" then
+      if my targetURL(u, %(prefix)s, "%(cid)s") then
         set index of w to 1
         set active tab index of w to ti
         activate
@@ -1703,7 +1786,8 @@ def focus_tab(win: int, tab: int, app: str = BROWSER_APP["edge"], cid: str = "")
     序号漂移，直接 set active tab index 就可能停在别人的会话上——看起来就是
     「点了 A 却跳到 B」。核对不上就当 miss，交给 find_tab 重新定位。
     """
-    script = FOCUS_TAB_SCRIPT % {"app": app, "win": win, "tab": tab, "cid": cid}
+    script = FOCUS_TAB_SCRIPT % {"app": app, "win": win, "tab": tab, "cid": cid,
+                                 "prefix": json.dumps(CONV_PAGE_PREFIX)}
     out = _run_osa(script)
     if out == "ok":
         return True
@@ -1714,7 +1798,7 @@ def focus_tab(win: int, tab: int, app: str = BROWSER_APP["edge"], cid: str = "")
 
 def find_tab(cid: str, app: str = BROWSER_APP["edge"]) -> bool:
     """按 conversationId 全量扫一遍再切（缓存 miss / 序号漂移时的兜底）。"""
-    return _run_osa(FIND_TAB_SCRIPT % {"app": app, "cid": cid}, timeout=10) == "ok"
+    return _run_osa(FIND_TAB_SCRIPT % {"app": app, "cid": cid, "prefix": json.dumps(CONV_PAGE_PREFIX)}, timeout=10) == "ok"
 
 
 # ── 扩展命令通道：长轮询，避免 AppleScript 的一百多毫秒开销 ──────────
@@ -1724,7 +1808,9 @@ _cmd_queues: dict[str, "queue.Queue[dict]"] = {}
 _cmd_done: dict[str, float] = {}    # 已经执行或已过期，防止迟到的扩展再执行一次
 # 点了任务但还没确认切过去：cmd_id -> (cid, 点击那一刻的 update_ms)
 # 只有标签真的切过去才据此标已读，且用点击时的版本判定，新回复不会被顺带吃掉
-_open_pending: dict[str, tuple[str, int]] = {}
+_open_pending: dict[str, tuple[str, int, str]] = {}
+_cmd_claim_lock = threading.Lock()
+_open_visit_until: dict[str, float] = {}
 _cmd_acks: dict[str, float] = {}
 # cmd_id -> 扩展回报的执行结果（如 {"result": "closed", "n": 12}）
 _cmd_results: dict[str, dict] = {}
@@ -1735,7 +1821,7 @@ _ext_seen = 0.0          # 扩展最近一次长轮询的时间
 _auth_warned = False     # 「密钥不可用、请求放行」的告警只打一次，别刷屏日志
 
 
-def _confirm_open(cid: str, clicked_update: int) -> None:
+def _confirm_open(cid: str, clicked_update: int, clicked_reply: str | None = None) -> None:
     """标签确实切过去了，才算用户「看过这个会话的这一次回复」。
 
     clicked_update 是点击时的 update_ms：如果这期间又来了新回复（update_ms
@@ -1745,9 +1831,11 @@ def _confirm_open(cid: str, clicked_update: int) -> None:
         with _lock:
             state = load_state()
             task = (state.get("tasks") or {}).get(str(cid))
-            if not task or task.get("muted"):
+            if not task or task.get("muted") or task.get("running_since"):
                 return
             if (task.get("update_ms") or 0) > clicked_update:
+                return
+            if clicked_reply is not None and (task.get("reply_version") or "") != clicked_reply:
                 return
             mark_seen(task)
             save_state(state)
@@ -1768,18 +1856,18 @@ def _cmd_expired(item: dict) -> bool:
 
 def _open_fallback(cid: str, cmd_id: str) -> None:
     """扩展没在 0.25s 内接走命令时，退回 AppleScript 聚焦（必须执行）。"""
-    if _cmd_acks.pop(cmd_id, None) is not None:
+    with _cmd_claim_lock:
+        if cmd_id in _cmd_done:
+            return
+        # Claim before navigating; an extension that has already claimed owns the action.
         _cmd_done[cmd_id] = time.time()
-        return
-    # 兜底已经动过手了：命令作废，迟到的扩展即使领到也不要再执行一次
-    _cmd_done[cmd_id] = time.time()
-    t0 = _cmd_t0.pop(cmd_id, None)
-    pending = _open_pending.pop(cmd_id, None)
+        t0 = _cmd_t0.pop(cmd_id, None)
+        pending = _open_pending.pop(cmd_id, None)
     try:
         r = open_conversation(cid)
         ms = int((time.time() - t0) * 1000) if t0 else -1
         log("open cid=%s via=applescript(%s) %dms" % (cid, r, ms))
-        if r in ("focused", "opened") and pending:
+        if r == "focused" and pending:
             _confirm_open(*pending)
     except Exception as e:
         log("open fallback failed cid=%s: %s" % (cid, e))
@@ -1794,7 +1882,7 @@ def open_conversation(cid: str) -> str:
     with _open_guard:
         now = time.time()
         if now - _open_seen.get(cid, 0) < 1.5:
-            return "focused"
+            return "duplicate"
         _open_seen[cid] = now
 
     task = (load_state().get("tasks") or {}).get(cid) or {}
@@ -1805,7 +1893,7 @@ def open_conversation(cid: str) -> str:
     # 这个会话的标签在哪个浏览器里，由扩展上报决定；不知道时就两个都找
     owner = _tab_browser.get(cid) or ""
     app = BROWSER_APP.get(owner, "")
-    candidates = [app] if app else [BROWSER_APP["edge"], BROWSER_APP["chrome"]]
+    candidates = ([app] if app else []) + [a for a in BROWSER_APP.values() if a != app]
 
     key = "cid:" + cid
     for a in candidates:
@@ -2156,9 +2244,13 @@ class Handler(BaseHTTPRequestHandler):
                     except queue.Empty:
                         break
                     # 兜底已经执行过、或已经过期的命令直接丢掉，别再开一个标签
-                    if candidate.get("id") in _cmd_done or _cmd_expired(candidate):
-                        continue
-                    item = candidate
+                    with _cmd_claim_lock:
+                        command_id = candidate.get("id")
+                        if command_id in _cmd_done or _cmd_expired(candidate):
+                            continue
+                        if candidate.get("cmd") == "focus" and command_id:
+                            _cmd_done[command_id] = time.time()
+                        item = candidate
                     break
             finally:
                 with _cmd_waiters_lock:
@@ -2219,13 +2311,28 @@ class Handler(BaseHTTPRequestHandler):
             # 只落盘，不动状态：重算交给常驻循环（它是唯一的写入方，
             # 这样「心跳刷新整份快照」和用户操作互相覆盖的问题一并消失）
             try:
-                os.makedirs(os.path.dirname(WEBSTATE_FILE), exist_ok=True)
-                # 多个标签页会同时上报，临时文件名带线程号避免互相搬走
-                tmp = "%s.%d.tmp" % (WEBSTATE_FILE, threading.get_ident())
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(payload, f, ensure_ascii=False)
-                os.replace(tmp, WEBSTATE_FILE)
-            except OSError as exc:
+                at = int(payload.get("at") or 0)
+                if not at or at > now_ms() + 5000:
+                    self._json({"ok": False, "error": "invalid sample time"}, 400)
+                    return
+                with _lock:
+                    if source_mode() != "web":
+                        self._json({"ok": True, "ignored": "source is api"})
+                        return
+                    try:
+                        with open(WEBSTATE_FILE, encoding="utf-8") as f:
+                            previous_at = int(json.load(f).get("at") or 0)
+                    except (OSError, ValueError, AttributeError):
+                        previous_at = 0
+                    if previous_at >= at:
+                        self._json({"ok": True, "ignored": "older snapshot"})
+                        return
+                    os.makedirs(os.path.dirname(WEBSTATE_FILE), exist_ok=True)
+                    tmp = "%s.%d.tmp" % (WEBSTATE_FILE, threading.get_ident())
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, ensure_ascii=False)
+                    os.replace(tmp, WEBSTATE_FILE)
+            except (OSError, ValueError, TypeError) as exc:
                 self._json({"ok": False, "error": str(exc)}, 500)
                 return
             _wake.set()
@@ -2252,9 +2359,10 @@ class Handler(BaseHTTPRequestHandler):
 
         # 扩展收到命令并执行完后回报
         if parsed.path == "/cmd/ack":
-            _cmd_acks[cid] = time.time()
-            _cmd_done[cid] = time.time()
-            pending = _open_pending.pop(cid, None)
+            with _cmd_claim_lock:
+                _cmd_acks[cid] = time.time()
+                _cmd_done[cid] = time.time()
+                pending = _open_pending.pop(cid, None)
             # unknown / expired 表示扩展没真正切过去，不能当成「看过了」
             if pending and (query.get("result") or [""])[0] in ("focused", "created"):
                 _confirm_open(*pending)
@@ -2277,14 +2385,39 @@ class Handler(BaseHTTPRequestHandler):
 
         # /open：优先让扩展用 chrome.tabs 切（毫秒级），失败再退回 AppleScript
         if parsed.path == "/open":
-            cmd_id = "%s-%d" % (cid, int(time.time() * 1000))
+            if not re.fullmatch(r"[0-9]+", cid):
+                self._json({"ok": False, "result": "missing"}, 400)
+                return
+            cmd_id = "%s-%s" % (cid, secrets.token_hex(8))
             task0 = (load_state().get("tasks") or {}).get(cid) or {}
             url0 = task0.get("url")
+            if not url0:
+                self._json({"ok": False, "result": "missing"}, 404)
+                return
+            try:
+                clicked_update = int((query.get("update") or [task0.get("update_ms") or 0])[0])
+            except ValueError:
+                self._json({"ok": False, "result": "invalid version"}, 400)
+                return
+            clicked_reply = (query.get("version") or [task0.get("reply_version") or "-"])[0]
+            ticket = (cid, clicked_update, "" if clicked_reply == "-" else clicked_reply)
+            # Do not let activation events during a programmatic jump acknowledge a newer reply.
+            _open_visit_until[cid] = time.monotonic() + 15
+            with _cmd_claim_lock:
+                cutoff = time.time() - 120
+                for key, when in list(_cmd_done.items()):
+                    if when < cutoff:
+                        _cmd_done.pop(key, None)
+                        _open_pending.pop(key, None)
+                        _cmd_t0.pop(key, None)
+                for key, when in list(_open_visit_until.items()):
+                    if when <= time.monotonic():
+                        _open_visit_until.pop(key, None)
             owner = _tab_browser.get(cid)
             if (url0 and owner and (time.time() - _ext_seen) < 20 and _cmd_waiters > 0):
                 _cmd_t0[cmd_id] = time.time()
                 # 记下点击那一刻的回复版本：之后到的新回复不能被这次「已读」吃掉
-                _open_pending[cmd_id] = (cid, task0.get("update_ms") or 0)
+                _open_pending[cmd_id] = ticket
                 _cmd_queue(owner).put({"cmd": "focus", "cid": cid, "url": url0,
                                        "tabId": _tab_ids.get(cid), "id": cmd_id,
                                        "browser": owner,
@@ -2294,9 +2427,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 result = open_conversation(cid)
             # 只有真的把标签切过去了才算读过；入队 / 排队中不算
-            if result in ("focused", "opened"):
-                _confirm_open(cid, task0.get("update_ms") or 0)
-            self._json({"ok": True, "result": result})
+            if result == "focused":
+                _confirm_open(*ticket)
+            self._json({"ok": result not in ("failed", "missing"), "result": result})
             return
 
         focused = True           # 旧版扩展不带这个字段，按「在前台」处理
@@ -2305,11 +2438,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 ln = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(ln)) if ln > 0 else {}
-                match = re.search(r"[?&]conversationId=(\d+)", payload.get("url") or "")
+                cid = conversation_id(payload.get("url") or "")
                 focused = payload.get("focused", True) is not False
             except (AttributeError, TypeError, ValueError):
-                match = None
-            cid = match.group(1) if match else ""
+                cid = ""
+                focused = False
 
         deadline = None
         if parsed.path == "/deadline" and query.get("minutes"):
@@ -2343,7 +2476,8 @@ class Handler(BaseHTTPRequestHandler):
                                     seen_ms=now_ms(), running_since=0, queue_error=True)
                 elif parsed.path == "/active":
                     # 后台窗口里的程序化切标签不算「用户在看」
-                    changed = (focused and not task.get("muted")
+                    changed = (focused and not task.get("muted") and not task.get("running_since")
+                               and time.monotonic() >= _open_visit_until.get(cid, 0)
                                and task.get("status") in ("attention", "stuck"))
                     if changed:
                         mark_seen(task)
@@ -2396,24 +2530,32 @@ def close_conversation_tabs(mode: str) -> int | None:
     targets = closeable_tabs(mode)
     if not targets:
         return 0
-    owner = _tab_browser.get(targets[0][0]) or ""
-    if not owner or (time.time() - _ext_seen) >= 20 or _cmd_waiters <= 0:
+    if (time.time() - _ext_seen) >= 20 or _cmd_waiters <= 0:
         return None
-    cmd_id = "close-%d" % int(time.time() * 1000)
-    _cmd_queue(owner).put({
-        "cmd": "closeTabs",
-        "tabIds": {cid: tab for cid, tab in targets},
-        "id": cmd_id,
-        "expires": int(time.time() * 1000) + 15000,
-    })
-    # 等扩展回报实际关了几个；超过 5 秒就当作没关成
+    groups = {}
+    for cid, tab in targets:
+        owner = _tab_browser.get(cid)
+        if owner:
+            groups.setdefault(owner, {})[cid] = tab
+    if not groups:
+        return None
+    pending = set()
+    for owner, tabs in groups.items():
+        cmd_id = "close-" + secrets.token_hex(8)
+        pending.add(cmd_id)
+        _cmd_queue(owner).put({"cmd": "closeTabs", "tabIds": tabs, "id": cmd_id,
+                               "expires": int(time.time() * 1000) + 5000})
+    closed = 0
     deadline = time.time() + 5
-    while time.time() < deadline:
-        got = _cmd_results.pop(cmd_id, None)
-        if got is not None:
-            return int(got.get("n") or 0)
-        time.sleep(0.05)
-    return 0
+    while pending and time.time() < deadline:
+        for cmd_id in list(pending):
+            got = _cmd_results.pop(cmd_id, None)
+            if got is not None:
+                pending.remove(cmd_id)
+                closed += int(got.get("n") or 0)
+        if pending:
+            time.sleep(0.05)
+    return closed
 
 
 # ── 主循环 ──────────────────────────────────────────────────────────

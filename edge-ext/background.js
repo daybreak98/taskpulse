@@ -95,7 +95,7 @@ async function push() {
 async function notifyActive(tabId) {
   try {
     const t = await chrome.tabs.get(tabId);
-    if (!t || !t.url || !ORIGIN || !t.url.startsWith(ORIGIN + "/")) return;
+    if (!t || !t.active || t.status !== "complete" || !isConversationTab(t.url)) return;
     // 后台窗口里的程序化切标签不该算「用户在看」→ 带上窗口是否聚焦
     let focused = false;
     try {
@@ -155,41 +155,69 @@ async function closeTabsFor(map, expires) {
   return closed;
 }
 
-async function focusConversation(cid, url, tabId, stale) {
-  const re = new RegExp("[?&]conversationId=" + cid + "(?:[&#]|$)");
+function matchesConversation(url, cid) {
+  if (!isConversationTab(url) || !/^\d+$/.test(cid)) return false;
+  try {
+    const values = new URL(url).searchParams.getAll("conversationId");
+    return values.length === 1 && values[0] === cid;
+  } catch (_) { return false; }
+}
+
+async function arrived(tabId, cid) {
+  const t = await chrome.tabs.get(tabId).catch(() => null);
+  if (!t || !t.active || t.status !== "complete" || t.pendingUrl && t.pendingUrl !== t.url ||
+      !matchesConversation(t.url, cid)) return false;
+  const w = await chrome.windows.get(t.windowId).catch(() => null);
+  return !!w?.focused;
+}
+
+async function waitForArrival(tabId, cid) {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    if (await arrived(tabId, cid)) return true;
+    const t = await chrome.tabs.get(tabId).catch(() => null);
+    if (!t || t.status === "complete" && t.url && t.url !== "about:blank" && !matchesConversation(t.url, cid)) return false;
+    await sleep(100);
+  }
+  return false;
+}
+
+async function focusConversation(cid, url, tabId, expires) {
   let hit = null;
   // 优先用 TaskPulse 缓存的 tabId（单标签查询，比全量 query 快一个量级）
   if (typeof tabId === "number") {
     try {
       const t = await chrome.tabs.get(tabId);
-      if (t && t.url && re.test(t.url)) hit = t;
+      if (t && t.status === "complete" && matchesConversation(t.url, cid)) hit = t;
     } catch (_) {}
   }
   if (!hit && SCOPE) {
     const tabs = await chrome.tabs.query({ url: SCOPE });
-    hit = tabs.find((t) => t.url && re.test(t.url));
+    hit = tabs.find((t) => t.status === "complete" && matchesConversation(t.url, cid));
   }
   // 过期命令一律不执行：后端已经用 AppleScript 兜底动过手了，
   // 这里再切一次就是两个执行方做同一件事（评审要求二者互斥）
-  if (stale) return "expired";
+  if (expires && Date.now() > expires) return "expired";
 
   if (hit) {
     // 切标签与把窗口激活到前台并行发起，省掉一次串行等待
-    const jobs = [chrome.tabs.update(hit.id, { active: true })];
+    await chrome.tabs.update(hit.id, { active: true });
     if (typeof hit.windowId === "number") {
-      jobs.push(chrome.windows.update(hit.windowId, { focused: true }).catch(() => {}));
+      await chrome.windows.update(hit.windowId, { focused: true });
     }
-    await Promise.all(jobs);
-    return "focused";
+    return await arrived(hit.id, cid) ? "focused" : "unconfirmed";
   }
 
-  if (!url) return "expired";
+  if (!matchesConversation(url, cid)) return "expired";
 
   // 这个会话没有自己的标签页。就用新标签打开，不去改动用户已经打开的页面：
   // 覆盖式导航看似省一个标签，但会把用户正在看的会话换掉，行为不可预期。
   // 上面两次查找已经按 URL 全量扫过，所以「找不到」是真的没有，不是映射过期。
-  await chrome.tabs.create({ url, active: true });
-  return "created";
+  const created = await chrome.tabs.create({ url, active: true });
+  if (typeof created.windowId === "number") {
+    await chrome.windows.update(created.windowId, { focused: true });
+  }
+  return await waitForArrival(created.id, cid) ? "created" : "unconfirmed";
 }
 
 // 长轮询：TaskPulse 点提示条时，命令在这里被毫秒级接走
@@ -216,10 +244,9 @@ async function listen() {
           }
         }
         if (cmd && cmd.cmd === "focus" && cmd.cid) {
-          const stale = !!cmd.expires && Date.now() > cmd.expires;
           let how = "unknown";
           try {
-            how = await focusConversation(String(cmd.cid), cmd.url || "", cmd.tabId, stale);
+            how = await focusConversation(String(cmd.cid), cmd.url || "", cmd.tabId, cmd.expires);
           } catch (_) {}
           if (cmd.id) {
             try {
@@ -382,11 +409,15 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     return;
   }
   if (msg.kind === "webstate" && msg.payload) {
+    if (pausedByApi || sender?.tab?.id !== leaderId || sender?.frameId !== 0) {
+      respond({ ok: false });
+      return;
+    }
     fetch(WEBSTATE_ENDPOINT, {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(msg.payload)
-    }).then(() => respond({ ok: true })).catch(() => respond({ ok: false }));
+    }).then(r => respond({ ok: r.ok })).catch(() => respond({ ok: false }));
     return true;
   }
 });

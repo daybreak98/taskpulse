@@ -115,6 +115,7 @@ struct TaskItem: Decodable, Equatable {
     let muted: Bool?
     let stale: Bool?
     let reply_version: String?
+    let updated_ms: Int?
     /// 用户手动标的「完成后提醒我」：行更亮，回话弹窗常驻
     let important: Bool?
     /// 浏览器里是否有这个会话的标签页（清理菜单据此算能关几个）
@@ -1652,8 +1653,16 @@ final class PollerRunner {
         p.environment = env
         p.standardOutput = logHandle("taskpulse.poll.out")
         p.standardError = logHandle("taskpulse.poll.err")
-        p.terminationHandler = { done in
+        p.terminationHandler = { [weak self] done in
             dbg("poller 退出 status=\(done.terminationStatus)")
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.stopped, self.proc === done else { return }
+                self.proc = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    guard let self, !self.stopped else { return }
+                    self.start(rt)
+                }
+            }
         }
         do {
             try p.run()
@@ -1763,7 +1772,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self?.showToast(TaskItem(id: 0, name: "测试提示条", group: nil, status: "attention",
                                              prev: nil, progress: 0, elapsed: 0, idle_minutes: 0,
                                              overdue: false, failed: nil, muted: nil, stale: nil,
-                                             reply_version: nil, important: nil, has_tab: nil),
+                                             reply_version: nil, updated_ms: nil, important: nil, has_tab: nil),
                                    title: "测试提示条", body: "如果你看到这条，说明提示条正常")
                     return
                 }
@@ -2553,8 +2562,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 点击任务行：跳到对应标签页（不再自动算完成）
     func open(_ item: TaskItem) {
-        activateEdge()
-        guard let url = URL(string: endpoint + "/open?id=\(item.id)") else { return }
+        guard var components = URLComponents(string: endpoint + "/open") else { return }
+        components.queryItems = [URLQueryItem(name: "id", value: String(item.id)),
+                                 URLQueryItem(name: "version", value: item.reply_version ?? "-")]
+        if let update = item.updated_ms {
+            components.queryItems?.append(URLQueryItem(name: "update", value: String(update)))
+        }
+        guard let url = components.url else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 15

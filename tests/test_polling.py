@@ -693,6 +693,87 @@ class PollingTests(unittest.TestCase):
                                 headers={"User-Agent": "Mozilla/5.0 Chrome/157"})
         self.assertEqual(r.status_code, 204)
 
+    def test_api_does_not_import_old_web_error(self):
+        path = Path(self.directory) / "webstate.json"
+        path.write_text(json.dumps({"at": NOW, "error": "HTTP 401"}), encoding="utf-8")
+        with patch.multiple(poller, WEBSTATE_FILE=str(path), source_mode=lambda: "api"):
+            state = poller.poll_tick(FakeAgent([conversation()]), full=True)
+        self.assertNotIn("poller_error", state)
+
+    def test_web_round_freezes_list_and_health_as_well_as_queue(self):
+        path = Path(self.directory) / "webstate.json"
+        first = {"at": NOW, "conversations": [conversation(1)],
+                 "queues": {"1": {"state": "IDLE", "pending": []}}, "queueAt": {"1": NOW}}
+        path.write_text(json.dumps(first), encoding="utf-8")
+        with patch.object(poller, "WEBSTATE_FILE", str(path)):
+            provider = poller.WebProvider()
+            provider.begin_round()
+            path.write_text(json.dumps({"at": NOW + 5000, "conversations": [conversation(2)]}), encoding="utf-8")
+            self.assertEqual(provider.conversations(1)[0]["id"], 1)
+            self.assertEqual(provider.last_at(), NOW)
+            self.assertEqual(provider.queue(1, 1), (False, "IDLE"))
+
+    def test_no_sample_does_not_advance_queue_watermark(self):
+        task = {"id": 1, "queue_checked_at": NOW - 10000, "queue_observed_at": NOW - 10000}
+        poller.apply_queue_sample(task, poller.QueueSample(NOW, None), {}, [])
+        self.assertEqual(task["queue_checked_at"], NOW - 10000)
+        self.assertEqual(task["queue_observed_at"], NOW - 10000)
+
+    def test_new_run_resets_old_failure_and_settle_state(self):
+        task = {"id": 1, "name": "test", "status": "stuck", "failed": True,
+                "update_ms": NOW, "running_since": 0, "settle_until": NOW + 1000}
+        events = []
+        poller.apply_queue_sample(task, poller.QueueSample(NOW, True, "RUNNING"), {}, events)
+        self.assertEqual(task["status"], "running")
+        self.assertFalse(task["failed"])
+        self.assertNotIn("settle_until", task)
+        self.assertEqual(events, [])
+
+    def test_new_pending_reply_resets_countdown(self):
+        task = {"id": 1, "name": "test", "status": "attention", "update_ms": NOW,
+                "acked_update": NOW - 1000000, "reply_version": "update:old",
+                "reply_pending": True, "countdown_since": NOW - 1000000}
+        events = []
+        poller.apply_queue_sample(task, poller.QueueSample(NOW, False, "IDLE"), {}, events)
+        self.assertEqual(task["status"], "attention")
+        self.assertEqual(task["countdown_since"], NOW)
+        self.assertEqual(events, [])
+
+    def test_open_confirmation_is_bound_to_reply_and_not_running(self):
+        task = {"id": 1, "status": "attention", "reply_pending": True,
+                "update_ms": NOW, "reply_version": "run:new"}
+        poller.save_state({"tasks": {"1": task}})
+        poller._confirm_open("1", NOW, "run:old")
+        self.assertTrue(poller.load_state()["tasks"]["1"]["reply_pending"])
+        task.update(status="stuck", running_since=NOW - 1000)
+        poller.save_state({"tasks": {"1": task}})
+        poller._confirm_open("1", NOW, "run:new")
+        self.assertEqual(poller.load_state()["tasks"]["1"]["status"], "stuck")
+
+    def test_browser_heartbeat_keeps_other_browser_tab_and_focus(self):
+        with patch.multiple(poller, _tab_ids={}, _tab_browser={}, _tab_groups={},
+                            _tab_sample_at={}, _active_browser=""):
+            edge_url = "https://agent.example.com/chat?conversationId=1"
+            chrome_url = "https://agent.example.com/chat?conversationId=2"
+            poller.ingest_tabs({"browser": "edge", "tabs": [{"url": edge_url, "tabId": 1}],
+                                "active": {"url": edge_url, "focused": True}})
+            poller.ingest_tabs({"browser": "chrome", "tabs": [{"url": chrome_url, "tabId": 2}],
+                                "active": {"url": chrome_url, "focused": False}})
+            self.assertEqual(poller._tab_ids, {"1": 1, "2": 2})
+            self.assertEqual(poller.load_active()["cid"], "1")
+            self.assertTrue(poller.load_active()["focused"])
+
+    def test_conversation_id_requires_exact_query_and_scope(self):
+        self.assertEqual(poller.conversation_id("https://agent.example.com/chat?conversationId=123"), "123")
+        self.assertEqual(poller.conversation_id("https://agent.example.com/share?conversationId=12"), "")
+        self.assertEqual(poller.conversation_id("https://agent.example.com/chat?conversationId=12&conversationId=123"), "")
+        self.assertEqual(poller.conversation_id("https://agent.example.com/chat?next=x#?conversationId=12"), "")
+
+    def test_claimed_focus_command_cannot_trigger_fallback(self):
+        with patch.multiple(poller, _cmd_done={"test-claim": time.time()}, open_conversation=Mock()):
+            poller._open_fallback("1", "test-claim")
+            poller.open_conversation.assert_not_called()
+
     def test_finished_task_leaves_live_counts(self):
         agent = FakeAgent([conversation(1)], busy=(1,))
         poller.poll_tick(agent, full=True)
