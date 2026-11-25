@@ -1,5 +1,13 @@
 # TaskPulse 安装步骤
 
+> **2026-11-25 起，安装改成 App 内自初始化。**
+> 同事拿到的 ZIP 里只有 `TaskPulse.app` 和 `README.md`：双击 App，它自己把
+> uv / Python / 配置 / 扩展文件准备到用户目录，然后引导装浏览器扩展。
+> 不再需要双击 `install.command`，也不需要终端。
+> 面向同事的说明见 `packaging/QUICKSTART.md`（包里叫 `README.md`）；
+> 下面这份保留给需要排查、或想手动安装的人。
+
+
 TaskPulse 是贴在屏幕右边缘的一条细条，点开能看到你所有 DataAgent 会话的状态：
 谁在跑、谁在等你、谁卡住了。点一下任务就跳到对应的浏览器标签。
 

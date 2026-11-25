@@ -1508,7 +1508,7 @@ final class PollerRunner {
     private var proc: Process?
     private var stopped = false
     private var startedByUs = false
-    private var home: String { NSHomeDirectory() }
+    private var home: String { Bootstrap.home }
 
     func startIfNeeded() {
         guard let rt = loadRuntime() else {
@@ -1521,6 +1521,20 @@ final class PollerRunner {
             guard let self, !self.stopped else { return }
             if alive {
                 dbg("poller: 已有服务在 127.0.0.1:\(port)，不重复启动")
+                return
+            }
+            self.spawn(rt)
+        }
+    }
+
+    /// 用首次初始化的结果启动（不读 runtime.json，避免刚写完文件的时序问题）
+    func start(with plan: Bootstrap.Plan) {
+        guard !stopped else { return }
+        let rt = Runtime(uv: plan.uv, poller: plan.poller, port: plan.port, args: plan.args)
+        serviceAlive(port: plan.port) { [weak self] alive in
+            guard let self, !self.stopped else { return }
+            if alive {
+                dbg("poller: 已有服务在 127.0.0.1:\(plan.port)，不重复启动")
                 return
             }
             self.spawn(rt)
@@ -1642,14 +1656,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 退出按钮会摘掉 LaunchAgent，之后用户双击 App 是「手工启动」的。
         // 若再登录，launchd 也会拉起一个——两个面板叠一起。这里保证只有一个。
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
-        if running.count > 1 {
+        // 自检开关：两台实例同 bundle id 时，隔离测试会被这条挡掉
+        let skipInstanceCheck = ProcessInfo.processInfo.environment["TP_SKIP_INSTANCE_CHECK"] == "1"
+        if running.count > 1 && !skipInstanceCheck {
             NSApp.terminate(nil)
             return
         }
         buildPanel()
         applyLayout()
         refresh()
-        poller.startIfNeeded()
+        // 首次打开：先把运行环境准备到用户目录（原来由 install.command 做），
+        // 之后再起后台。已经初始化过的机器直接起，跳过一次额外检查。
+        if Bootstrap.isReady() {
+            // 先纠正 runtime.json 里的路径（App 可能被移动过）
+            Bootstrap.refreshPaths()
+            if Bootstrap.isReady() { poller.startIfNeeded() } else { runBootstrap() }
+        } else {
+            runBootstrap()
+        }
         dataTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
@@ -1688,6 +1712,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                 OnboardingController.shared.show()
             }
+        }
+    }
+
+    private var bootstrapRunning = false
+
+    /// 首次启动的初始化：进度与失败都显示在那个引导面板里，失败可重试。
+    func runBootstrap() {
+        guard !bootstrapRunning else { return }
+        bootstrapRunning = true
+        OnboardingController.shared.showBootstrap { [weak self] plan in
+            guard let self else { return }
+            self.bootstrapRunning = false
+            self.poller.start(with: plan)
         }
     }
 
@@ -2424,10 +2461,24 @@ private struct CloseResult: Decodable {
     let closed: Int?
 }
 
+// 自检入口：在终端里跑一遍初始化，打印每一步结果（不需要图形界面）
+if CommandLine.arguments.contains("--bootstrap-check") {
+    do {
+        let plan = try Bootstrap.runSync()
+        print("OK uv=\(plan.uv)")
+        print("   poller=\(plan.poller)")
+        print("   port=\(plan.port)  args=\(plan.args.count) 个")
+        exit(0)
+    } catch {
+        print("FAIL \(error)")
+        exit(1)
+    }
+}
+
 // 单实例
-try? FileManager.default.createDirectory(atPath: NSHomeDirectory() + "/.taskpulse",
+try? FileManager.default.createDirectory(atPath: Bootstrap.stateDir,
                                          withIntermediateDirectories: true)
-let lockPath = NSHomeDirectory() + "/.taskpulse/ui.lock"
+let lockPath = Bootstrap.stateDir + "/ui.lock"
 if !FileManager.default.fileExists(atPath: lockPath) {
     FileManager.default.createFile(atPath: lockPath, contents: nil)
 }
