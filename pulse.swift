@@ -1729,6 +1729,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             NSApp.terminate(nil)
             return
         }
+        dbg("进入主流程 ready=\(Bootstrap.isReady())")
         buildPanel()
         applyLayout()
         refresh()
@@ -1814,6 +1815,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return true
         }
 
+        dbg("自我安装：\(selfPath) -> \(target)（当前 \(mine)，已装 \(existing.isEmpty ? "无" : existing)）")
         OnboardingController.shared.showInstalling()
         DispatchQueue.global(qos: .userInitiated).async {
             // 升级时旧版本可能正在运行：先让它退出，否则新实例启动会被
@@ -1824,6 +1826,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 try fm.createDirectory(atPath: (target as NSString).deletingLastPathComponent,
                                        withIntermediateDirectories: true)
                 try fm.copyItem(atPath: selfPath, toPath: target)
+                dbg("自我安装：复制完成，准备启动新位置")
                 DispatchQueue.main.async {
                     self.launchLater(target)
                     NSApp.terminate(nil)
@@ -2649,6 +2652,9 @@ if CommandLine.arguments.contains("--bootstrap-check") {
         exit(1)
     }
 }
+
+// 启动埋点：闪退时这行是唯一线索，所以放在最前面
+dbg("启动 pid=\(getpid()) path=\(Bundle.main.bundlePath)")
 
 // 单实例：两把锁分开。
 //   - 已安装的那份（~/Applications）用 ui.lock，保证「只开一个窗口」
