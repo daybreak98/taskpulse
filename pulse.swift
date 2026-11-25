@@ -487,6 +487,25 @@ final class CapsuleView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
+// MARK: - 表头空白区
+
+/// 表头空白处（计数胶囊和 API/WEB 之间）双击：全部分组展开 / 折叠。
+/// 不画任何东西、不设 tooltip、不改光标——只是接一个手势。
+final class HeaderBlankCatcher: NSView {
+    var onDoubleClick: (() -> Void)?
+
+    override var isFlipped: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            onDoubleClick?()
+            return
+        }
+        // 单击仍交给上层：表头也是拖动窗口的把手
+        super.mouseDown(with: event)
+    }
+}
+
 // MARK: - 图钉按钮
 
 final class PinView: NSView {
@@ -1243,6 +1262,22 @@ final class PulseView: NSView {
         }
     }
 
+    /// 全部分组展开 / 折叠：有任意一个展开着就全收起，否则全展开
+    func toggleAllGroups() {
+        let gs = groups()
+        guard !gs.isEmpty else { return }
+        let anyOpen = gs.contains { isOpenNamed($0.name) }
+        if anyOpen {
+            closedGroups = Set(gs.map { $0.name })
+            openGroups.removeAll()
+        } else {
+            closedGroups.removeAll()
+            openGroups = Set(gs.map { $0.name })
+        }
+        rebuild()
+        onToggleGroup?("")
+    }
+
     private func toggle(group name: String) {
         if isOpenNamed(name) {
             closedGroups.insert(name)
@@ -1298,6 +1333,17 @@ final class PulseView: NSView {
             self.onSetSource?(mode)
         }
         addSubview(src)
+
+        // 计数胶囊结束（x≈106）到来源开关起点（width-100）之间是纯空白，
+        // 双击这里切换「全部分组展开 / 折叠」；视觉上不做任何改动
+        let blankLeft: CGFloat = 106
+        let blankRight: CGFloat = bounds.width - 100
+        if blankRight - blankLeft > 24 {
+            let catcher = HeaderBlankCatcher(
+                frame: NSRect(x: blankLeft, y: 0, width: blankRight - blankLeft, height: HEADER_H))
+            catcher.onDoubleClick = { [weak self] in self?.toggleAllGroups() }
+            addSubview(catcher)
+        }
 
         let sep = NSView(frame: NSRect(x: 10, y: HEADER_H - 0.5, width: bounds.width - 20, height: 0.5))
         sep.wantsLayer = true
@@ -1697,6 +1743,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.endDrag("mouseUp")
             return e
         }
+        // 诊断入口：TP_TEST_EXPAND_ALL=1 启动后自动把所有分组展开一次，
+        // 用来核对表头双击那种「全展开」后的排版（不需要注入鼠标）
+        if ProcessInfo.processInfo.environment["TP_TEST_EXPAND_ALL"] == "1" {
+            // 等扩展把标签组上报上来（最多 15 秒），否则展开的是空的「未分组」
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20.0) { [weak self] in
+                self?.view.toggleAllGroups()
+            }
+        }
+
         // 诊断入口：TP_TEST_TOAST=1 启动时弹一条测试提示条，用来确认右上角
         // 那条「Agent 回话了」到底能不能显示（毛玻璃渲染在部分机器上会失效）
         if ProcessInfo.processInfo.environment["TP_TEST_TOAST"] == "1" {
