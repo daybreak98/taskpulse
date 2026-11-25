@@ -12,21 +12,88 @@ CONFIG="$HOME/.taskpulse/config.json"
 echo "== TaskPulse 安装 =="
 echo "目标目录: $DEST"
 
-# ---------- 1. 准备 uv（用于运行后台服务）----------
+# ---------- 1. 准备 uv 与 Python（优先用本机已有的，其次用安装包自带的）----------
+ARCH="$(uname -m)"                                      # arm64 / x86_64
+UV_ARCH="$([ "$ARCH" = "arm64" ] && echo aarch64 || echo x86_64)"
+VENDOR="$(pwd)/vendor"
+PY_VERSION="$(cat "$VENDOR/python-version.txt" 2>/dev/null || echo "")"
+
+# 本机有东西但跑不起来时，问用户怎么办；没有图形界面就退回终端提问
+ask_use_bundled() {
+  # AppleScript 的字符串里不能有真实换行，先压成空格
+  local msg
+  msg="$(printf '%s' "$1" | tr '\n' ' ')"
+  if command -v osascript >/dev/null 2>&1; then
+    local ans
+    ans=$(osascript -e "display dialog \"$msg\" with title \"TaskPulse 安装\" \
+      buttons {\"先不装了\", \"用安装包自带的\"} default button \"用安装包自带的\" \
+      with icon caution" 2>/dev/null | sed 's/^.*button returned://')
+    [ "$ans" = "用安装包自带的" ]
+  else
+    printf "%s\n  用安装包自带的继续？[Y/n] " "$1"
+    read -r ans
+    [ "${ans:-Y}" != "n" ]
+  fi
+}
+
 UV_BIN="$(command -v uv || true)"
+if [ -z "$UV_BIN" ] && [ -x "$HOME/.local/bin/uv" ]; then
+  UV_BIN="$HOME/.local/bin/uv"
+fi
+
+if [ -n "$UV_BIN" ]; then
+  if "$UV_BIN" --version >/dev/null 2>&1; then
+    echo "-- 用本机已有的 uv：$UV_BIN（$("$UV_BIN" --version 2>/dev/null)）"
+  else
+    echo "-- 发现 $UV_BIN，但跑不起来"
+    ask_use_bundled "本机已有的 uv（$UV_BIN）无法运行，可能是文件损坏或架构不符（本机 $ARCH）。
+安装包自带一份 $ARCH 的 uv 可以用。要改用自带的吗？" || {
+      echo "!! 已停止。修好本机的 uv 后重跑本脚本即可。"
+      exit 1
+    }
+    UV_BIN=""
+  fi
+fi
+
 if [ -z "$UV_BIN" ]; then
-  if [ -x "$HOME/.local/bin/uv" ]; then
+  if [ -s "$VENDOR/uv-$UV_ARCH.gz" ]; then
+    echo "-- 解压安装包自带的 uv（$UV_ARCH，约 30MB）..."
+    mkdir -p "$HOME/.local/bin"
+    gunzip -c "$VENDOR/uv-$UV_ARCH.gz" > "$HOME/.local/bin/uv.tmp" \
+      && chmod +x "$HOME/.local/bin/uv.tmp" \
+      && mv "$HOME/.local/bin/uv.tmp" "$HOME/.local/bin/uv" || {
+        echo "!! 解压自带 uv 失败"
+        exit 1
+      }
     UV_BIN="$HOME/.local/bin/uv"
   else
-    echo "-- 未找到 uv，正在安装（需要网络）..."
+    echo "-- 安装包没带 $UV_ARCH 的 uv，改为在线安装（需要网络）..."
     curl -LsSf https://astral.sh/uv/install.sh | sh || {
       echo "!! uv 安装失败，请手动安装后重试：https://docs.astral.sh/uv/"
       exit 1
     }
     UV_BIN="$HOME/.local/bin/uv"
   fi
+  echo "   -> $("$UV_BIN" --version 2>/dev/null || echo 无法运行)"
 fi
-echo "-- uv: $UV_BIN"
+
+# Python 同理：本机有 >=3.10 就用本机的，否则解压自带的（最后才回退到 uv 在线下载）
+if UV_FOUND="$("$UV_BIN" python find '>=3.10' 2>/dev/null)"; then
+  echo "-- 用本机已有的 Python：$UV_FOUND"
+else
+  PY_NAME="cpython-${PY_VERSION}-macos-${UV_ARCH}-none"
+  if [ -n "$PY_VERSION" ] && [ -s "$VENDOR/python-$UV_ARCH.tar.xz" ]; then
+    PY_DIR="$("$UV_BIN" python dir 2>/dev/null || echo "$HOME/.local/share/uv/python")/$PY_NAME"
+    echo "-- 本机没有可用的 Python，解压自带的 $PY_VERSION（$UV_ARCH，约 80MB）..."
+    mkdir -p "$PY_DIR"
+    if tar -xJf "$VENDOR/python-$UV_ARCH.tar.xz" -C "$PY_DIR" \
+       && UV_FOUND="$("$UV_BIN" python find '>=3.10' 2>/dev/null)"; then
+      echo "   -> $UV_FOUND"
+    else
+      echo "-- 自带的 Python 解压后没被识别，改为在线安装（需要网络）"
+    fi
+  fi
+fi
 
 # ---------- 2. 配置：包内自带就直接用，不再提问 ----------
 mkdir -p "$HOME/.taskpulse"
@@ -267,6 +334,8 @@ api = {
     "pending": qf.get("pending") or "",
     "idle": list(qf.get("idle") or []),
     "body": body,
+    # 关键词匹配在页面内完成（只把布尔回传），这份表要跟 poller 同源
+    "marks": list(cfg.get("failure_marks") or []),
 }
 
 mpath = os.path.join(d, "manifest.json")

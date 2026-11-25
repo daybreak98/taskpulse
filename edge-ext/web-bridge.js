@@ -122,7 +122,13 @@
       const data = await jfetch(CFG.api.prefix + path);
       const list = ((data && data.data) || {}).list || [];
       const m = list[0];
-      if (m) lastMessages[cid] = { sender: m.sender, content: (m.content || "").slice(0, 400) };
+      if (!m) return;
+      // 关键词匹配就在页面里做完，只把布尔传回本机：消息原文不出浏览器
+      const marks = CFG.api.marks || [];
+      const content = typeof m.content === "string" ? m.content : "";
+      const failed = m.sender === "assistant" && content !== ""
+        && marks.some((k) => content.indexOf(k) >= 0);
+      lastMessages[cid] = { sender: m.sender, failed };
     } catch (_) {}
   }
 

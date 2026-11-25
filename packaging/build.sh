@@ -61,6 +61,15 @@ chmod +x "$OUT/install.command" "$OUT/uninstall.command" "$OUT/health_check.sh" 
 mkdir -p "$OUT/docs" && cp docs/product-spec.md docs/INSTALL.md docs/fixes-summary.md docs/followup-review-response.md "$OUT/docs/"
 cp docs/INSTALL.md "$OUT/INSTALL.md"     # 用户第一眼就能看到，不用进 docs 目录找
 
+# 自带的 uv 与 Python：让没有开发环境的机器也能装。
+# 体积大，不入库，构建前跑一次 packaging/vendor.sh 生成。
+if [ ! -d packaging/vendor ] || [ -z "$(ls -A packaging/vendor 2>/dev/null)" ]; then
+  echo "!! 缺少 packaging/vendor（自带的 uv / Python），先跑一次 ./packaging/vendor.sh" >&2
+  exit 1
+fi
+cp -R packaging/vendor "$OUT/"
+echo "   -> 自带运行时 $(du -sh packaging/vendor | cut -f1)"
+
 # 内部包：config.json 与 uv-args.txt 来自 packaging/internal/（不入库）
 if [ "$MODE" = "internal" ]; then
   if [ ! -f packaging/internal/config.json ]; then

@@ -943,9 +943,14 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
         failed = None
         try:
             message = agent.last_message(conv["id"], timeout)
-            content = message.get("content")
-            if message.get("sender") == "assistant" and isinstance(content, str) and content:
-                failed = any(mark in content for mark in FAIL_MARKS)
+            # 扩展在页面里就把关键词匹配做完了，只回一个布尔：消息原文不出浏览器。
+            # 老版本扩展回的是截断后的原文，走下面的兼容分支。
+            if isinstance(message.get("failed"), bool):
+                failed = message["failed"]
+            else:
+                content = message.get("content")
+                if message.get("sender") == "assistant" and isinstance(content, str) and content:
+                    failed = any(mark in content for mark in FAIL_MARKS)
         except Exception as exc:
             if isinstance(exc, requests.HTTPError) and exc.response is not None:
                 if exc.response.status_code == 429:

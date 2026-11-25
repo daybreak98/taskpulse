@@ -22,3 +22,6 @@ edge-ext/manifest.json
 
 # 团队内部包用的配置与额外依赖参数（含内部标识，不入库）
 packaging/internal/
+
+# 自带的 uv / Python 运行时（73MB，用 packaging/vendor.sh 生成，不入库）
+packaging/vendor/

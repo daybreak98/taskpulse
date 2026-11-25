@@ -3,7 +3,8 @@
 一个常驻屏幕边缘的窄条，显示你在某个 Agent 会话平台上的任务状态，点一下就能跳到对应标签页。
 
 要求：macOS 13 或更新（Intel / Apple Silicon 都可以）、装有 Microsoft Edge、能访问你的 Agent 平台。
-后台取数用 Python 跑，脚本会自动准备（本机有 `uv` 就直接用，没有就装一个）。
+后台取数用 Python 跑。安装包自带 uv 与 Python 运行时：本机已有能用的就直接用，没有才解压自带的，
+有但跑不起来会弹窗问你怎么办。
 
 ---
 
@@ -13,7 +14,7 @@
 
 包名通常带 `-internal`。解压后**双击 `install.command`**，全程不问任何问题：
 
-- 自动装运行依赖（首次联网约 30 秒）
+- 自动装运行依赖（用包里自带的 uv / Python，通常十几秒）
 - 自动写入包内自带的配置
 - 自动注册开机自启并拉起小窗
 
@@ -64,7 +65,8 @@ launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 
 扩展做两件事：上报目标站点标签页的标题 / 分组名 / 标签 id、执行「切到某个标签」的命令；
 另外可选地在页面里用**你自己的登录态**读一次会话状态（见下方「取数来源」）。
-它只允许访问 `127.0.0.1` 和你配置的那个站点，不读取页面内容、不外传数据。
+它只允许访问 `127.0.0.1` 和你配置的那个站点，不外传数据。不读页面正文：
+判断「限流」用的关键词匹配在页面内完成，只把「是 / 否」传回本机，消息原文不出浏览器。
 站点范围由安装脚本按 `config.json` 里的 `extension.scope` 生成 `edge-ext/config.js` 与
 `edge-ext/manifest.json`（仓库里只有中性的 `manifest.template.json`，不含任何域名）。
 **所以改完配置要重新运行一次 `install.command`，然后在扩展页点一次 ⟳。**
@@ -94,6 +96,15 @@ launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 
 > 为什么不做成全自动？macOS 上的 Chromium 只接受商店来源的静默安装
 > （本地 crx 的 External Extensions 通道实测不生效），装解压缩目录必须由人点一次。
+
+## 构建安装包
+
+```bash
+./packaging/vendor.sh      # 生成自带的 uv / Python（约 73MB，不入库，只需一次）
+./packaging/build.sh       # 或 build.sh internal，产物在 dist/
+```
+
+`vendor/` 里是两套架构（arm64 / x86_64）的 uv 与 Python，缺架构时安装脚本会退回在线安装。
 
 ## 授权与登录
 
