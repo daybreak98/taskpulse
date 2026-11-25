@@ -16,7 +16,7 @@
 
 - 自动装运行依赖（用包里自带的 uv / Python，通常十几秒）
 - 自动写入包内自带的配置
-- 自动注册开机自启并拉起小窗
+- 直接打开小窗（取数由 App 自己拉起，不注册开机自启）
 
 装完小窗会自己出现在屏幕右上角，并弹一个**扩展安装引导**：选 Edge 或 Chrome，
 它会替你打开扩展页、把扩展目录递到 Finder，你按提示点两下，「检查一下」通过就完成。
@@ -59,8 +59,8 @@
 想重新走一遍引导：
 
 ```bash
-defaults delete com.taskpulse.ui onboarded
-launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
+defaults delete com.hyj.taskpulse onboarded
+open ~/Applications/TaskPulse.app     # 没在跑就先打开；已经在跑就退出重开
 ```
 
 扩展做两件事：上报目标站点标签页的标题 / 分组名 / 标签 id、执行「切到某个标签」的命令；
@@ -106,6 +106,16 @@ launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 
 `vendor/` 里是两套架构（arm64 / x86_64）的 uv 与 Python，缺架构时安装脚本会退回在线安装。
 
+## 运行模型
+
+打开 App 才开始，关掉就停：
+
+- 不注册 launchd / 开机自启项，系统「允许在后台」里不会出现 TaskPulse
+- App 启动时自己拉起 `uv run poller.py` 子进程（参数来自 `~/.taskpulse/runtime.json`）
+- 点右上角的叉 = 整个结束：App 退出时 `SIGTERM` 子进程；即使 App 崩溃被强杀，
+  子进程也会在 2 秒内发现宿主 PID 消失并自行退出
+- 好处是不留后台进程、不会触发系统的「后台项目」提示
+
 ## 授权与登录
 
 - 第一次点任务行（或右上角提示条）跳转时，系统会弹「TaskPulse 想要控制 Microsoft Edge」，点**允许**。
@@ -129,11 +139,8 @@ launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 
 ## 配置说明（`~/.taskpulse/config.json`）
 
-脚本生成的是能跑的最小集合，其余字段走内置默认值。想改就改这份文件，改完重启后台：
-
-```bash
-launchctl kickstart -k gui/$UID/com.taskpulse.poller
-```
+脚本生成的是能跑的最小集合，其余字段走内置默认值。想改就改这份文件，改完让 App 重读：
+点右上角的叉退出，再双击 `~/Applications/TaskPulse.app`。
 
 | 字段 | 作用 |
 |---|---|
@@ -203,7 +210,7 @@ launchctl kickstart -k gui/$UID/com.taskpulse.poller
 |---|---|
 | 提示「已损坏，无法打开」 | `xattr -dr com.apple.quarantine ~/Applications/TaskPulse.app` |
 | 启动就报「TaskPulse 还不能开始工作」 | 按提示补 `~/.taskpulse/config.json`，或重跑 `install.command` |
-| 窄条不见了 | `launchctl kickstart -k gui/$UID/com.taskpulse.ui` |
+| 窄条不见了 | 双击 `~/Applications/TaskPulse.app`（不打开就不跑，这是设计） |
 | 数字一直不变 | `curl 127.0.0.1:8899/state` 看 `poller_error`；再看 `~/Library/Logs/taskpulse.log` |
 | 点任务不跳转 | 确认扩展已加载；`curl 127.0.0.1:8899/state` 里 `extension.ok` 应为 `true` |
 | 引导点了「检查一下」不通过 | 确认扩展在扩展页是「已启用」状态，且浏览器里至少开着一个会话标签 |

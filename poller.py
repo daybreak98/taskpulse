@@ -200,6 +200,11 @@ WEBSTATE_FILE = os.path.join(HOME, ".taskpulse", "webstate.json")
 WEB_STALE_SECONDS = max(180, POLL_SECONDS * 3)
 # 页面没上报时，后台敲一次的周期；UI 用它显示「约 N 秒后重试」
 WEB_RETRY_HINT_SECONDS = 15
+# 由 App 拉起时设置：宿主退出后本进程也要退出（不留在后台空转）
+EXIT_WITH_PARENT = os.environ.get("TP_EXIT_WITH_PARENT") == "1"
+# App 的 PID。不能只看 ppid：进程树是 App → uv → python，
+# python 的父进程是 uv（不会被 reparent），父进程死掉时 ppid 也不变
+HOST_PID = int(os.environ.get("TP_HOST_PID") or 0)
 
 
 def source_mode() -> str:
@@ -1236,6 +1241,7 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             state.pop("poller_error", None)
             state.pop("poller_error_at", None)
             state.pop("retry_at", None)
+            state.pop("auth_required", None)
             if isinstance(agent, WebProvider):
                 age = agent.age_seconds()
                 if age is None or age > WEB_STALE_SECONDS:
@@ -1419,6 +1425,8 @@ def view(state: dict) -> dict:
         "updated": state.get("updated"),
         "source": source, "source_age": source_age,
         "poller_error": state.get("poller_error"),
+        # 401：凭据失效，只有重新扫码能恢复。App 据此显示「重新授权」按钮
+        "auth_required": bool(state.get("auth_required")),
         # 还剩几秒会再试；没有退避（比如等页面上报）时为 null
         "retry_in_seconds": (max(0, round(((state.get("retry_at") or 0) - stamp) / 1000))
                              if state.get("retry_at") else None),
@@ -2410,6 +2418,29 @@ def close_conversation_tabs(mode: str) -> int | None:
 
 # ── 主循环 ──────────────────────────────────────────────────────────
 
+def _watch_parent() -> None:
+    """App 拉起时（TP_EXIT_WITH_PARENT=1）：宿主退出后本进程跟着退出。
+
+    父进程消失后会被 reparent 到 launchd，ppid 变成 1——据此判断，
+    不需要额外约定 PID 文件。手动在终端跑时不会设这个变量。
+    """
+    while True:
+        time.sleep(2)
+        gone = False
+        if HOST_PID:
+            try:
+                os.kill(HOST_PID, 0)      # 只探活，不真发信号
+            except ProcessLookupError:
+                gone = True
+            except PermissionError:
+                pass                       # 存在但不属于我们，当作活着
+        elif os.getppid() == 1:
+            gone = True
+        if gone:
+            log("宿主 App 已退出，取数服务一并退出")
+            os._exit(0)
+
+
 def poll_loop() -> None:
     lock = take_lock()
     while lock is None:
@@ -2420,7 +2451,8 @@ def poll_loop() -> None:
         _poll_forever()
 
 
-def _mark_error(msg: str, retry_seconds: float | None = None) -> None:
+def _mark_error(msg: str, retry_seconds: float | None = None,
+                auth_required: bool = False) -> None:
     """把取数故障写进 state，UI/诊断能看到「数字不再更新」的原因。
 
     retry_seconds 是这一轮退避的时长，UI 据此显示「约 N 秒后重试」——
@@ -2431,6 +2463,8 @@ def _mark_error(msg: str, retry_seconds: float | None = None) -> None:
             state = load_state()
             state["poller_error"] = msg
             state["poller_error_at"] = now_ms()
+            if auth_required:
+                state["auth_required"] = True
             if retry_seconds:
                 state["retry_at"] = now_ms() + int(retry_seconds * 1000)
             else:
@@ -2515,6 +2549,7 @@ def _poll_forever() -> None:
                 kind = "full" if full else ("discovery" if discovery else "active")
                 log("poll %s ok %.1fs" % (kind, time.monotonic() - started))
         except (Exception, SystemExit) as exc:
+            auth = False
             # SDK 在拿不到 OBO 票时直接 sys.exit(1)（它本来是给命令行脚本用的）。
             # 我们常驻，这属于「上游凭据暂不可用」——多为客户端没开——不该按自身
             # 故障指数退避到 480 秒，否则用户把客户端打开后还要干等很久。
@@ -2523,12 +2558,20 @@ def _poll_forever() -> None:
                            "（需要 MyFlicker / CodeFlicker 客户端保持运行且已登录）")
                 backoff = POLL_SECONDS
                 log(f"取数暂停：{message}，{backoff} 秒后重试")
+            elif isinstance(exc, requests.HTTPError) and exc.response is not None \
+                    and exc.response.status_code == 401:
+                # 401 不等于网络抖动：重试多少次都不会好，只有重新授权能恢复
+                failures += 1
+                message = ("API 凭据已失效（401）：需要重新扫码授权后才能继续取数")
+                backoff = max(POLL_SECONDS, min(60 * 2 ** min(failures - 1, 5), 1800))
+                log(f"取数暂停：{message}，{backoff:.0f} 秒后重试")
+                auth = True
             else:
                 failures += 1
                 message = f"{type(exc).__name__}: {exc}"
                 backoff = max(POLL_SECONDS, min(60 * 2 ** min(failures - 1, 5), 1800))
                 log(f"取数失败：{message}，{backoff} 秒后重试")
-            _mark_error(message, backoff)
+            _mark_error(message, backoff, auth_required=auth)
             agent = None
             next_full = time.monotonic() + backoff
             next_discovery = next_full if DISCOVERY_POLL_SECONDS else float("inf")
@@ -2647,6 +2690,8 @@ def main() -> int:
 
     # 取数循环常驻本进程：省掉每次都启动解释器的开销，也复用已建立的会话（少换 token）
     server = QuietServer(("127.0.0.1", PORT), Handler)
+    if EXIT_WITH_PARENT:
+        threading.Thread(target=_watch_parent, name="parent", daemon=True).start()
     threading.Thread(target=poll_loop, name="poller", daemon=True).start()
     threading.Thread(target=_deadline_forever, name="deadline", daemon=True).start()
     log(f"TaskPulse serving on http://127.0.0.1:{PORT}")

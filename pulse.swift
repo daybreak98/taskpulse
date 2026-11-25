@@ -126,6 +126,8 @@ struct Payload: Decodable {
     let source_age: Double?
     let window_limit: Int?
     let poller_error: String?
+    /// 凭据失效（401）：只有重新扫码能恢复，界面据此显示「扫码授权」按钮
+    let auth_required: Bool?
     /// 距离下一次重试还有多少秒；null 表示没有退避在跑
     let retry_in_seconds: Int?
     let stale_after_seconds: Double?
@@ -955,6 +957,8 @@ final class PulseView: NSView {
     var onTogglePin: (() -> Void)?
     var onSetSource: ((String) -> Void)?
     var onQuit: (() -> Void)?
+    /// 凭据失效时点「扫码重新授权」
+    var onReauthorize: (() -> Void)?
     /// 刚点下去的来源：后端还没确认，先照它画，免得多等一个轮询周期
     var pendingSource: String?
     var onOpen: ((TaskItem) -> Void)?
@@ -973,6 +977,13 @@ final class PulseView: NSView {
         return Date().timeIntervalSince1970 - Double(ms) / 1000 > (p.stale_after_seconds ?? 180)
     }
 
+    /// 凭据是否失效。诊断入口 TP_TEST_AUTH=1 可强制为真，
+    /// 不用造一次真 401 就能核对黄条与按钮的排版
+    private var authRequired: Bool {
+        if ProcessInfo.processInfo.environment["TP_TEST_AUTH"] == "1" { return true }
+        return payload?.auth_required == true
+    }
+
     /// 有退避在跑时补一句「约 N 秒后重试」，让用户知道要不要等
     private var retrySuffix: String {
         guard let n = payload?.retry_in_seconds else { return "" }
@@ -983,6 +994,7 @@ final class PulseView: NSView {
     var statusMessage: String? {
         if connectionLost { return "本机服务连接中断" + retrySuffix }
         guard let p = payload else { return "正在连接本机服务…" }
+        if authRequired { return "API 凭据已失效，取数已暂停" }
         if let error = p.poller_error {
             // 两种故障要分开说：接口/认证出问题，和「浏览器页面这一会儿没上报」
             if error.contains("没有上报") { return "浏览器页面暂无数据，显示上次快照" + retrySuffix }
@@ -1057,6 +1069,11 @@ final class PulseView: NSView {
         return Array((hit.isEmpty ? g.tasks : hit).prefix(16))
     }
 
+    /// 凭据失效时黄条下面那个按钮：把扫码授权流程拉起来
+    @objc private func reauthorize() {
+        onReauthorize?()
+    }
+
     /// 点击头部计数：只看该状态的标签组与任务；再点一次恢复全部
     func toggleFilter(_ kind: String) {
         filter = (filter == kind) ? nil : kind
@@ -1068,7 +1085,8 @@ final class PulseView: NSView {
 
     func layoutHeight() -> CGFloat {
         if compact { return COMPACT_CAPSULE_H + 12 }
-        let h0 = HEADER_H + (statusMessage == nil ? 0 : 22)
+        // 凭据失效时黄条下面要放「扫码授权」按钮，多留一行
+        let h0 = HEADER_H + (statusMessage == nil ? 0 : (authRequired ? 46 : 22))
         let gs = groups()
         if gs.isEmpty { return h0 + 34 }
         if flattened { return h0 + CGFloat(gs[0].tasks.count) * TASK_ROW_H + 8 }
@@ -1136,7 +1154,25 @@ final class PulseView: NSView {
             label.frame = NSRect(x: 12, y: y + 6, width: bounds.width - 24, height: 16)
             label.toolTip = statusDetail
             addSubview(label)
-            y += 22
+            // 只有凭据真的失效（401）才给这个按钮：日常状态一律不出现
+            if authRequired {
+                // 系统圆角按钮在深色玻璃上是深字，得自己指定颜色，
+                // 否则看起来像「灰掉的不可点」——引导面板踩过同一个坑
+                let btn = NSButton(title: "扫码重新授权", target: self,
+                                    action: #selector(reauthorize))
+                btn.isBordered = false
+                btn.attributedTitle = NSAttributedString(string: "扫码重新授权", attributes: [
+                    .foregroundColor: palette["attention"] ?? mainText,
+                    .font: NSFont.systemFont(ofSize: 11.5, weight: .medium),
+                    .underlineStyle: NSUnderlineStyle.single.rawValue,
+                ])
+                btn.toolTip = "用手机上的快手 App 扫码授权一次，之后长期可用"
+                btn.frame = NSRect(x: 12, y: y + 24, width: 110, height: 18)
+                addSubview(btn)
+                y += 46
+            } else {
+                y += 22
+            }
         }
 
         if gs.isEmpty {
@@ -1455,9 +1491,123 @@ final class ToastHandle {
 
 // MARK: - 应用
 
+// MARK: - 取数服务
+
+/// 取数服务由 App 自己拉起：打开 App 就取数，退出就停。
+///
+/// 之前靠两个 launchd 常驻项，好处是关掉浮窗后取数还在跑，代价是
+/// 「没打开也在后台跑」以及系统的后台项目提示。现在跟着 App 生命周期走。
+final class PollerRunner {
+    struct Runtime: Decodable {
+        let uv: String
+        let poller: String
+        let port: Int?
+        let args: [String]?
+    }
+
+    private var proc: Process?
+    private var stopped = false
+    private var startedByUs = false
+    private var home: String { NSHomeDirectory() }
+
+    func startIfNeeded() {
+        guard let rt = loadRuntime() else {
+            dbg("poller: 缺 runtime.json（安装未完成？），不自动启动")
+            return
+        }
+        let port = rt.port ?? 8899
+        // 端口上已经有服务（上次没退干净、或用户自己在终端跑着）：不重复拉起
+        serviceAlive(port: port) { [weak self] alive in
+            guard let self, !self.stopped else { return }
+            if alive {
+                dbg("poller: 已有服务在 127.0.0.1:\(port)，不重复启动")
+                return
+            }
+            self.spawn(rt)
+        }
+    }
+
+    func stop() {
+        stopped = true
+        guard startedByUs, let p = proc, p.isRunning else { return }
+        p.terminate()                      // SIGTERM
+        let deadline = Date().addingTimeInterval(1.5)
+        while p.isRunning && Date() < deadline { usleep(60_000) }
+        if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+        proc = nil
+        dbg("poller 已停止")
+    }
+
+    // MARK: 内部
+
+    private func loadRuntime() -> Runtime? {
+        guard let data = FileManager.default.contents(atPath: home + "/.taskpulse/runtime.json") else {
+            return nil
+        }
+        return try? JSONDecoder().decode(Runtime.self, from: data)
+    }
+
+    private func serviceAlive(port: Int, then: @escaping (Bool) -> Void) {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/state") else { return then(false) }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 1.2
+        if let token = try? String(contentsOfFile: home + "/.taskpulse/token", encoding: .utf8) {
+            req.setValue(token.trimmingCharacters(in: .whitespacesAndNewlines),
+                         forHTTPHeaderField: "X-TP-Token")
+        }
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
+            // 401 也算「有人在监听」，只要不是连接失败
+            let alive = (resp as? HTTPURLResponse) != nil
+            DispatchQueue.main.async { then(alive) }
+        }.resume()
+    }
+
+    private func spawn(_ rt: Runtime) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: rt.uv)
+        var args = ["run", "--quiet", "--python", ">=3.10"]
+        args.append(contentsOf: rt.args ?? [])
+        args.append(rt.poller)
+        p.arguments = args
+        p.currentDirectoryURL = URL(fileURLWithPath: (rt.poller as NSString).deletingLastPathComponent)
+        var env = ProcessInfo.processInfo.environment
+        // 让子进程知道要跟着 App 一起退（父进程消失时自己退，见 poller._watch_parent）
+        env["TP_EXIT_WITH_PARENT"] = "1"
+        // 进程树是 App → uv → python，光靠 ppid 判断不到宿主死活，直接给 PID
+        env["TP_HOST_PID"] = "\(ProcessInfo.processInfo.processIdentifier)"
+        p.environment = env
+        p.standardOutput = logHandle("taskpulse.poll.out")
+        p.standardError = logHandle("taskpulse.poll.err")
+        p.terminationHandler = { done in
+            dbg("poller 退出 status=\(done.terminationStatus)")
+        }
+        do {
+            try p.run()
+            proc = p
+            startedByUs = true
+            dbg("poller 已启动 pid=\(p.processIdentifier)")
+        } catch {
+            dbg("poller 启动失败: \(error)")
+        }
+    }
+
+    private func logHandle(_ name: String) -> FileHandle? {
+        let dir = home + "/Library/Logs"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = dir + "/" + name
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: nil)
+        }
+        let h = try? FileHandle(forWritingAtPath: path)
+        h?.seekToEndOfFile()
+        return h
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var panel: NSPanel!
     var view: PulseView!
+    let poller = PollerRunner()
     var dataTimer: Timer?
     var dataRequestInFlight = false
     var consecutiveReadFailures = 0
@@ -1499,6 +1649,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         buildPanel()
         applyLayout()
         refresh()
+        poller.startIfNeeded()
         dataTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
@@ -1627,6 +1778,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.onTogglePin = { [weak self] in self?.togglePin() }
         view.onSetSource = { [weak self] mode in self?.setSource(mode) }
         view.onQuit = { [weak self] in self?.quitApp() }
+        view.onReauthorize = { [weak self] in self?.reauthorize() }
         view.onOpen = { [weak self] item in self?.open(item) }
         view.onCheck = { [weak self] item, on in on ? self?.ack(item) : self?.unack(item) }
         view.onDeadline = { [weak self] item, m in self?.setDeadline(item, minutes: m) }
@@ -2166,15 +2318,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         post("/unack?id=\(item.id)")
     }
 
-    /// 退出：先摘掉界面这个 LaunchAgent，否则 KeepAlive 会立刻把进程拉回来。
-    /// 只摘界面这一个——后台取数继续跑，下次打开浮窗立即就有数据。
+    func applicationWillTerminate(_ notification: Notification) {
+        poller.stop()
+    }
+
+    /// 退出：整个 App 结束，取数子进程在 applicationWillTerminate 里一起停。
     @objc func quitApp() {
-        let boot = Process()
-        boot.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        boot.arguments = ["bootout", "gui/\(getuid())/com.taskpulse.ui"]
-        try? boot.run()
-        boot.waitUntilExit()
         NSApp.terminate(nil)
+    }
+
+    /// 凭据失效时点「扫码重新授权」：在终端里跑授权脚本，二维码会同时出现在
+    /// 独立浏览器窗口里，扫完脚本会自己验证取数。
+    func reauthorize() {
+        let script = NSHomeDirectory() + "/Applications/TaskPulse/api_login.command"
+        guard FileManager.default.fileExists(atPath: script) else {
+            // 脚本被删了：至少把安装目录打开，用户能看见缺什么
+            dbg("reauthorize: 缺少 \(script)")
+            NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory() + "/Applications/TaskPulse"))
+            return
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["-a", "Terminal", script]
+        do {
+            try p.run()
+            dbg("reauthorize: 已打开终端运行 api_login.command")
+        } catch {
+            dbg("reauthorize 失败: \(error)")
+        }
     }
 
     /// 切换取数来源：api = 本机 token，web = 浏览器里用 cookie 取数

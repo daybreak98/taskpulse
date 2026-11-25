@@ -355,61 +355,31 @@ if [ -z "$TP_SCOPE" ]; then
   echo "-- 注意：extension.scope 为空，扩展装上也不会匹配任何页面"
 fi
 
-# ---------- 6. 写入 launchd 配置 ----------
-# 团队内部包可能带 uv-args.txt（每行一个额外参数，如 --with 内部包 --index 私有源）
-UV_EXTRA_XML=""
+# ---------- 6. 交给 App 的运行参数 ----------
+# 不再注册 launchd 常驻项：用户没打开 App，就不该有进程在跑。
+# 取数服务改成由 App 启动时自己拉起（见 pulse.swift 的 PollerRunner），
+# 顺带也不会再触发系统的「后台项目」提示。
+for svc in com.taskpulse.poller com.taskpulse.ui; do
+  launchctl bootout "gui/$(id -u)/$svc" 2>/dev/null || true
+done
+rm -f "$AGENTS/com.taskpulse."*.plist*
+rm -rf "$AGENTS/disabled-taskpulse"
 
-if [ -f "./uv-args.txt" ]; then
-  while IFS= read -r ARG; do
-    [ -z "$ARG" ] && continue
-    ARG="$(printf '%s' "$ARG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')"
-    UV_EXTRA_XML="$UV_EXTRA_XML<string>$ARG</string>"
-  done < ./uv-args.txt
-fi
-
-cat > "$AGENTS/com.taskpulse.poller.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.taskpulse.poller</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$UV_BIN</string><string>run</string><string>--quiet</string><string>--python</string><string>&gt;=3.10</string>$UV_EXTRA_XML
-    <string>$DEST/poller.py</string>
-  </array>
-  <key>WorkingDirectory</key><string>$DEST</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Background</string>
-  <key>AssociatedBundleIdentifiers</key><array><string>com.hyj.taskpulse</string></array>
-  <key>StandardOutPath</key><string>$LOGS/taskpulse.poll.out</string>
-  <key>StandardErrorPath</key><string>$LOGS/taskpulse.poll.err</string>
-</dict>
-</plist>
-PLIST
-
-cat > "$AGENTS/com.taskpulse.ui.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.taskpulse.ui</string>
-  <key>ProgramArguments</key>
-  <array><string>$HOME/Applications/$APP_NAME.app/Contents/MacOS/$APP_NAME</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Interactive</string>
-  <key>AssociatedBundleIdentifiers</key><array><string>com.hyj.taskpulse</string></array>
-  <key>StandardOutPath</key><string>$LOGS/taskpulse.stdout</string>
-  <key>StandardErrorPath</key><string>$LOGS/taskpulse.stderr</string>
-</dict>
-</plist>
-PLIST
+"$UV_BIN" run --quiet --no-project python - "$HOME/.taskpulse/runtime.json" \
+  "$UV_BIN" "$DEST/poller.py" "$TP_PORT" <<'PYGEN'
+import json, os, sys
+out, uv, poller, port = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+args = []
+if os.path.exists("uv-args.txt"):
+    args = [l.rstrip("\n") for l in open("uv-args.txt", encoding="utf-8") if l.strip()]
+json.dump({"uv": uv, "poller": poller, "port": port, "args": args},
+          open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+print("   -> runtime.json")
+PYGEN
 
 # ---------- 7. 启动 ----------
 if [ "${TP_DRY:-}" = "1" ]; then
-  echo "-- 干跑模式：跳过 launchctl / open"
+  echo "-- 干跑模式：跳过 open / 健康检查"
   exit 0
 fi
 
@@ -417,30 +387,22 @@ fi
 defaults delete com.taskpulse.ui onboarded 2>/dev/null || true
 defaults delete com.hyj.taskpulse onboarded 2>/dev/null || true
 
-launchctl bootout "gui/$(id -u)/com.taskpulse.poller" 2>/dev/null
-launchctl bootout "gui/$(id -u)/com.taskpulse.ui" 2>/dev/null
-# bootstrap / kickstart 失败要能看见：以前全吞掉，装完没反应时无从排查
-for svc in com.taskpulse.poller com.taskpulse.ui; do
-  if ! launchctl bootstrap "gui/$(id -u)" "$AGENTS/${svc}.plist" 2>/dev/null; then
-    launchctl bootout "gui/$(id -u)/${svc}" 2>/dev/null
-    if ! launchctl bootstrap "gui/$(id -u)" "$AGENTS/${svc}.plist"; then
-      echo "!! 服务 ${svc} 注册失败，日志：${LOGS}/taskpulse.poll.err"
-    fi
-  fi
-  launchctl kickstart -k "gui/$(id -u)/${svc}" 2>/dev/null \
-    || echo "!! 服务 ${svc} 未能启动（launchctl kickstart 返回非零）"
-done
+echo "-- 正在打开 TaskPulse…"
+open "$HOME/Applications/$APP_NAME.app" 2>/dev/null || {
+  echo "!! 打不开 App，请手动双击 ~/Applications/$APP_NAME.app"
+}
 
-sleep 3
-# 分别报告「进程在线」与「取数就绪」：服务返回 500 也算进程在线，
-# 但那时候报「已就绪」会把人带进沟里
+# App 起来后才会拉起取数服务：轮询等它，最多 25 秒
 if [ -x "./health_check.sh" ]; then
+  for _ in $(seq 1 25); do
+    sleep 1
+    ./health_check.sh "${TP_PORT}" >/dev/null 2>&1 && break
+  done
   ./health_check.sh "${TP_PORT}"
-  HC=$?
-  case "$HC" in
+  case $? in
     0) ;;
     2) echo "-- 服务在线，但取数还没就绪；页面/凭据就位后会自动开始" ;;
-    *) echo "-- 后台服务没起来，看日志: ${LOGS}/taskpulse.poll.err" ;;
+    *) echo "-- 取数服务没起来，看日志：${LOGS}/taskpulse.poll.err" ;;
   esac
 else
   echo "-- 缺少 health_check.sh，跳过健康检查"
@@ -448,22 +410,22 @@ fi
 
 cat <<TIPS
 
-===== 接下来只需 2 步（窗口里会带你走）=====
-1) 屏幕中间会弹「装浏览器扩展」的引导：选 Edge 或 Chrome 后，它会自动
-   打开扩展页、自动把扩展目录路径复制到剪贴板、自动在 Finder 里打开该目录。
-   你只需要在扩展页里做两件事：
-     a. 右上角打开「开发人员模式」
-     b. 点「加载解压缩的扩展」→ 按 ⌘⇧G 粘贴路径 → 回车 → 选「选择」
-   装好后引导会自己检测到，自动变成「已连接」，不用点任何检查按钮。
+===== 还剩 1 步：装浏览器扩展 =====
+屏幕中间会弹「装浏览器扩展」的引导：选 Edge 或 Chrome 后，它会自动打开扩展页、
+复制目录路径、在访达里选中目录。你只需要在扩展页里：
+  1. 右上角打开「开发人员模式」
+  2. 点「加载解压缩的扩展」→ 选已高亮好的 edge-ext → 选择
 
-2) 首次点任务行跳转时，系统会弹「TaskPulse 想要控制浏览器」，点「允许」。
-   数据服务用的是你浏览器里已登录的账号，不用另填 token。
+以后的使用方式：
+  - 打开：双击 ~/Applications/TaskPulse.app
+  - 取数：App 打开时自动开始，不需要额外操作
+  - 退出：点小窗右上角的叉，取数一并停止，不会在后台留进程
+  - 开机不会自动启动；要用时打开一次即可
 
-扩展只读标签页标题与标签组名，只发 127.0.0.1；页面访问范围：${TP_SCOPE:-未配置}
+扩展只读标签页标题、URL 与标签组名，只发 127.0.0.1；
+判断「限流」的关键词匹配也在页面内完成，消息原文不出浏览器。
+页面访问范围：${TP_SCOPE:-未配置}
 扩展目录：$DEST/edge-ext
-
-想重新走一遍引导：
-  defaults delete com.taskpulse.ui onboarded; launchctl kickstart -k gui/$(id -u)/com.taskpulse.ui
 
 想要卸载：运行 uninstall.command
 TIPS
