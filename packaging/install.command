@@ -233,7 +233,7 @@ TP_PORT="${TP_PORT:-8899}"
 echo "-- 端口: $TP_PORT    扩展域名: ${TP_SCOPE:-（未配置）}"
 
 # ---------- 3. 先确认运行依赖（失败就别动现有安装）----------
-echo "-- 检查运行依赖（首次会联网安装，约 30 秒）..."
+echo "-- 检查运行依赖（从内网源装 ks-aimate，首次约 10-40 秒）..."
 UV_PREHEAT=()
 if [ -f "./uv-args.txt" ]; then
   while IFS= read -r ARG; do

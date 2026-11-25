@@ -127,7 +127,14 @@ final class OnboardingController {
         // 常驻 App 是 accessory（无 Dock 图标），弹窗要临时变成普通 App 才拿得到焦点，
         // 否则第一次点击会被系统当成「激活点击」吞掉
         NSApp.setActivationPolicy(.regular)
-        renderChoice()
+        // 自检入口：TP_TEST_STEPS=Edge / Chrome 直接进「装扩展」那一页，
+        // 不需要注入鼠标就能核对路径是否完整可见
+        if let forced = ProcessInfo.processInfo.environment["TP_TEST_STEPS"], !forced.isEmpty {
+            browser = forced.contains("Edge") ? "Microsoft Edge" : "Google Chrome"
+            renderSteps(browser ?? "Microsoft Edge")
+        } else {
+            renderChoice()
+        }
         NSApp.activate(ignoringOtherApps: true)
         p.makeKeyAndOrderFront(nil)
         // 后台常驻 App 的激活随时会被抢走；面板一旦失活就会掉到别的窗口后面，
@@ -338,12 +345,19 @@ final class OnboardingController {
             "拖不了就点「加载解压缩的扩展」→ 按 ⌘⇧G 粘贴路径（已复制）→ 回车。",
             size: 10.5, color: secondaryText))
 
+        // 路径要完整可见：用户得照着它在文件选择框里逐级找目录，
+        // 单行截断（byTruncatingMiddle）看不出全貌，等于没给
+        let path = label(dir, size: 11, color: mainText, wrap: true)
+        path.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        path.lineBreakMode = .byCharWrapping
+        path.isSelectable = true
+        // 换行要按面板实际内容宽度算，否则 wrappingLabel 会按固有宽度摊成一行跑出面板
+        path.preferredMaxLayoutWidth = (panel?.contentView?.bounds.width ?? 430) - 44
+        s.addArrangedSubview(path)
+
         let pathRow = NSStackView()
         pathRow.orientation = .horizontal
         pathRow.spacing = 8
-        let path = label(dir, size: 11, color: mainText, wrap: false)
-        path.lineBreakMode = .byTruncatingMiddle
-        pathRow.addArrangedSubview(path)
         pathRow.addArrangedSubview(linkButton("再复制一次", #selector(copyPath)))
         pathRow.addArrangedSubview(linkButton("在 Finder 里选中", #selector(revealDir)))
         pathRow.addArrangedSubview(linkButton("重新打开扩展页", #selector(reopenExtensions)))
