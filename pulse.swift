@@ -1792,7 +1792,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let mine = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? ""
         let existing = (Bundle(path: target)?.infoDictionary?["CFBundleVersion"] as? String) ?? ""
 
-        if !existing.isEmpty && existing >= mine {
+        // 只有磁盘上那份「更新」才跳过；版本相同也覆盖，避免同一天多次构建
+        // 时双击下载目录里的包却启动了旧副本
+        if !existing.isEmpty && existing > mine {
             dbg("已安装 \(existing)（当前 \(mine)），直接启动它")
             launchLater(target)
             NSApp.terminate(nil)
@@ -1801,6 +1803,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         OnboardingController.shared.showInstalling()
         DispatchQueue.global(qos: .userInitiated).async {
+            // 升级时旧版本可能正在运行：先让它退出，否则新实例启动会被
+            // 单实例检查（running.count > 1）直接挡回去，看起来像「没装上」
+            Self.stopOtherInstances()
             do {
                 if fm.fileExists(atPath: target) { try fm.removeItem(atPath: target) }
                 try fm.createDirectory(atPath: (target as NSString).deletingLastPathComponent,
@@ -1825,6 +1830,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         return true
+    }
+
+    /// 结束同 bundle id 的其他实例（升级时旧版本还开着）
+    private static func stopOtherInstances() {
+        let me = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
+            .filter { $0.processIdentifier != me }
+        for app in others { app.terminate() }
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let alive = NSRunningApplication
+                .runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
+                .filter { $0.processIdentifier != me && !$0.isTerminated }
+            if alive.isEmpty { break }
+            usleep(120_000)
+        }
+        dbg("自我安装：已结束 \(others.count) 个旧实例")
     }
 
     /// 延迟 1 秒再启动目标 App：本实例要先退出，否则目标的单实例检查会把它挡回去
@@ -2605,10 +2628,15 @@ if CommandLine.arguments.contains("--bootstrap-check") {
     }
 }
 
-// 单实例
+// 单实例：两把锁分开。
+//   - 已安装的那份（~/Applications）用 ui.lock，保证「只开一个窗口」
+//   - 从下载目录双击的那份用 installer.lock，它的职责是装/升级
+// 如果共用一把锁，升级时安装器会被正在运行的旧版本直接挡在 main 里，
+// 表现为「双击新包没反应」。
 try? FileManager.default.createDirectory(atPath: Bootstrap.stateDir,
                                          withIntermediateDirectories: true)
-let lockPath = Bootstrap.stateDir + "/ui.lock"
+let isInstalledCopy = Bundle.main.bundlePath == Bootstrap.home + "/Applications/TaskPulse.app"
+let lockPath = Bootstrap.stateDir + (isInstalledCopy ? "/ui.lock" : "/installer.lock")
 if !FileManager.default.fileExists(atPath: lockPath) {
     FileManager.default.createFile(atPath: lockPath, contents: nil)
 }

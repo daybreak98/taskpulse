@@ -1,5 +1,14 @@
 # TaskPulse · 安装说明（macOS）
 
+> **当前分发方式（2026-11-25 起）**：ZIP 里只有 `TaskPulse.app` + `README.md`。
+> 同事双击 App，它自己把 uv / Python / 配置 / 扩展文件准备到用户目录，
+> 首次运行还会把自己装进 `~/Applications`，之后从启动台打开即可。
+> 面向同事的说明见 `packaging/QUICKSTART.md`。
+>
+> **下面这份文档保留给两种人**：需要手动排查安装问题的，以及在改这个项目的。
+> 文中提到的 `install.command` 仍然可用（保留在仓库里），但已不再随包分发。
+
+
 一个常驻屏幕边缘的窄条，显示你在某个 Agent 会话平台上的任务状态，点一下就能跳到对应标签页。
 
 要求：macOS 13 或更新（Intel / Apple Silicon 都可以）、装有 Microsoft Edge、能访问你的 Agent 平台。
