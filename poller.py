@@ -704,13 +704,19 @@ def fast_candidates(tasks: dict, stamp: int) -> list[dict]:
     stuck_ms = STUCK_POLL_SECONDS * 1000
     eligible = []
     for task in tasks.values():
-        if not running(task):
+        # 用户标了「完成后提醒我」的会话即使没在跑也要盯：否则它一旦掉出
+        # 监控窗口，下一次回话根本取不到，高亮和弹窗都不会发生
+        important = bool(task.get("important")) and task.get("status") != "done"
+        if not running(task) and not important:
             continue
         checked = task.get("queue_checked_at") or 0
         # 已经判定卡住的，没必要每 5 秒再看一次；按 stuck_interval_seconds 放慢。
         if task.get("status") == "stuck" and stamp - checked < stuck_ms:
             continue
         if task.get("queue_error") and stamp - checked < retry_ms:
+            continue
+        # 重要会话按「运行中」的节奏复查（retry_ms 是 60 秒，太慢）
+        if important and not running(task) and stamp - checked < ACTIVE_POLL_SECONDS * 1000:
             continue
         eligible.append(task)
     # 最久没检查的先查，避免同一批任务一直占满快速复查的名额。
@@ -1278,6 +1284,7 @@ def view(state: dict) -> dict:
             "idle_minutes": int((stamp - (task.get("update_ms") or stamp)) / 60000),
             "url": task.get("url"),
             "deadline": task.get("deadline"),
+            "important": bool(task.get("important")),
             "deadline_left": (int((task["deadline"] - stamp) / 1000)
                               if task.get("deadline") else None),
             "overdue": bool(task.get("deadline") and stamp >= task["deadline"]),
@@ -2083,7 +2090,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "无效的截止时间"}, 400)
                 return
 
-        if parsed.path not in ("/ack", "/unack", "/active", "/deadline"):
+        if parsed.path not in ("/ack", "/unack", "/active", "/deadline", "/important"):
             self._json({"error": "not found"}, 404)
             return
 
@@ -2105,6 +2112,12 @@ class Handler(BaseHTTPRequestHandler):
                                and task.get("status") in ("attention", "stuck"))
                     if changed:
                         mark_seen(task)
+                elif parsed.path == "/important":
+                    # 用户手动标的「完成后提醒我」：只影响展示与弹窗持久化，
+                    # 不参与状态判定，也不改变卡住计时
+                    want = (query.get("value") or ["1"])[0] not in ("0", "false", "no")
+                    task["important"] = want
+                    task["important_at"] = now_ms() if want else 0
                 else:
                     task.update(deadline=deadline, deadline_notified=0)
                     _deadline_wake.set()

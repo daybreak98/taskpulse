@@ -434,6 +434,20 @@ class PollingTests(unittest.TestCase):
         self.assertIn("凭据服务", err, "错误文案对用户不可读")
         self.assertNotIn("SystemExit", err)
 
+    def test_important_task_keeps_fast_sampling_while_idle(self):
+        """标了「完成后提醒我」的会话即使没在跑，也要按秒级复查，
+        否则它掉出监控窗口后再有回话就取不到。"""
+        agent = FakeAgent([conversation(1), conversation(2)], busy=(1,))
+        poller.poll_tick(agent, full=True)
+        state = poller.load_state()
+        state["tasks"]["2"]["important"] = True     # 已查看、但被标记
+        poller.save_state(state)
+
+        self.stamp += 10_000
+        agent.queue_calls.clear()
+        poller.poll_tick(agent, full=False)
+        self.assertIn(2, agent.queue_calls, "重要会话没有被复查")
+
     def test_short_task_is_not_marked_seen_before_list_catches_up(self):
         """8 秒短任务：队列先转空闲、列表还没刷新，不能直接判「已查看」。"""
         base = NOW

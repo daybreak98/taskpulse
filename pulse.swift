@@ -107,6 +107,8 @@ struct TaskItem: Decodable, Equatable {
     let muted: Bool?
     let stale: Bool?
     let reply_version: String?
+    /// 用户手动标的「完成后提醒我」：行更亮，回话弹窗常驻
+    let important: Bool?
 }
 struct Counts: Decodable, Equatable {
     let running: Int
@@ -722,6 +724,7 @@ final class TaskRowView: NSView {
     var onClick: ((TaskItem) -> Void)?
     var onCheck: ((TaskItem, Bool) -> Void)?
     var onDeadline: ((TaskItem, Int?) -> Void)?
+    var onImportant: ((TaskItem, Bool) -> Void)?
     private var hovered = false
 
     init(item: TaskItem, width: CGFloat, checked: Bool, snapshotStale: Bool, dimmed: Bool = false) {
@@ -741,8 +744,11 @@ final class TaskRowView: NSView {
         let w = bounds.width
         let done = checked || item.status == "done"
         let tone = (unconfirmed || dimmed) ? "seen" : item.status
-        let color = palette[tone] ?? secondaryText
-        let alpha: CGFloat = done || unconfirmed || dimmed || item.status == "seen" ? 0.7 : 1
+        // 标了「完成后提醒我」：颜色翻倍提亮，即使在「已查看」里也一眼能认出
+        let emphasized = item.important == true
+        let base = palette[tone] ?? secondaryText
+        let color = emphasized ? brightened(base, by: 2.0) : base
+        let alpha: CGFloat = emphasized ? 1 : (done || unconfirmed || dimmed || item.status == "seen" ? 0.7 : 1)
 
         // 一行 = 一块状态色玻璃板（参考里 .row 的 tint + 顶部高光 + 细边）
         let plate = NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 8, yRadius: 8)
@@ -754,6 +760,12 @@ final class TaskRowView: NSView {
             plate.fill()
         }
 
+        if emphasized {
+            let bar = NSBezierPath(roundedRect: NSRect(x: 6, y: 5, width: 2.5, height: TASK_ROW_H - 10),
+                                   xRadius: 1.25, yRadius: 1.25)
+            color.withAlphaComponent(0.95).setFill()
+            bar.fill()
+        }
         color.withAlphaComponent(alpha).setFill()
         NSBezierPath(ovalIn: NSRect(x: 13, y: TASK_ROW_H / 2 - 3, width: 6, height: 6)).fill()
 
@@ -839,6 +851,19 @@ final class TaskRowView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         let menu = NSMenu()
+        // 最上面一项：完成后的回话要重点提醒。选中态用暗色底标出来，
+        // 再点一次即取消——和下面几项「选时间」是独立的开关。
+        let toggle = NSMenuItem(title: "完成后提醒我", action: nil, keyEquivalent: "")
+        let row = MenuToggleView(frame: NSRect(x: 0, y: 0, width: 200, height: 26))
+        row.titled = "完成后提醒我"
+        row.on = item.important == true
+        row.onClick = { [weak self] in
+            guard let self else { return }
+            self.onImportant?(self.item, self.item.important != true)
+        }
+        toggle.view = row
+        menu.addItem(toggle)
+        menu.addItem(.separator())
         for (title, minutes) in [("10 分钟后要完成", 10), ("30 分钟后", 30), ("1 小时后", 60)] {
             let mi = NSMenuItem(title: title, action: #selector(pickDeadline(_:)), keyEquivalent: "")
             mi.target = self; mi.tag = minutes; menu.addItem(mi)
@@ -876,6 +901,7 @@ final class PulseView: NSView {
     var onOpen: ((TaskItem) -> Void)?
     var onCheck: ((TaskItem, Bool) -> Void)?
     var onDeadline: ((TaskItem, Int?) -> Void)?
+    var onImportant: ((TaskItem, Bool) -> Void)?
     var onToggleGroup: ((String) -> Void)?
 
     override var isFlipped: Bool { true }
@@ -1057,6 +1083,7 @@ final class PulseView: NSView {
                 t.onClick = { [weak self] it in self?.onOpen?(it) }
                 t.onCheck = { [weak self] it, on in self?.onCheck?(it, on) }
                 t.onDeadline = { [weak self] it, m in self?.onDeadline?(it, m) }
+                t.onImportant = { [weak self] it, on in self?.onImportant?(it, on) }
                 addSubview(t)
                 y += TASK_ROW_H
             }
@@ -1080,6 +1107,7 @@ final class PulseView: NSView {
                 t.onClick = { [weak self] it in self?.onOpen?(it) }
                 t.onCheck = { [weak self] it, on in self?.onCheck?(it, on) }
                 t.onDeadline = { [weak self] it, m in self?.onDeadline?(it, m) }
+                t.onImportant = { [weak self] it, on in self?.onImportant?(it, on) }
                 addSubview(t)
                 y += TASK_ROW_H
             }
@@ -1196,12 +1224,63 @@ final class PulseView: NSView {
     }
 }
 
+// MARK: - 菜单里的开关行（完成后提醒我）
+
+/// NSMenuItem 本身画不了背景色，这里用一个自绘视图代替标题：
+/// 开启时铺小窗同款暗色，未开启时透明；悬停给一层浅色反馈。
+final class MenuToggleView: NSView {
+    var titled = ""
+    var on = false { didSet { needsDisplay = true } }
+    var onClick: (() -> Void)?
+    private var hovered = false { didSet { needsDisplay = true } }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let r = NSRect(x: 6, y: 2, width: bounds.width - 12, height: bounds.height - 4)
+        let shape = NSBezierPath(roundedRect: r, xRadius: 5, yRadius: 5)
+        if on {
+            rgb(0x0F1A21, alpha: 0.55).setFill()
+            shape.fill()
+        } else if hovered {
+            rgb(0xC5DCFF, alpha: 0.10).setFill()
+            shape.fill()
+        }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12.5, weight: on ? .semibold : .regular),
+            .foregroundColor: on ? mainText : mainText.withAlphaComponent(0.9),
+        ]
+        let text = (on ? "✓ " : "") + titled
+        let size = (text as NSString).size(withAttributes: attrs)
+        (text as NSString).draw(at: NSPoint(x: 12, y: (bounds.height - size.height) / 2),
+                                withAttributes: attrs)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+        enclosingMenuItem?.menu?.cancelTracking()
+    }
+}
+
 // MARK: - 可点击的提示条（Agent 回话）
 
 final class ToastView: NSView {
     var title = ""
     var body = ""
     var accent: NSColor = .systemBlue
+    /// 重要会话：整块背景掺入 50% 状态色，与普通提示条区分开
+    var emphasize = false { didSet { needsDisplay = true } }
     /// 点击瞬间的高亮反馈
     var highlighted = false { didSet { needsDisplay = true } }
     var onClick: (() -> Void)?
@@ -1215,6 +1294,11 @@ final class ToastView: NSView {
         // 和主面板同一套底板：磨砂层由外层 NSVisualEffectView 提供，这里只叠蒙层 + 高光
         toastTint.setFill()
         shape.fill()
+        if emphasize {
+            // 状态色只铺一半：整块盖满会压掉文字对比度
+            accent.withAlphaComponent(0.5).setFill()
+            shape.fill()
+        }
         NSGraphicsContext.saveGraphicsState()
         shape.setClip()
         if let g = NSGradient(colorsAndLocations:
@@ -1350,7 +1434,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self?.showToast(TaskItem(id: 0, name: "测试提示条", group: nil, status: "attention",
                                              prev: nil, progress: 0, elapsed: 0, idle_minutes: 0,
                                              overdue: false, failed: nil, muted: nil, stale: nil,
-                                             reply_version: nil),
+                                             reply_version: nil, important: nil),
                                    title: "测试提示条", body: "如果你看到这条，说明提示条正常")
                     return
                 }
@@ -1456,6 +1540,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.onOpen = { [weak self] item in self?.open(item) }
         view.onCheck = { [weak self] item, on in on ? self?.ack(item) : self?.unack(item) }
         view.onDeadline = { [weak self] item, m in self?.setDeadline(item, minutes: m) }
+        view.onImportant = { [weak self] item, on in self?.setImportant(item, on) }
         view.onDragStart = { [weak self] in self?.dragBegan() }
         view.onDragEnd = { [weak self] in self?.endDrag("mouseUp") }
         view.onToggleGroup = { [weak self] _ in self?.applyLayout() }
@@ -1762,6 +1847,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         tv.title = title
         tv.body = body ?? item.name
         tv.accent = accent ?? palette["attention"] ?? .systemOrange
+        // 用户标了「完成后提醒我」的会话：弹窗用状态色标出来，且不自动消失
+        let pinned = item.important == true
+        tv.emphasize = pinned
 
         let np = ToastPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
                             styleMask: [.borderless, .nonactivatingPanel],
@@ -1807,10 +1895,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         toasts.insert(handle, at: 0)
+        // 常驻的（重要）保留，普通条先让位，避免重要提醒被挤掉
         while toasts.count > 3 {
-            let old = toasts.removeLast()
-            old.timer?.invalidate()
-            old.panel.orderOut(nil)
+            if let idx = toasts.lastIndex(where: { $0.timer != nil }) , idx > 0 {
+                let old = toasts.remove(at: idx)
+                old.timer?.invalidate()
+                old.panel.orderOut(nil)
+            } else {
+                let old = toasts.removeLast()
+                old.timer?.invalidate()
+                old.panel.orderOut(nil)
+            }
         }
         layoutToasts()
 
@@ -1821,9 +1916,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             np.animator().alphaValue = 1
         }
 
-        handle.timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: false) { [weak self, weak handle] _ in
-            guard let self, let hd = handle else { return }
-            self.dismissToast(hd)
+        // 重要会话不设自动关闭：必须由用户点一下才算看过
+        if !pinned {
+            handle.timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: false) { [weak self, weak handle] _ in
+                guard let self, let hd = handle else { return }
+                self.dismissToast(hd)
+            }
         }
     }
 
@@ -2012,6 +2110,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.refresh()
             }
         }.resume()
+    }
+
+    /// 「完成后提醒我」：只影响展示与弹窗，不改状态判定
+    func setImportant(_ item: TaskItem, _ on: Bool) {
+        post("/important?id=\(item.id)&value=\(on ? 1 : 0)")
     }
 
     func setDeadline(_ item: TaskItem, minutes: Int?) {
