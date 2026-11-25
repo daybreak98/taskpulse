@@ -58,15 +58,27 @@ if ! command -v agent-browser >/dev/null 2>&1; then
 fi
 echo "-- agent-browser: $(agent-browser --version 2>&1 | head -1)"
 
+echo "──────── 这一步在做什么 ────────"
+echo "API 模式由本机进程直连接口取数：比 WEB 模式快，也不用一直开着网页，"
+echo "但它需要一份「你本人授权」的登录凭据。扫码就是把这份凭据写到本机，"
+echo "一次授权长期可用；以后过期了再扫一次即可。"
+echo
+echo "不会做的事："
+echo "  · 不读取、不接管你的浏览器，不拿网页内容，也不碰浏览器里的 cookie"
+echo "  · 不接触手机上的数据（扫码只做身份确认，不会装任何东西）"
+echo "  · 凭据只写在 ~/.codeflicker/sso/，不上传到任何地方"
+echo "  · 取数只调 DataAgent 自己的接口，拿会话标题与状态；"
+echo "    最后一条消息只在内存里比对是否限流，不保存、不外传"
+echo "───────────────────────────────"
 echo
 if [ "${1:-}" = "--terminal" ]; then
-  echo "接下来二维码会直接画在这个终端窗口里，用手机扫码。"
+  echo "接下来二维码会直接画在这个终端窗口里，用手机上的快手 App 扫它。"
   QR_MODE="terminal"
 else
-  echo "接下来会在屏幕上打开一个浏览器窗口，里面是登录页和二维码；"
-  echo "用手机上的快手 App 扫码授权即可。二维码有效期约 1 分钟。"
+  echo "接下来会在屏幕上打开一个浏览器窗口，里面是登录页和二维码，用手机上的快手 App 扫它。"
   QR_MODE="browser"
 fi
+echo "二维码有效期约 1 分钟，过期就关掉窗口重跑本脚本。"
 echo
 read -r -p "准备好了按回车开始..." _
 
