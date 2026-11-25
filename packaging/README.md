@@ -1,8 +1,8 @@
 # TaskPulse · 安装说明（macOS）
 
-> **当前分发方式（2026-11-25 起）**：ZIP 里只有 `TaskPulse.app` + `README.md`。
-> 同事双击 App，它自己把 uv / Python / 配置 / 扩展文件准备到用户目录，
-> 首次运行还会把自己装进 `~/Applications`，之后从启动台打开即可。
+> **当前分发方式**：解压后双击 `Install TaskPulse.app`。安装器把 `TaskPulse.app`
+> 安装到 `~/Applications` 并打开它，由 TaskPulse 准备 uv、Python、配置和扩展文件。
+> 之后从启动台打开 TaskPulse 即可。
 > 面向同事的说明见 `packaging/QUICKSTART.md`。
 >
 > **下面这份文档保留给两种人**：需要手动排查安装问题的，以及在改这个项目的。

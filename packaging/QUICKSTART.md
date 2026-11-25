@@ -7,18 +7,18 @@
 
 ## 第一次用（3 步）
 
-### 1. 双击解压出来的 `TaskPulse.app`
+### 1. 双击解压出来的 `Install TaskPulse.app`
 
 系统可能提示「无法打开」或「无法验证开发者」——这是 macOS 对个人签名应用的标准拦截。
 
 任选一种放行：
 
-- 在 `TaskPulse.app` 上**右键 → 打开**
+- 在 `Install TaskPulse.app` 上**右键 → 打开**
 - 或双击一次被拦后，去「系统设置 → 隐私与安全性」，滚到底部，点 **「仍要打开」**，输入开机密码
 
 只需要放行这一次。
 
-> 第一次启动时它会**把自己装进「应用程序」文件夹**（窗口里会显示「安装到应用程序文件夹…」），
+> 安装器会把 `TaskPulse.app` 装进你个人的**应用程序**文件夹，
 > 然后自动打开装好的那一份。之后从**启动台或 Spotlight 搜「TaskPulse」**就能打开，
 > 不用再回到解压目录。
 
@@ -85,7 +85,7 @@ API 凭据过期时，展开小窗会看到「API 凭据已失效」和一个「
 | 双击没反应 | 右键 → 打开；仍不行去「隐私与安全性」点「仍要打开」 |
 | 一直停在「正在准备运行环境」 | 看窗口里最后一步；多半是没连内网（装依赖要走内网源），连上后点「重试」 |
 | 细条不见了 | 启动台搜 TaskPulse 打开；或双击 `~/Applications/TaskPulse.app` |
-| 启动台搜不到 | 确认 `~/Applications/TaskPulse.app` 存在；没有的话重新双击解压目录里的那份 |
+| 启动台搜不到 | 确认 `~/Applications/TaskPulse.app` 存在。缺失时双击解压目录里的 `Install TaskPulse.app` |
 | 数字不动 | 确认浏览器里开着 DataAgent 页面、扩展是启用状态 |
 | 想彻底删掉 | 运行 `~/Applications/TaskPulse/uninstall.command`，再在扩展页移除 TaskPulse |
 | 要发给开发者排查 | `~/Library/Logs/taskpulse-app.log`（App 行为）、`taskpulse.log`（取数）、`taskpulse.poll.err`（启动失败） |

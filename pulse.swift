@@ -1713,7 +1713,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        if !isInstalledCopy {
+        if isInstaller {
             installSelf()
             return
         }
@@ -1781,7 +1781,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 安装器在目标 App 启动前保持可见，失败时允许重试。
     private func installSelf() {
-        let source = Bundle.main.bundleURL
+        let source = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/TaskPulse.app", isDirectory: true)
         let target = installedAppURL
         let mine = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? ""
         let config = target.appendingPathComponent("Contents/Info.plist")
@@ -1830,12 +1830,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             throw installError("复制的 App 缺少可执行文件。")
         }
 
-        try stopInstalledApp(at: target)
-
         if !fm.fileExists(atPath: target.path) {
             try fm.moveItem(at: incoming, to: target)
             return
         }
+        try stopInstalledApp(at: target)
         let backup = staging.appendingPathComponent("Previous.app", isDirectory: true)
         try fm.moveItem(at: target, to: backup)
         do {
@@ -1852,12 +1851,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private static func stopInstalledApp(at target: URL) throws {
-        let targetPath = bundlePath(target)
         func running() -> [NSRunningApplication] {
-            (taskPulseInstances() + taskPulseInstances(bundleIdentifier: "com.taskpulse.ui")).filter { app in
-                guard app.bundleURL.map(bundlePath) == targetPath, app.processIdentifier > 0 else { return false }
-                return kill(app.processIdentifier, 0) == 0 || errno != ESRCH
-            }
+            installedInstances(at: target, includingLegacy: true)
         }
 
         func waitForExit(seconds: Int) -> [NSRunningApplication] {
@@ -1872,7 +1867,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let old = running()
         guard !old.isEmpty else { return }
-        for instance in old { instance.terminate() }
+        for instance in old {
+            dbg("自我安装：请求退出旧版 TaskPulse pid=\(instance.processIdentifier) path=\(target.path)")
+            instance.terminate()
+        }
 
         let remaining = waitForExit(seconds: 4)
         guard !remaining.isEmpty else { return }
@@ -1884,7 +1882,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let stillRunning = waitForExit(seconds: 3)
         if !stillRunning.isEmpty {
             let pids = stillRunning.map { String($0.processIdentifier) }.joined(separator: "、")
-            throw installError("旧版 TaskPulse 仍在运行（PID：\(pids)）。请在「活动监视器」结束旧版后重试。")
+            throw installError("无法关闭 \(target.path) 中的旧版 TaskPulse（PID：\(pids)）。请退出这个实例后重试。")
         }
     }
 
@@ -1894,12 +1892,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func openInstalledApp() {
         OnboardingController.shared.showInstalling("打开已安装的 TaskPulse…")
-        if let running = taskPulseInstances().first(where: { $0.bundleURL.map(bundlePath) == bundlePath(installedAppURL) }) {
+        if let running = installedInstances(at: installedAppURL).first {
             confirmInstalledLaunch(running, until: Date().addingTimeInterval(8))
             return
         }
         let options = NSWorkspace.OpenConfiguration()
         options.createsNewApplicationInstance = true
+        options.allowsRunningApplicationSubstitution = false
         if let home = ProcessInfo.processInfo.environment["TP_HOME"] {
             options.environment = ["TP_HOME": home]
         }
@@ -1907,7 +1906,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             DispatchQueue.main.async {
                 if let error {
                     self.installFailed("无法打开已安装的 App：\(error.localizedDescription)")
-                } else if let app, app.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+                } else if let app, app.processIdentifier > 0, app.bundleIdentifier == runtimeBundleID {
                     self.confirmInstalledLaunch(app, until: Date().addingTimeInterval(8))
                 } else {
                     self.installFailed("系统未启动已安装的 TaskPulse。")
@@ -1921,9 +1920,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             installFailed("已安装的 TaskPulse 在启动完成前退出或未响应。")
             return
         }
-        if app.isFinishedLaunching, app.bundleURL.map(bundlePath) == bundlePath(installedAppURL) {
+        if app.isFinishedLaunching {
             app.activate(options: [.activateAllWindows])
-            dbg("自我安装：已打开目标 App")
+            dbg("自我安装：已打开目标 App pid=\(app.processIdentifier) path=\(app.bundleURL?.path ?? "未知")")
             NSApp.terminate(nil)
             return
         }
@@ -2705,30 +2704,46 @@ private func bundlePath(_ url: URL) -> String {
     url.standardizedFileURL.resolvingSymlinksInPath().path
 }
 
-private func taskPulseInstances(bundleIdentifier: String = "com.hyj.taskpulse") -> [NSRunningApplication] {
-    let me = ProcessInfo.processInfo.processIdentifier
+private let runtimeBundleID = "com.hyj.taskpulse"
+private let installerBundleID = "com.hyj.taskpulse.installer"
+
+private func taskPulseInstances(bundleIdentifier: String) -> [NSRunningApplication] {
     return NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
-        .filter { $0.processIdentifier != me && !$0.isTerminated }
+        .filter { $0.processIdentifier > 0 && $0.processIdentifier != getpid() && !$0.isTerminated }
+}
+
+private func installedInstances(at target: URL, includingLegacy: Bool = false) -> [NSRunningApplication] {
+    let executable = bundlePath(target.appendingPathComponent("Contents/MacOS/TaskPulse"))
+    let current = taskPulseInstances(bundleIdentifier: runtimeBundleID)
+    let legacy = includingLegacy ? taskPulseInstances(bundleIdentifier: "com.taskpulse.ui") : []
+    return (current + legacy).filter { app in
+        // 用内核记录的可执行文件路径确认身份，避免 Launch Services 的旧登记或同名副本参与升级。
+        let capacity = Int(MAXPATHLEN) * 4
+        var path = [UInt8](repeating: 0, count: capacity)
+        guard proc_pidpath(app.processIdentifier, &path, UInt32(capacity)) > 0 else { return false }
+        let actualPath = String(decoding: path.prefix { $0 != 0 }, as: UTF8.self)
+        return bundlePath(URL(fileURLWithPath: actualPath)) == executable
+    }
 }
 
 private let installedAppURL = URL(fileURLWithPath: Bootstrap.home, isDirectory: true)
     .appendingPathComponent("Applications/TaskPulse.app", isDirectory: true)
-private let isInstalledCopy = bundlePath(Bundle.main.bundleURL) == bundlePath(installedAppURL)
+private let isInstaller = Bundle.main.bundleIdentifier == installerBundleID
 
 // 启动埋点：在实例锁前记录进程与 App 路径。
-dbg("启动 pid=\(getpid()) path=\(Bundle.main.bundlePath)")
+let buildCommit = Bundle.main.object(forInfoDictionaryKey: "TaskPulseBuildCommit") as? String ?? "未知"
+dbg("启动 pid=\(getpid()) role=\(isInstaller ? "installer" : "ui") build=\(buildCommit) path=\(Bundle.main.bundlePath)")
 
 // 安装器与已安装 App 持有不同的锁，可以同时完成交接。
 try? FileManager.default.createDirectory(atPath: Bootstrap.stateDir, withIntermediateDirectories: true)
-let lockPath = Bootstrap.stateDir + (isInstalledCopy ? "/ui.lock" : "/installer.lock")
+let lockPath = Bootstrap.stateDir + (isInstaller ? "/installer.lock" : "/ui.lock")
 let lockFD = open(lockPath, O_CREAT | O_WRONLY | O_CLOEXEC, 0o600)
 let appLock = lockFD >= 0 ? FileHandle(fileDescriptor: lockFD, closeOnDealloc: true) : nil
 if let appLock, flock(appLock.fileDescriptor, LOCK_EX | LOCK_NB) != 0, errno == EWOULDBLOCK {
-    taskPulseInstances().first(where: {
-        guard let url = $0.bundleURL else { return false }
-        return (bundlePath(url) == bundlePath(installedAppURL)) == isInstalledCopy
-    })?.activate(options: [.activateAllWindows])
-    dbg("已有实例在运行（\(isInstalledCopy ? "ui" : "installer")），激活它并退出")
+    let instances = isInstaller ? taskPulseInstances(bundleIdentifier: installerBundleID)
+        : installedInstances(at: installedAppURL)
+    instances.first?.activate(options: [.activateAllWindows])
+    dbg("已有实例持有启动锁（\(isInstaller ? "installer" : "ui")），退出本次启动")
     exit(0)
 }
 

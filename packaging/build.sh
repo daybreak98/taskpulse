@@ -1,8 +1,8 @@
 #!/bin/bash
-# 构建「免费个人内测包」：ZIP 里只有一个 TaskPulse.app + 使用说明。
+# 构建「免费个人内测包」：ZIP 里只有 Install TaskPulse.app + 使用说明。
 #
 # 同事不需要跑 install.command、不需要终端、不需要预装 Python：
-# 双击 App 后由 App 自己把运行环境准备到用户目录（见 Bootstrap.swift）。
+# 双击安装器后，它会安装并打开 TaskPulse.app，由后者准备运行环境。
 #
 #   用法：./packaging/build.sh
 #
@@ -13,6 +13,9 @@ cd "$(dirname "$0")/.." || exit 1
 
 VER="$(date +%Y%m%d)"
 NAME="TaskPulse-$VER-personal"
+if BUILD_COMMIT="$(git rev-parse --short HEAD 2>/dev/null)"; then
+  NAME="$NAME-$BUILD_COMMIT"
+fi
 OUT="dist/$NAME"
 
 if [ ! -d packaging/vendor ] || [ -z "$(ls -A packaging/vendor 2>/dev/null)" ]; then
@@ -32,6 +35,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp packaging/Info.plist "$APP/Contents/Info.plist"
 # 构建号用日期：App 自我安装时据此判断新旧，避免把旧副本盖到新版上
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VER" "$APP/Contents/Info.plist"
+if [ -n "$BUILD_COMMIT" ]; then
+  /usr/libexec/PlistBuddy -c "Add :TaskPulseBuildCommit string $BUILD_COMMIT" "$APP/Contents/Info.plist"
+fi
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
 TMPB="$STAGE/build"
@@ -75,8 +81,7 @@ echo "   -> $(lipo -archs "$APP/Contents/MacOS/TaskPulse")"
 
 echo "== 4/4 打包 =="
 rm -rf "$OUT" && mkdir -p "$OUT"
-cp -R "$APP" "$OUT/"
-codesign --verify --deep --strict "$OUT/TaskPulse.app"
+bash packaging/wrap_installer.sh "$APP" "$OUT/Install TaskPulse.app"
 cp packaging/QUICKSTART.md "$OUT/README.md"   # 英文名：中文名在某些解压工具里会乱码
 
 ZIP="$NAME.zip"

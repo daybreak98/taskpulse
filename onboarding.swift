@@ -287,7 +287,7 @@ final class OnboardingController {
         beginBootstrap()
     }
 
-    /// 首次从「下载」里运行时，先把 App 自己装进 ~/Applications
+    /// 安装器把 TaskPulse.app 装到 ~/Applications 后再打开它。
     func showInstalling(_ step: String = "安装到「应用程序」文件夹…") {
         show()
         renderBootstrapping(step)
