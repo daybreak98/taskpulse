@@ -22,6 +22,7 @@
   const samples = new Map();
   const messages = new Map();
   const probes = new Map();
+  let trackedTasks = {};
 
   async function fetchInfo(path, deadline, init = {}) {
     const remaining = deadline - Date.now();
@@ -71,7 +72,7 @@
     conversations = [...found.values()].sort((a, b) => (b.updateTime || 0) - (a.updateTime || 0));
     listAt = Date.now();
     dirty = true;
-    const watched = new Set(conversations.slice(0, timing.watch).map(row => row.id));
+    const watched = new Set(TaskPulseState.watchRows(conversations, samples, trackedTasks, Date.now()).map(row => row.id));
     for (const map of [samples, messages, probes]) {
       for (const id of map.keys()) if (!watched.has(id)) map.delete(id);
     }
@@ -112,7 +113,7 @@
     try {
       const data = await fetchInfo(api.prefix + api.messages.replace("{cid}", row.id), deadline);
       const latest = Array.isArray(data.list) && data.list[0];
-      if (typeof latest?.sender !== "string") return;
+      if (typeof latest?.sender !== "string") throw new Error("消息结构无效");
       const sender = latest.sender === "assistant" ? "assistant" : "other";
       const content = typeof latest.content === "string" ? latest.content : "";
       const failed = sender === "assistant" && api.marks.some(mark => content.includes(mark));
@@ -127,10 +128,15 @@
       };
       messages.set(row.id, message);
       probe.failures = 0;
+      probe.errorAt = 0;
       probe.nextAt = Date.now() + (sender === "assistant" ? 30_000 : 10_000);
       dirty = true;
     } catch {
-      // A slow or not-yet-visible reply is retried on a later bounded idle sample.
+      // Never reuse an older success as confirmation after a failed probe.
+      messages.delete(row.id);
+      probe.errorAt = Date.now();
+      dirty = true;
+      // Keep retrying this version with the existing bounded backoff.
     }
   }
 
@@ -150,13 +156,14 @@
     const accepted = await chrome.runtime.sendMessage({
       kind: "tp.webstate", pageId, lease: token,
       payload: { at, listAt, error, conversations, queues, queueAt, queueErrors,
-        lastMessages: Object.fromEntries(messages) }
+        lastMessages: Object.fromEntries(messages),
+        messageErrors: Object.fromEntries([...probes].filter(([, probe]) => probe.errorAt).map(([id, probe]) => [id, probe.errorAt])) }
     });
     if (accepted?.ok) dirty = false;
   }
 
   function dueAt(now) {
-    return conversations.slice(0, timing.watch).map(row => {
+    return TaskPulseState.watchRows(conversations, samples, trackedTasks, now).map(row => {
       let sample = samples.get(row.id);
       if (!sample) {
         sample = { checked: 0, version: 0, hotUntil: 0 };
@@ -167,8 +174,10 @@
         sample.hotUntil = now + timing.hotWindow;
       }
       return { row, sample };
-    }).filter(({ sample }) => {
-      const hot = TaskPulseState.queueBusy(sample.queue) === true || sample.hotUntil > now;
+    }).filter(({ row, sample }) => {
+      const task = trackedTasks[row.id];
+      const hot = TaskPulseState.queueBusy(sample.queue) === true || sample.hotUntil > now ||
+        Boolean(task?.awaitingReply || task?.runAt || task?.messageUncertain);
       return now - sample.checked >= (hot ? timing.hot : timing.idle);
     }).sort((a, b) => a.sample.checked - b.sample.checked).slice(0, timing.queueBudget);
   }
@@ -179,6 +188,11 @@
     const token = lease;
     const deadline = Date.now() + timing.round;
     try {
+      // Read the durable monitoring set on every round, including after a
+      // collector handoff. Old active/uncertain tasks retain their queue slots.
+      const saved = await chrome.storage.local.get(web.keys.state).catch(() => null);
+      if (saved) trackedTasks = saved[web.keys.state]?.tasks || {};
+      if (token !== lease) return;
       if (Date.now() >= nextListAt) {
         nextListAt = Date.now() + timing.list;
         await pullList(deadline);
@@ -187,8 +201,10 @@
       if (!error) {
         for (const { row, sample } of dueAt(Date.now())) {
           if (token !== lease || deadline - Date.now() < 250) break;
+          const wasBusy = TaskPulseState.queueBusy(sample.queue) === true;
           if (await pullQueue(row, sample, deadline) && token === lease &&
               TaskPulseState.queueBusy(sample.queue) === false) {
+            if (wasBusy && probes.has(row.id)) probes.get(row.id).nextAt = 0;
             await pullLastMessage(row, deadline);
           }
         }

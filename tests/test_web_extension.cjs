@@ -27,6 +27,7 @@ const report = (at, conversation, options = {}) => ({
   queues: options.busy === null ? {} : { [id]: { sessionState: options.busy ? "BUSY" : "IDLE", pending: [] } },
   queueAt: options.busy === null ? {} : { [id]: options.queueAt ?? at },
   queueErrors: options.queueError ? { [id]: at } : {},
+  messageErrors: options.messageError ? { [id]: at } : {},
   lastMessages: options.message ? { [id]: options.message } : {}
 });
 
@@ -173,7 +174,7 @@ test("路径验证和扩展权限限制在 DataAgent", () => {
   }
 });
 
-function worker() {
+function worker(seed = {}) {
   const event = () => {
     const listeners = [];
     return {
@@ -182,13 +183,13 @@ function worker() {
       listeners
     };
   };
-  const local = { data: {} }, session = { data: {} };
+  const local = { data: structuredClone(seed.local || {}) }, session = { data: structuredClone(seed.session || {}) };
   for (const store of [local, session]) {
     store.get = async key => ({ [key]: structuredClone(store.data[key]) });
     store.set = async data => Object.assign(store.data, structuredClone(data));
     store.remove = async key => { delete store.data[key]; };
   }
-  const notices = new Map();
+  const notices = new Map(seed.notices || []);
   const tabs = [{ id: 7, windowId: 1, url: web.page, active: true, status: "complete" }];
   const sender = { id: "unit", frameId: 0, tab: tabs[0], url: web.page };
   const chrome = {
@@ -243,7 +244,7 @@ function worker() {
     stamp = payload.at;
     return send({ kind: "tp.webstate", pageId: "page", lease, payload });
   }
-  return { tabs, sender, send, deliver, notices, local, chrome };
+  return { tabs, sender, send, deliver, notices, local, session, chrome };
 }
 
 test("worker rejects the old page lease and reuses a correctly verified conversation", async () => {
@@ -449,4 +450,284 @@ test("同文档进入 DataAgent 时补装采集脚本，工具栏优先使用已
     await new Promise(resolve => setTimeout(resolve, 5));
   }
   assert.deepEqual(sent.find(item => item.kind === "tp.show"), { tabId: ready.id, kind: "tp.show" });
+});
+
+async function until(predicate, label) {
+  for (let i = 0; i < 100; i++) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.ok(predicate(), label || "event did not settle");
+}
+
+test("idle message failures never settle an unconfirmed run as read; recovery is deduplicated", () => {
+  const { next } = timeline();
+  next(report(now, row(), { message: message(old, now, "historical") }));
+  next(report(now + 5_000, row(), { busy: true }));
+  const idle = next(report(now + 10_000, row(), {
+    message: message(old, now, "historical"), messageError: true
+  }));
+  assert.equal(idle.task.messageUncertain, true);
+  assert.equal(rules.canAcknowledge(idle.task), false);
+  const afterTimeout = next(report(now + 110_000, row(), { messageError: true }));
+  assert.notEqual(afterTimeout.task.status, "seen");
+  assert.equal(afterTimeout.task.acked, old);
+  assert.equal(rules.view(afterTimeout.state, now + 110_000).tasks[0].uncertain, true);
+  const update = now + 120_000;
+  const recovered = next(report(now + 121_000, row(update), {
+    message: message(update, now + 121_000, "recovered", { atMessage: now + 105_000 })
+  }));
+  assert.equal(recovered.task.status, "attention");
+  assert.equal(recovered.task.messageUncertain, false);
+  assert.equal(recovered.replies.length, 1);
+  const repeated = next(report(now + 130_000, row(update), {
+    message: message(update, now + 130_000, "recovered", { atMessage: now + 105_000 })
+  }));
+  assert.equal(repeated.replies.length, 0);
+});
+
+test("distinct server IDs at the same timestamp are independent, replay of either ID is ignored", () => {
+  const tracker = timeline();
+  tracker.next(report(now, row()));
+  const update = now + 1_000;
+  const a = tracker.next(report(now + 5_000, row(update), {
+    message: message(update, now + 5_000, "same-time-a", { atMessage: update })
+  }));
+  a.state.tasks[id] = rules.acknowledge(a.task);
+  tracker.restore(a.state);
+  const b = tracker.next(report(now + 10_000, row(update), {
+    message: message(update, now + 10_000, "same-time-b", { atMessage: update })
+  }));
+  assert.equal(b.replies.length, 1);
+  assert.notEqual(rules.revision(a.task), rules.revision(b.task));
+  const replay = tracker.next(report(now + 15_000, row(update), {
+    message: message(update, now + 15_000, "same-time-a", { atMessage: update })
+  }));
+  assert.equal(replay.replies.length, 0);
+  assert.equal(rules.revision(replay.task), rules.revision(b.task));
+});
+
+test("a late historical message newer than an old list timestamp is quiet at first install", () => {
+  const { next } = timeline();
+  const first = next(report(now, row(), {
+    message: message(old, now, "historical", { atMessage: now - 1_000 })
+  }));
+  assert.equal(first.replies.length, 0);
+  assert.equal(first.task.status, "seen");
+  assert.equal(first.task.lastAssistant, "historical");
+});
+
+test("known active and unconfirmed tasks survive the 24-row discovery window", () => {
+  const rows = Array.from({ length: 30 }, (_, i) => ({ ...row(old - i), id: String(100 + i) }));
+  const localBusy = rows[25].id;
+  const durableBusy = rows[27].id;
+  const uncertain = rows[28].id;
+  const samples = new Map([[localBusy, { queue: { sessionState: "BUSY", pending: [] } }]]);
+  const tracked = {
+    [durableBusy]: { agentId: agent, runAt: old },
+    [uncertain]: { agentId: agent, messageUncertain: true }
+  };
+  const ids = rules.watchRows(rows, samples, tracked, now).map(row => row.id);
+  assert.equal(ids.length, 27);
+  assert.ok(ids.includes(localBusy));
+  assert.ok(ids.includes(durableBusy));
+  assert.ok(ids.includes(uncertain));
+  assert.ok(!ids.includes(rows[29].id));
+});
+
+test("collector actually polls a durable old running task after leader handoff; failed message probes recover", async () => {
+  const rows = Array.from({ length: 27 }, (_, i) => ({ ...row(old - i), id: String(100 + i) }));
+  const trackedId = rows.at(-1).id;
+  const probeId = rows[0].id;
+  let stamp = now, interval, messageFailure = true;
+  let listRequests = 0;
+  const queueReads = [], reports = [], listeners = [];
+  const reply = data => ({ ok: true, json: async () => ({ success: true, data }) });
+  const chrome = {
+    storage: { local: { get: async key => ({ [key]: { tasks: { [trackedId]: { agentId: agent, runAt: old } } } }) } },
+    runtime: {
+      id: "collector-test",
+      onMessage: { addListener: fn => listeners.push(fn) },
+      sendMessage: async packet => { if (packet.kind === "tp.webstate") reports.push(packet.payload); return { ok: true }; }
+    }
+  };
+  class Clock extends Date { static now() { return stamp; } }
+  const context = vm.createContext({
+    chrome, URL, console, crypto: webcrypto, AbortController, Date: Clock,
+    location: new URL(web.page), document: { hidden: false, addEventListener() {} },
+    setTimeout, clearTimeout, setInterval: fn => { interval = fn; return 1; }, clearInterval() {},
+    fetch: async url => {
+      if (url.pathname.endsWith("/list")) {
+        listRequests++;
+        return reply({ groups: [], ungrouped: { conversations: rows } });
+      }
+      const cid = url.pathname.split("/").at(-2);
+      if (url.pathname.endsWith("/queue")) {
+        queueReads.push(cid);
+        return reply({ sessionState: cid === trackedId ? "BUSY" : "IDLE", pending: [] });
+      }
+      if (cid === probeId && messageFailure) throw new Error("message endpoint offline");
+      return reply({ list: [{ sender: "other", id: "user-" + cid, createTime: old }] });
+    }
+  });
+  for (const file of ["config.js", "state.js", "web-bridge.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(ext, file), "utf-8"), context, { filename: file });
+  }
+  let page;
+  listeners[0]({ kind: "tp.probe" }, {}, answer => { page = answer; });
+  listeners[0]({ kind: "tp.role", pageId: page.pageId, lease: "replacement" }, {}, () => {});
+  await until(() => reports.length === 1, "first collector report");
+  assert.ok(reports[0].messageErrors[probeId]);
+  assert.equal(reports[0].lastMessages[probeId], undefined);
+  messageFailure = false;
+  for (let round = 1; round <= 7; round++) {
+    stamp += 5_000;
+    interval();
+    await until(() => reports.length >= round + 1, "collector round " + round);
+  }
+  assert.ok(queueReads.includes(trackedId), "old running task was evicted");
+  assert.ok(!queueReads.includes(rows.at(-2).id), "cold task exceeded discovery budget");
+  assert.ok(reports.some(report => report.lastMessages[probeId] && !report.messageErrors[probeId]));
+  assert.ok(listRequests >= 2, "list refresh was not exercised");
+  assert.ok(reports.at(-1).queueAt[trackedId], "old task was lost after list refresh");
+  listeners[0]({ kind: "tp.role", pageId: page.pageId, lease: "" }, {}, () => {});
+});
+
+test("foreground report acknowledges an already-notified reply and clears the system notification", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), {
+    message: message(update, now + 5_000, "foreground")
+  }));
+  assert.equal(app.notices.size, 1);
+  app.tabs[0].url = web.conversationUrl(id, agent);
+  await app.deliver(report(now + 10_000, row(update)));
+  const state = app.local.data[web.keys.state];
+  assert.equal(state.tasks[id].status, "seen");
+  assert.equal(state.tasks[id].pending, false);
+  assert.equal(app.notices.size, 0);
+  assert.deepEqual(state.outbox, {});
+});
+
+test("foreground read cancels delayed outbox replay after failure and restart", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.create = async () => { throw new Error("temporary delivery failure"); };
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), {
+    message: message(update, now + 5_000, "outbox")
+  }));
+  assert.equal(Object.keys(app.local.data[web.keys.state].outbox).length, 1);
+  const resumed = worker({ local: app.local.data });
+  resumed.tabs[0].url = web.conversationUrl(id, agent);
+  await resumed.deliver(report(now + 15_000, row(update)));
+  assert.equal(resumed.local.data[web.keys.state].tasks[id].pending, false);
+  assert.deepEqual(resumed.local.data[web.keys.state].outbox, {});
+  assert.equal(resumed.notices.size, 0);
+  resumed.tabs[0].url = web.page;
+  await resumed.deliver(report(now + 20_000, row(update)));
+  assert.equal(resumed.notices.size, 0);
+});
+
+test("notification cleanup is retried after a transient clear failure", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), {
+    message: message(update, now + 5_000, "clear-retry")
+  }));
+  const clear = app.chrome.notifications.clear;
+  app.chrome.notifications.clear = async () => { throw new Error("temporary clear failure"); };
+  app.tabs[0].url = web.conversationUrl(id, agent);
+  await app.deliver(report(now + 10_000, row(update)));
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, false);
+  assert.equal(app.notices.size, 1);
+  app.chrome.notifications.clear = clear;
+  app.tabs[0].url = web.page;
+  await app.deliver(report(now + 15_000, row(update)));
+  assert.equal(app.notices.size, 0);
+});
+
+test("different revisions never reuse a successful navigation result; failed second jump keeps its notice", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const updateA = now + 1_000, updateB = now + 10_000;
+  await app.deliver(report(now + 5_000, row(updateA), { message: message(updateA, now + 5_000, "jump-a") }));
+  const a = [...app.notices.keys()][0];
+  await app.deliver(report(now + 15_000, row(updateB), { message: message(updateB, now + 15_000, "jump-b") }));
+  const b = [...app.notices.keys()].find(key => key !== a);
+  let release, attempts = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const create = app.chrome.tabs.create;
+  app.chrome.tabs.create = async args => {
+    if (++attempts !== 1) throw new Error("second navigation failed");
+    await gate;
+    return create(args);
+  };
+  app.chrome.tabs.update = async () => { throw new Error("second focus failed"); };
+  const first = app.send({ kind: "tp.open", id, revision: a.slice("tp-reply:".length) });
+  await until(() => attempts === 1);
+  app.chrome.notifications.onClicked.listeners[0](b);
+  release();
+  assert.equal((await first).ok, true);
+  await until(() => attempts === 2, "second navigation was incorrectly coalesced");
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(app.notices.has(b), true);
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, true);
+});
+
+test("old jump stays version-protected on subsequent report and worker restart, real visit reads the new reply", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const updateA = now + 1_000, updateB = now + 10_000;
+  await app.deliver(report(now + 5_000, row(updateA), { message: message(updateA, now + 5_000, "old") }));
+  const a = [...app.notices.keys()][0];
+  await app.deliver(report(now + 15_000, row(updateB), { message: message(updateB, now + 15_000, "new") }));
+  const b = [...app.notices.keys()].find(key => key !== a);
+  assert.equal((await app.send({ kind: "tp.open", id, revision: a.slice("tp-reply:".length) })).ok, true);
+  await app.deliver(report(now + 20_000, row(updateB)));
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, true);
+  assert.equal(app.notices.has(b), true);
+  const restarted = worker({ local: app.local.data, session: app.session.data, notices: [...app.notices] });
+  restarted.tabs.splice(0, restarted.tabs.length, ...structuredClone(app.tabs));
+  await restarted.deliver(report(now + 25_000, row(updateB)));
+  assert.equal(restarted.local.data[web.keys.state].tasks[id].pending, true);
+  const target = restarted.tabs.find(tab => tab.active);
+  assert.equal((await restarted.send({ kind: "tp.visit", id }, {
+    id: "unit", frameId: 0, tab: target, url: target.url
+  })).ok, true);
+  assert.equal(restarted.local.data[web.keys.state].tasks[id].pending, false);
+  assert.equal(restarted.notices.has(b), false);
+});
+
+test("unconfirmed message cannot be checked or cleared by a foreground visit", async () => {
+  const app = worker();
+  await app.deliver(report(now, row(), { busy: true }));
+  const update = now + 5_000;
+  await app.deliver(report(now + 10_000, row(update), { messageError: true }));
+  app.tabs[0].url = web.conversationUrl(id, agent);
+  await app.deliver(report(now + 110_000, row(update), { messageError: true }));
+  const task = app.local.data[web.keys.state].tasks[id];
+  assert.equal(task.messageUncertain, true);
+  assert.equal((await app.send({ kind: "tp.check", id, revision: rules.revision(task), checked: true })).ok, false);
+  assert.notEqual(app.local.data[web.keys.state].tasks[id].status, "seen");
+  assert.equal(app.local.data[web.keys.state].tasks[id].acked, old);
+});
+
+test("disconnect does not deliver a stale outbox; recovery delivers the current version only once", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.getPermissionLevel = async () => "denied";
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), { message: message(update, now + 5_000, "reconnect") }));
+  assert.equal(Object.keys(app.local.data[web.keys.state].outbox).length, 1);
+  app.chrome.notifications.getPermissionLevel = async () => "granted";
+  await app.deliver(report(now + 10_000, row(update), { error: "HTTP 401", busy: null }));
+  assert.equal(app.notices.size, 0);
+  await app.deliver(report(now + 15_000, row(update)));
+  assert.equal(app.notices.size, 1);
+  await app.deliver(report(now + 20_000, row(update)));
+  assert.equal(app.notices.size, 1);
+  assert.deepEqual(app.local.data[web.keys.state].outbox, {});
 });

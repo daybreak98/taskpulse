@@ -21,7 +21,8 @@
 
   function acknowledge(task) {
     return {
-      ...task, acked: Math.max(task.acked, task.replyAt || task.replyUpdate || task.update), pending: false, phaseAt: 0,
+      ...task, acked: Math.max(task.acked || 0, task.replyAt || task.replyUpdate || 0),
+      readRevision: revision(task), pending: false, phaseAt: 0,
       status: task.status === "attention" || (task.status === "stuck" && !task.runAt) ? "seen" : task.status
     };
   }
@@ -29,7 +30,9 @@
   function latestMessage(report, task, stamp) {
     const message = report.lastMessages?.[task.id];
     if (!message || time(message.updateTime) !== task.update ||
-        !time(message.at) || time(message.at) > stamp) return null;
+        !time(message.at) || time(message.at) > stamp ||
+        time(report.messageErrors?.[task.id]) >= time(message.at) ||
+        !["assistant", "other"].includes(message.sender)) return null;
     return message;
   }
 
@@ -41,9 +44,17 @@
   }
 
   function newReply(task, message, key) {
-    if (!key || key === task.replyKey || message.messageId && message.messageId === task.lastAssistant) return false;
+    if (!key || key === task.replyKey || task.replyKeys?.includes(key) ||
+        message.messageId && message.messageId === task.lastAssistant) return false;
     const at = time(message.atMessage);
-    if (at) return at > Math.max(task.acked, task.replyAt || 0) && at >= task.update - 5_000;
+    if (at) {
+      if (at > Math.max(task.acked || 0, task.replyAt || 0, task.historyAt || 0)) return true;
+      // The API can timestamp two different messages in the same second.
+      // A distinct, previously unseen server message ID identifies the next
+      // reply even when list and message timestamps have not advanced.
+      return Boolean(message.messageId && task.lastAssistant && at === task.replyAt &&
+        at >= (task.acked || 0) && at > (task.historyAt || 0));
+    }
     return task.update > Math.max(task.acked, task.created, task.replyUpdate || 0);
   }
 
@@ -54,6 +65,28 @@
     return (Array.isArray(pending) ? pending.length > 0 : Boolean(pending)) || !api.idle.includes(raw);
   }
 
+  function verifiedReply(task) {
+    return /^(message|time|update)\./.test(task.replyKey || "");
+  }
+
+  function canAcknowledge(task) {
+    return !!task && !task.runAt && !task.messageUncertain &&
+      task.status !== "running" && (!task.pending || verifiedReply(task));
+  }
+
+  function watchRows(rows, samples, tasks, now) {
+    // The recent window is a discovery budget, not an eviction policy for work
+    // already in flight. Persisted state also protects work after a leader change.
+    return rows.filter((row, index) => {
+      const sample = samples.get(row.id);
+      const task = tasks?.[row.id];
+      return index < timing.watch || queueBusy(sample?.queue) === true ||
+        sample?.hotUntil > now || Boolean(task && task.agentId === (id(row.agentId) ||
+          String(globalThis.TaskPulseWeb.api.body.agentIdList[0])) &&
+          (task.runAt || task.awaitingReply || task.pending || task.messageUncertain));
+    });
+  }
+
   function applyQueue(task, at, busy, message) {
     let started = task.runAt || 0;
     if (started && task.observedAt && at - task.observedAt > STUCK) started = 0;
@@ -61,14 +94,37 @@
 
     if (busy) {
       task.runAt = started || at;
+      task.awaitingReply = true;
+      task.lastBusyAt = at;
+      task.messageUncertain = false;
       task.settleUntil = 0;
       task.status = at - task.runAt >= STUCK ? "stuck" : "running";
       return;
     }
 
+    // A cached pre-run message is not evidence of what happened after the run.
+    if (message && task.awaitingReply && message.at < (task.lastBusyAt || started)) message = null;
+    const needsEvidence = task.awaitingReply || started || task.messageUncertain ||
+      task.update > Math.max(task.acked || 0, task.replyUpdate || 0, task.messageUpdate || 0);
+    if (!message && needsEvidence) {
+      task.messageUncertain = true;
+      if (started) {
+        task.settleUntil ||= at + SETTLE;
+        task.status = "running";
+      }
+      // Keep the last verified reply and its watermark; an idle queue is not
+      // evidence that the message endpoint successfully returned a reply.
+      return;
+    }
+    if (message) {
+      task.messageUpdate = task.update;
+      task.messageObservedAt = message.at;
+      task.messageUncertain = false;
+    }
     const key = replyIdentity(task, message);
     const changed = newReply(task, message, key);
     if (changed) {
+      task.replyKeys = [...new Set([...(task.replyKeys || []), task.replyKey, key].filter(Boolean))].slice(-32);
       task.replyKey = key;
       task.replyUpdate = task.update;
       task.replyAt = time(message.atMessage);
@@ -78,8 +134,8 @@
       task.failed = Boolean(message.failed);
     } else if (key && (key === task.replyKey || message.messageId && message.messageId === task.lastAssistant)) {
       if (task.pending && message.failed) task.failed = true;
-    } else if (!task.replyKey && task.update <= task.acked &&
-               message?.sender === "assistant" && time(message.atMessage) <= task.acked &&
+    } else if (!task.replyKey && task.update <= Math.max(task.acked || 0, task.historyAt || 0) &&
+               message?.sender === "assistant" && time(message.atMessage) <= Math.max(task.acked || 0, task.historyAt || 0) &&
                (!started || time(message.atMessage))) {
       task.lastAssistant = message.messageId || task.lastAssistant;
     }
@@ -92,6 +148,7 @@
     }
 
     task.runAt = 0;
+    task.awaitingReply = false;
     task.settleUntil = 0;
     if (!task.pending) {
       task.status = "seen";
@@ -125,7 +182,7 @@
       const old = state.tasks[cid]?.agentId === agentId ? state.tasks[cid] : null;
       if (old && update < old.update) continue;
       let task = {
-        ...(old || { status: "seen", acked: update > baseline ? Math.max(created, baseline) : update, observedAt: 0 }),
+        ...(old || { status: "seen", historyAt: baseline, acked: update > baseline ? Math.max(created, baseline) : update, observedAt: 0 }),
         id: cid, agentId, update, created, listedAt: listAt,
         name: text(row.name, 180) || "会话 " + cid, group: text(row.groupName, 80)
       };
@@ -135,19 +192,23 @@
       const message = latestMessage(report, task, at);
       const errorAt = time(report.queueErrors?.[cid]);
       const freshQueue = busy !== null && sampleAt > task.observedAt && sampleAt <= at;
-      if (freshQueue) {
+      const freshMessage = busy === false && sampleAt === task.observedAt && !task.queueError &&
+        message && message.at >= sampleAt && message.at > (task.messageObservedAt || 0);
+      if (freshQueue || freshMessage) {
         applyQueue(task, sampleAt, busy, message);
-        task.queueError = false;
+        if (freshQueue) task.queueError = false;
+      } else if (task.update > Math.max(task.acked || 0, task.replyUpdate || 0, task.messageUpdate || 0) &&
+                 !message && busy !== true) {
+        task.messageUncertain = true;
       }
       if (errorAt > task.observedAt) task.queueError = true;
       const confirmed = !state.error && !task.queueError && task.observedAt &&
         now - listAt <= timing.sourceStale && now - task.observedAt <= timing.queueStale;
-      const verified = /^(message|time|update)\./.test(task.replyKey || "") &&
-        (task.replyAt !== undefined || message?.sender === "assistant");
-      if (task.pending && verified && confirmed && !task.runAt && task.notified !== task.replyKey) {
+      if (task.pending && verifiedReply(task) && confirmed && canAcknowledge(task)) {
         if (cid === activeId && task.status === "attention") {
+          // Auto-read must also apply to a reply that has already been notified.
           task = acknowledge(task);
-        } else {
+        } else if (task.notified !== task.replyKey) {
           task.notified = task.replyKey;
           replies.push(task);
         }
@@ -169,7 +230,7 @@
     const tasks = [];
     for (const task of Object.values(state.tasks)) {
       if (task.listedAt !== state.listAt) continue;
-      const uncertain = stale || task.queueError || !task.observedAt || now - task.observedAt > timing.queueStale;
+      const uncertain = stale || task.queueError || task.messageUncertain || !task.observedAt || now - task.observedAt > timing.queueStale;
       if (!uncertain && Object.hasOwn(counts, task.status)) counts[task.status]++;
       tasks.push({ ...task, uncertain });
     }
@@ -177,5 +238,5 @@
     return { counts, tasks, stale, offline, error };
   }
 
-  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, queueBusy, stuckMs: STUCK };
+  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, canAcknowledge, verifiedReply, queueBusy, watchRows, stuckMs: STUCK };
 })();

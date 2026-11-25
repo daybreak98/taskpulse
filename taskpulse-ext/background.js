@@ -6,8 +6,32 @@ const rules = globalThis.TaskPulseState;
 const ALARM = "tp-web-sync";
 const REPLY_NOTICE = "tp-reply:";
 const contentFiles = chrome.runtime.getManifest().content_scripts[0].js;
+// One navigation job per exact reply; different revisions never share a result.
 const opening = new Map();
+let navigationLane = Promise.resolve();
 const jumpTabs = new Map();
+const JUMP_KEY = "tp-web-jump-tabs-v1";
+const jumpReady = chrome.storage.session.get(JUMP_KEY).then(items => {
+  for (const [tabId, cid] of Object.entries(items[JUMP_KEY] || {})) {
+    if (Number.isInteger(Number(tabId)) && web.id(cid)) jumpTabs.set(Number(tabId), cid);
+  }
+}).catch(() => {});
+let jumpLane = Promise.resolve();
+function persistJumps() {
+  const snapshot = Object.fromEntries(jumpTabs);
+  const result = jumpLane.then(() => chrome.storage.session.set({ [JUMP_KEY]: snapshot }));
+  jumpLane = result.catch(() => {});
+  return result;
+}
+async function rememberJump(tabId, cid) {
+  await jumpReady;
+  jumpTabs.set(tabId, cid);
+  await persistJumps();
+}
+async function forgetJump(tabId) {
+  await jumpReady;
+  if (jumpTabs.delete(tabId)) await persistJumps().catch(() => {});
+}
 
 const info = error => console.warn("TaskPulse:", error?.message ?? error);
 let lane = Promise.resolve();
@@ -112,9 +136,67 @@ async function foregroundPage() {
   return isReady(tab) ? tab : null;
 }
 
-function activeConversation(tab, visit = false) {
+function activeConversation(tab) {
   const id = web.conversationId(tab?.url);
-  return opening.has(id) || visit && jumpTabs.get(tab?.id) === id ? "" : id;
+  // A notification landing is a versioned action, not an unversioned visit.
+  // Keep this protection after navigation completes (including worker restarts).
+  return opening.has(id) || jumpTabs.get(tab?.id) === id ? "" : id;
+}
+
+function freshTask(state, task, now = Date.now()) {
+  return !state.error && state.at && now - state.at <= web.timing.sourceStale &&
+    state.listAt && now - state.listAt <= web.timing.sourceStale &&
+    task && task.listedAt === state.listAt && !task.queueError && task.observedAt &&
+    now - task.observedAt <= web.timing.queueStale;
+}
+
+function canAutoRead(state, task) {
+  return freshTask(state, task) && task.pending && task.status === "attention" &&
+    rules.verifiedReply(task) && rules.canAcknowledge(task);
+}
+
+async function readForeground(state, tabId, windowId) {
+  await jumpReady;
+  const tab = await foregroundPage();
+  if (!tab || tabId !== undefined && tab.id !== tabId || windowId !== undefined && tab.windowId !== windowId) return false;
+  const task = state.tasks[activeConversation(tab)];
+  if (!canAutoRead(state, task)) return false;
+  state.tasks[task.id] = rules.acknowledge(task);
+  return true;
+}
+
+function noticeTask(state, revision) {
+  const [id, agentId] = revision.split("/");
+  const task = state.tasks[id];
+  return task?.agentId === agentId && task.pending && rules.revision(task) === revision ? task : null;
+}
+
+function pruneOutbox(state) {
+  let changed = false;
+  for (const revision of Object.keys(state.outbox || {})) {
+    if (!noticeTask(state, revision)) {
+      delete state.outbox[revision];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+async function clearReadNotices(state) {
+  const existing = await chrome.notifications.getAll();
+  await Promise.allSettled(Object.keys(existing).filter(key => {
+    if (!key.startsWith(REPLY_NOTICE)) return false;
+    const revision = key.slice(REPLY_NOTICE.length);
+    const [id, agentId, update] = revision.split("/");
+    const task = state.tasks[id];
+    if (!task?.readRevision || task.agentId !== agentId ||
+        task.pending && rules.revision(task) === revision) return false;
+    // Exact read version, older update versions, or all superseded notices
+    // when the *current* version is read. Never clear a newer pending version.
+    return revision === task.readRevision ||
+      Number(update) < Number(task.readRevision.split("/")[2]) ||
+      (!task.pending && rules.revision(task) === task.readRevision);
+  }).map(key => chrome.notifications.clear(key)));
 }
 
 async function updateBadge(state) {
@@ -131,7 +213,8 @@ async function deliverNotices(state) {
   const existing = await chrome.notifications.getAll();
   let changed = false;
   for (const [revision, notice] of Object.entries(outbox)) {
-    if (notice.retryAt > now) continue;
+    const task = noticeTask(state, revision);
+    if (!task || !freshTask(state, task, now) || !rules.canAcknowledge(task) || notice.retryAt > now) continue;
     const notificationId = REPLY_NOTICE + revision;
     try {
       if (!Object.hasOwn(existing, notificationId)) {
@@ -150,21 +233,22 @@ async function deliverNotices(state) {
   if (changed) await saveState(state);
 }
 
+async function syncNotices(state) {
+  // Re-check real foreground before replaying an outbox (also on alarm/wake).
+  // Persist read state and outbox removal before any browser-side cleanup.
+  const read = await readForeground(state);
+  const pruned = pruneOutbox(state);
+  if (read || pruned) await saveState(state);
+  await Promise.allSettled([clearReadNotices(state), deliverNotices(state), updateBadge(state)]);
+}
+
 async function acknowledge(state, task, checked = false) {
   const revision = rules.revision(task);
   state.tasks[task.id] = rules.acknowledge(task);
   if (checked) state.tasks[task.id].checkedRevision = revision;
-  const prefix = task.id + "/" + task.agentId + "/";
-  for (const key of Object.keys(state.outbox || {})) {
-    if (key.startsWith(prefix)) delete state.outbox[key];
-  }
+  pruneOutbox(state);
   await saveState(state);
-  await Promise.allSettled([
-    chrome.notifications.getAll().then(existing => Promise.allSettled(
-      Object.keys(existing).filter(key => key.startsWith(REPLY_NOTICE + prefix)).map(key => chrome.notifications.clear(key))
-    )),
-    updateBadge(state)
-  ]);
+  await syncNotices(state);
 }
 
 async function acceptReport(msg, sender) {
@@ -173,6 +257,7 @@ async function acceptReport(msg, sender) {
     return { ok: false };
   }
   const state = await getState();
+  await jumpReady;
   const page = await foregroundPage();
   const { state: next, replies } = rules.absorb(state, msg.payload, Date.now(), activeConversation(page));
   if (next !== state) {
@@ -181,28 +266,27 @@ async function acceptReport(msg, sender) {
     for (const [revision, notice] of Object.entries(next.outbox)) {
       if (next.at - notice.at > 24 * 60 * 60_000) delete next.outbox[revision];
     }
+    pruneOutbox(next);
     await saveState(next);
-    const pageNotices = page && replies.length ? signal(page.id, {
+    await syncNotices(next);
+    const currentPage = await foregroundPage();
+    const pendingReplies = replies.filter(task => noticeTask(next, rules.revision(task)));
+    if (currentPage && pendingReplies.length) await signal(currentPage.id, {
       kind: "tp.replies",
-      tasks: replies.slice(0, 3).reverse().map(task => ({
+      tasks: pendingReplies.slice(0, 3).reverse().map(task => ({
         id: task.id, name: task.name, revision: rules.revision(task), failed: task.failed
       }))
-    }) : null;
-    await Promise.allSettled([deliverNotices(next), pageNotices, updateBadge(next)]);
+    });
   }
   return { ok: true };
 }
 
 async function markVisited(tabId, windowId) {
-  const tab = await foregroundPage();
-  if (!tab || tabId !== undefined && tab.id !== tabId || windowId !== undefined && tab.windowId !== windowId) return;
-  const id = activeConversation(tab, true);
-  if (!id) return;
   const state = await getState();
-  const task = state.tasks[id];
-  if (state.error || !task?.pending || task.runAt || task.listedAt !== state.listAt ||
-      task.queueError || Date.now() - task.observedAt > web.timing.queueStale) return;
-  await acknowledge(state, task);
+  if (!await readForeground(state, tabId, windowId)) return;
+  pruneOutbox(state);
+  await saveState(state);
+  await syncNotices(state);
 }
 
 async function raiseWindow(tab) {
@@ -244,7 +328,7 @@ async function focusConversation(id, agentId) {
     if (web.conversationId(candidate.url) !== id) continue;
     const actual = await chrome.tabs.get(candidate.id).catch(() => null);
     if (!isReady(actual) || web.conversationId(actual.url) !== id) continue;
-    jumpTabs.set(actual.id, id);
+    await rememberJump(actual.id, id);
     const result = await focusTab(actual).catch(() => null);
     if (!result?.focused) continue;
     const arrived = await foregroundPage();
@@ -253,7 +337,7 @@ async function focusConversation(id, agentId) {
   const url = web.conversationUrl(id, agentId);
   if (!url) return false;
   const created = await chrome.tabs.create({ url, active: true });
-  jumpTabs.set(created.id, id);
+  await rememberJump(created.id, id);
   if (!await raiseWindow(created) || !await waitForLanding(created.id, id)) return false;
   const arrived = await foregroundPage();
   return arrived?.id === created.id && web.conversationId(arrived.url) === id;
@@ -261,27 +345,38 @@ async function focusConversation(id, agentId) {
 
 async function openTask(id, revision, allowSavedId = false) {
   if (!web.id(id) || typeof revision !== "string" || revision.split("/")[0] !== id) return { ok: false };
-  if (opening.has(id)) return opening.get(id);
+  const jobs = opening.get(id) || new Map();
+  if (jobs.has(revision)) return jobs.get(revision);
+  opening.set(id, jobs);
 
-  const job = (async () => {
+  const job = navigationLane.then(async () => {
+    await jumpReady;
     const state = await getState();
     const task = state.tasks[id];
     if (!task && !allowSavedId) return { ok: false };
-    const agentId = task?.agentId ?? web.id(revision.split("/")[1]);
+    const agentId = web.id(revision.split("/")[1]) || task?.agentId;
     if (!await focusConversation(id, agentId)) return { ok: false };
     return serialize(async () => {
       const fresh = await getState();
       if (/HTTP (401|403)/.test(fresh.error)) return { ok: false };
       const current = fresh.tasks[id];
-      if (current && rules.revision(current) === revision && !current.runAt) await acknowledge(fresh, current);
-      return { ok: true };
+      if (current && rules.revision(current) === revision) {
+        if (current.pending && !rules.canAcknowledge(current)) {
+          return { ok: true, clearNotice: false };
+        }
+        if (rules.canAcknowledge(current)) await acknowledge(fresh, current);
+      }
+      // An obsolete ticket may navigate and dismiss only its own notification.
+      return { ok: true, clearNotice: true };
     });
-  })();
-  opening.set(id, job);
+  });
+  jobs.set(revision, job);
+  navigationLane = job.catch(() => {});
   try {
     return await job;
   } finally {
-    opening.delete(id);
+    jobs.delete(revision);
+    if (!jobs.size) opening.delete(id);
   }
 }
 
@@ -289,13 +384,23 @@ async function markChecked(id, revision, checked) {
   if (!web.id(id) || typeof checked !== "boolean") return { ok: false };
   const state = await getState();
   const task = state.tasks[id];
-  if (!task || rules.revision(task) !== revision || task.runAt || task.status === "running") return { ok: false };
+  if (!task || rules.revision(task) !== revision || !rules.canAcknowledge(task)) return { ok: false };
   if (checked) {
     await acknowledge(state, task, true);
   } else if (task.checkedRevision === revision) {
     delete task.checkedRevision;
     await saveState(state);
   }
+  return { ok: true };
+}
+
+async function userVisit(id, sender) {
+  await jumpReady;
+  if (!web.id(id) || opening.has(id) || jumpTabs.get(sender.tab.id) !== id) return { ok: false };
+  const tab = await foregroundPage();
+  if (tab?.id !== sender.tab.id || web.conversationId(tab.url) !== id || opening.has(id)) return { ok: false };
+  await forgetJump(tab.id);
+  await markVisited(tab.id, tab.windowId);
   return { ok: true };
 }
 
@@ -315,6 +420,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg.kind === "tp.webstate") reply = serialize(() => acceptReport(msg, sender));
   if (msg.kind === "tp.open") reply = openTask(msg.id, msg.revision);
   if (msg.kind === "tp.check") reply = serialize(() => markChecked(msg.id, msg.revision, msg.checked));
+  if (msg.kind === "tp.visit" && !opening.has(msg.id)) reply = serialize(() => userVisit(msg.id, sender));
   if (!reply) return false;
   reply.then(respond, error => { info(error); respond({ ok: false }); });
   return true;
@@ -324,7 +430,7 @@ chrome.notifications.onClicked.addListener(id => {
   if (!id.startsWith(REPLY_NOTICE)) return;
   const revision = id.slice(REPLY_NOTICE.length);
   void openTask(revision.split("/")[0], revision, true).then(result => {
-    if (result.ok) return chrome.notifications.clear(id);
+    if (result.ok && result.clearNotice !== false) return chrome.notifications.clear(id);
   }).catch(info);
 });
 
@@ -334,7 +440,7 @@ function wake(install = false) {
     if (install) await chrome.alarms.clear("tp-sync");
     await syncLeader({ install, nudge: true });
     const state = await getState();
-    await Promise.allSettled([deliverNotices(state), updateBadge(state)]);
+    await syncNotices(state);
   }).catch(() => {});
 }
 
@@ -345,34 +451,54 @@ chrome.alarms.onAlarm.addListener(alarm => {
 });
 
 chrome.tabs.onUpdated.addListener((id, change, tab) => {
-  if (change.url || change.discarded !== undefined || change.frozen !== undefined || change.status === "complete") {
+  if (!(change.url || change.discarded !== undefined || change.frozen !== undefined || change.status === "complete")) return;
+  void (async () => {
+    await jumpReady;
     if (isPage(tab)) {
       refreshLeader();
       const cid = web.conversationId(tab.url);
-      if (change.url && jumpTabs.has(id) && jumpTabs.get(id) !== cid) jumpTabs.delete(id);
+      if (change.url && jumpTabs.has(id) && jumpTabs.get(id) !== cid) await forgetJump(id);
       if (tab.active && !jumpTabs.has(id) && !opening.has(cid) && (change.url || change.status === "complete")) {
-        void serialize(() => markVisited(id, tab.windowId)).catch(() => {});
+        await serialize(() => markVisited(id, tab.windowId));
       }
     } else {
-      if (change.url && tab.url !== "about:blank") jumpTabs.delete(id);
-      void getLeader().then(leader => { if (leader?.tabId === id) refreshLeader(); }).catch(info);
+      if (change.url && tab.url !== "about:blank") await forgetJump(id);
+      if ((await getLeader())?.tabId === id) refreshLeader();
     }
-  }
+  })().catch(info);
 });
 chrome.tabs.onRemoved.addListener(id => {
-  jumpTabs.delete(id);
+  void forgetJump(id);
   void getLeader().then(leader => { if (leader?.tabId === id) refreshLeader(); }).catch(info);
 });
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
-  for (const id of jumpTabs.keys()) {
-    if (id !== tabId) {
-      void chrome.tabs.get(id).then(tab => { if (tab.windowId === windowId && !tab.active) jumpTabs.delete(id); }).catch(() => {});
+  void (async () => {
+    await jumpReady;
+    // A genuine switch away releases the previous tab's versioned protection.
+    for (const id of [...jumpTabs.keys()]) {
+      if (id === tabId) continue;
+      const tab = await chrome.tabs.get(id).catch(() => null);
+      if (!tab || tab.windowId === windowId && !tab.active) await forgetJump(id);
     }
-  }
-  if (!jumpTabs.has(tabId)) void serialize(() => markVisited(tabId, windowId)).catch(() => {});
+    await serialize(() => markVisited(tabId, windowId));
+  })().catch(info);
 });
 chrome.windows.onFocusChanged.addListener(windowId => {
-  void serialize(() => markVisited(undefined, windowId)).catch(() => {});
+  const duringJump = opening.size > 0;
+  void (async () => {
+    await jumpReady;
+    if (!duringJump && !opening.size) {
+      const win = await chrome.windows.getLastFocused({}).catch(() => null);
+      // Ignore delayed/temporary blur events when the window is actually focused.
+      if (windowId >= 0 || !win?.focused) {
+        for (const id of [...jumpTabs.keys()]) {
+          const tab = await chrome.tabs.get(id).catch(() => null);
+          if (!tab || tab.windowId !== windowId) await forgetJump(id);
+        }
+      }
+    }
+    await serialize(() => markVisited(undefined, windowId));
+  })().catch(info);
 });
 
 chrome.action.onClicked.addListener(tab => {
