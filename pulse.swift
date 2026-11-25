@@ -891,6 +891,7 @@ final class PulseView: NSView {
         if let error = p.poller_error {
             // 两种故障要分开说：接口/认证出问题，和「浏览器页面这一会儿没上报」
             if error.contains("没有上报") { return "浏览器页面暂无数据，显示上次快照" }
+            if error.contains("凭据服务") { return "需要打开 MyFlicker 客户端，API 模式已暂停" }
             return "取数暂时失败，显示上次快照"
         }
         if p.updated == nil { return "等待首次采样…" }

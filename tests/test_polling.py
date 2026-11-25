@@ -409,6 +409,31 @@ class PollingTests(unittest.TestCase):
         self.assertIn("429", poller.load_state()["poller_error"])
         self.assertEqual(poller.load_state()["updated"], NOW)
 
+    def test_missing_credentials_do_not_escalate_backoff(self):
+        """凭据服务不可用（SDK sys.exit）应按固定间隔重试，不该涨到几分钟。"""
+        agent = FakeAgent([conversation(1)])
+        agent.conversations = Mock(side_effect=SystemExit(1))
+        clock = {"t": 0.0}
+        pauses = []
+
+        def sleep(seconds):
+            pauses.append(seconds)
+            clock["t"] += seconds
+            if len(pauses) == 3:
+                raise StopLoop
+            return False
+
+        with patch.multiple(poller, AgentClient=lambda: agent,
+                            time=SimpleNamespace(monotonic=lambda: clock["t"], sleep=sleep),
+                            _sleep_until=sleep):
+            with self.assertRaises(StopLoop):
+                poller._poll_forever()
+
+        self.assertEqual(pauses, [60, 60, 60], "SystemExit 不该触发指数退避")
+        err = poller.load_state()["poller_error"]
+        self.assertIn("凭据服务", err, "错误文案对用户不可读")
+        self.assertNotIn("SystemExit", err)
+
     def test_short_task_is_not_marked_seen_before_list_catches_up(self):
         """8 秒短任务：队列先转空闲、列表还没刷新，不能直接判「已查看」。"""
         base = NOW

@@ -2209,10 +2209,19 @@ def _poll_forever() -> None:
                 kind = "full" if full else ("discovery" if discovery else "active")
                 log("poll %s ok %.1fs" % (kind, time.monotonic() - started))
         except (Exception, SystemExit) as exc:
-            failures += 1
-            message = f"{type(exc).__name__}: {exc}"
-            backoff = max(POLL_SECONDS, min(60 * 2 ** min(failures - 1, 5), 1800))
-            log(f"取数失败：{message}，{backoff} 秒后重试")
+            # SDK 在拿不到 OBO 票时直接 sys.exit(1)（它本来是给命令行脚本用的）。
+            # 我们常驻，这属于「上游凭据暂不可用」——多为客户端没开——不该按自身
+            # 故障指数退避到 480 秒，否则用户把客户端打开后还要干等很久。
+            if isinstance(exc, SystemExit):
+                message = ("本机凭据服务不可用，API 模式暂停取值"
+                           "（需要 MyFlicker / CodeFlicker 客户端保持运行且已登录）")
+                backoff = POLL_SECONDS
+                log(f"取数暂停：{message}，{backoff} 秒后重试")
+            else:
+                failures += 1
+                message = f"{type(exc).__name__}: {exc}"
+                backoff = max(POLL_SECONDS, min(60 * 2 ** min(failures - 1, 5), 1800))
+                log(f"取数失败：{message}，{backoff} 秒后重试")
             _mark_error(message)
             agent = None
             next_full = time.monotonic() + backoff
