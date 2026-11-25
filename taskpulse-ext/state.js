@@ -16,12 +16,12 @@
   }
 
   function revision(task) {
-    return [task.id, task.agentId, task.update, task.replyKey || "-"].join("/");
+    return [task.id, task.agentId, task.replyUpdate || task.update, task.replyKey || "-"].join("/");
   }
 
   function acknowledge(task) {
     return {
-      ...task, acked: task.update, pending: false, phaseAt: 0,
+      ...task, acked: Math.max(task.acked, task.replyAt || task.replyUpdate || task.update), pending: false, phaseAt: 0,
       status: task.status === "attention" || (task.status === "stuck" && !task.runAt) ? "seen" : task.status
     };
   }
@@ -33,10 +33,18 @@
     return message;
   }
 
-  function assistantEvidence(task, message) {
-    const at = time(message?.atMessage);
-    return message?.sender === "assistant" &&
-      (!at || (at > task.acked && at >= task.update - 5_000));
+  function replyIdentity(task, message) {
+    if (message?.sender !== "assistant") return "";
+    if (message.messageId) return "message." + encodeURIComponent(String(message.messageId).toWellFormed());
+    const at = time(message.atMessage);
+    return at ? "time." + at : "update." + task.update;
+  }
+
+  function newReply(task, message, key) {
+    if (!key || key === task.replyKey || message.messageId && message.messageId === task.lastAssistant) return false;
+    const at = time(message.atMessage);
+    if (at) return at > Math.max(task.acked, task.replyAt || 0) && at >= task.update - 5_000;
+    return task.update > Math.max(task.acked, task.created, task.replyUpdate || 0);
   }
 
   function queueBusy(queue, api = globalThis.TaskPulseWeb.api) {
@@ -52,67 +60,44 @@
     task.observedAt = at;
 
     if (busy) {
-      if (!started) {
-        task.phaseAt = at;
-        task.awaitList = false;
-        task.failed = false;
-      }
       task.runAt = started || at;
-      task.idleAt = 0;
       task.settleUntil = 0;
-      task.pending = false;
-      task.status = at - task.phaseAt >= STUCK ? "stuck" : "running";
+      task.status = at - task.runAt >= STUCK ? "stuck" : "running";
       return;
     }
 
-    const assistant = assistantEvidence(task, message);
-    const newAssistant = assistant && (!message.messageId || message.messageId !== task.lastAssistant);
-    const newer = task.update > task.acked && task.update > task.created;
-    let key = "";
-    if (started) {
-      task.idleAt ||= at;
-      const longRun = task.idleAt - started >= 20_000;
-      if ((newer || longRun) && (!message || newAssistant)) key = "run." + started;
-      if (!key) {
-        task.settleUntil ||= at + SETTLE;
-        if (at < task.settleUntil) {
-          task.status = "running";
-          return;
-        }
+    const key = replyIdentity(task, message);
+    const changed = newReply(task, message, key);
+    if (changed) {
+      task.replyKey = key;
+      task.replyUpdate = task.update;
+      task.replyAt = time(message.atMessage);
+      task.lastAssistant = message.messageId || "";
+      task.phaseAt = at;
+      task.pending = true;
+      task.failed = Boolean(message.failed);
+    } else if (key && (key === task.replyKey || message.messageId && message.messageId === task.lastAssistant)) {
+      if (task.pending && message.failed) task.failed = true;
+    } else if (!task.replyKey && task.update <= task.acked &&
+               message?.sender === "assistant" && time(message.atMessage) <= task.acked &&
+               (!started || time(message.atMessage))) {
+      task.lastAssistant = message.messageId || task.lastAssistant;
+    }
+    if (started && !changed && !task.pending) {
+      task.settleUntil ||= at + SETTLE;
+      if (at < task.settleUntil) {
+        task.status = "running";
+        return;
       }
-    } else if (task.replyKey && (task.update <= task.completedAt || task.update === task.replyUpdate || task.awaitList)) {
-      if (task.pending) key = task.replyKey;
-      // A list update can arrive after we inferred the same reply from the run.
-      if (task.awaitList && newer && (assistant || task.notified === task.replyKey)) {
-        task.awaitList = false;
-        if (!task.pending) task.acked = task.update;
-      }
-    } else if (newer && newAssistant) {
-      key = "update." + task.update;
     }
 
     task.runAt = 0;
-    task.idleAt = 0;
     task.settleUntil = 0;
-    if (!key) {
+    if (!task.pending) {
       task.status = "seen";
-      task.pending = false;
       task.phaseAt = 0;
       return;
     }
-
-    if (started) {
-      task.completedAt = at;
-      task.awaitList = !newer;
-    }
-    if (!task.pending || task.replyKey !== key) {
-      task.phaseAt = at;
-      task.failed = false;
-    }
-    task.replyKey = key;
-    task.replyUpdate = task.update;
-    task.pending = true;
-    if (assistant) task.failed = Boolean(message.failed);
     task.status = task.failed || at - task.phaseAt >= STUCK ? "stuck" : "attention";
   }
 
@@ -140,7 +125,7 @@
       const old = state.tasks[cid]?.agentId === agentId ? state.tasks[cid] : null;
       if (old && update < old.update) continue;
       let task = {
-        ...(old || { status: "seen", acked: created >= baseline ? 0 : update, observedAt: 0 }),
+        ...(old || { status: "seen", acked: update > baseline ? Math.max(created, baseline) : update, observedAt: 0 }),
         id: cid, agentId, update, created, listedAt: listAt,
         name: text(row.name, 180) || "会话 " + cid, group: text(row.groupName, 80)
       };
@@ -148,27 +133,22 @@
       const sampleAt = time(report.queueAt?.[cid]);
       const busy = queueBusy(report.queues?.[cid]);
       const message = latestMessage(report, task, at);
-      if (busy !== null && sampleAt > task.observedAt && sampleAt <= at) {
+      const errorAt = time(report.queueErrors?.[cid]);
+      const freshQueue = busy !== null && sampleAt > task.observedAt && sampleAt <= at;
+      if (freshQueue) {
         applyQueue(task, sampleAt, busy, message);
-        // A new assistant message can arrive before the list timestamp catches up.
-        // While a run is settling, the current list version is still historical.
-        if (busy === false && message?.sender === "assistant" && task.status === "seen" &&
-            update <= task.acked && time(message.atMessage) <= task.acked) {
-          task.lastAssistant = message.messageId || task.lastAssistant;
-        }
+        task.queueError = false;
       }
-      task.queueError = time(report.queueErrors?.[cid]) > task.observedAt;
-      const confirmed = !state.error && !task.queueError &&
+      if (errorAt > task.observedAt) task.queueError = true;
+      const confirmed = !state.error && !task.queueError && task.observedAt &&
         now - listAt <= timing.sourceStale && now - task.observedAt <= timing.queueStale;
-      if (task.pending && confirmed && task.notified !== task.replyKey) {
+      const verified = /^(message|time|update)\./.test(task.replyKey || "") &&
+        (task.replyAt !== undefined || message?.sender === "assistant");
+      if (task.pending && verified && confirmed && !task.runAt && task.notified !== task.replyKey) {
         if (cid === activeId && task.status === "attention") {
           task = acknowledge(task);
-          task.lastAssistant = message?.messageId || task.lastAssistant;
-        } else if (update > task.acked && assistantEvidence(task, message) &&
-                   (!message.messageId || message.messageId !== task.lastAssistant) &&
-                   !task.runAt && busy === false) {
+        } else {
           task.notified = task.replyKey;
-          task.lastAssistant = message.messageId || task.lastAssistant;
           replies.push(task);
         }
       }

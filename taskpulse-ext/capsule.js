@@ -132,7 +132,7 @@
   }
   function progress(task, now) {
     if (checkedTask(task)) return 1;
-    const phase = task.phaseAt || task.runAt;
+    const phase = task.runAt || task.phaseAt;
     const until = task.uncertain ? task.observedAt : now;
     return phase ? Math.max(0, Math.min(1, (until - phase) / rules.stuckMs)) : 0;
   }
@@ -141,7 +141,8 @@
     if (task.uncertain) return "待确认";
     if (task.status === "stuck" && task.failed) return "限流";
     if (task.status === "running" || task.status === "stuck") {
-      const seconds = task.runAt ? Math.max(0, Math.floor((now - task.runAt) / 1_000)) : 0;
+      const since = task.runAt || task.phaseAt;
+      const seconds = since ? Math.max(0, Math.floor((now - since) / 1_000)) : 0;
       return Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0");
     }
     return Math.max(0, Math.floor((now - (task.update || now)) / 60_000)) + "m";
@@ -173,7 +174,8 @@
       if (result?.ok) return true;
     } catch { /* A worker restart or tab navigation can invalidate a pending action. */ }
     actionError = kind === "tp.open" ? "暂时无法打开此会话，请重试" : "任务状态已变化，请重试";
-    render();
+    if (kind === "tp.open" && !expanded) setExpanded(true);
+    else render();
     return false;
   }
 
@@ -409,7 +411,7 @@
         setTimeout(() => removeToast(task.revision), 110);
       }
     });
-    toasts.unshift({ revision: task.revision, button, timer: setTimeout(() => removeToast(task.revision), 15_000) });
+    toasts.unshift({ id: task.id, revision: task.revision, button, timer: setTimeout(() => removeToast(task.revision), 15_000) });
     if (toasts.length > 3) removeToast(toasts.at(-1).revision);
     stack.prepend(button);
     layoutToasts();
@@ -423,6 +425,10 @@
     if (changes[web.keys.state]) {
       stateChanged = true;
       state = changes[web.keys.state].newValue ?? rules.blank();
+      for (const toast of [...toasts]) {
+        const task = state.tasks[toast.id];
+        if (task && !task.pending) removeToast(toast.revision);
+      }
     }
     if (changes[pinKey]) {
       pinChanged = true;

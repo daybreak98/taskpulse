@@ -7,6 +7,7 @@ const ALARM = "tp-web-sync";
 const REPLY_NOTICE = "tp-reply:";
 const contentFiles = chrome.runtime.getManifest().content_scripts[0].js;
 const opening = new Map();
+const jumpTabs = new Map();
 
 const info = error => console.warn("TaskPulse:", error?.message ?? error);
 let lane = Promise.resolve();
@@ -29,7 +30,7 @@ async function getLeader() {
 }
 
 const isPage = tab => web.conversationPage(tab?.url) !== null;
-const isReady = tab => isPage(tab) && tab.status === "complete" && !tab.discarded && !tab.frozen;
+const isReady = tab => isPage(tab) && tab.status === "complete" && (!tab.pendingUrl || tab.pendingUrl === tab.url) && !tab.discarded && !tab.frozen;
 const pages = () => chrome.tabs.query({ url: web.match });
 
 async function signal(tabId, message) {
@@ -46,6 +47,19 @@ async function signal(tabId, message) {
   }
 }
 
+async function probe(tab) {
+  const answer = await signal(tab.id, { kind: "tp.probe" });
+  if (answer?.pageId) return answer;
+  const actual = await chrome.tabs.get(tab.id).catch(() => null);
+  if (!isReady(actual)) return null;
+  try {
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: contentFiles });
+    return await signal(tab.id, { kind: "tp.probe" });
+  } catch {
+    return null;
+  }
+}
+
 async function syncLeader({ install = false, nudge = false } = {}) {
   const old = await getLeader();
   const candidates = (await pages()).filter(isReady);
@@ -57,7 +71,7 @@ async function syncLeader({ install = false, nudge = false } = {}) {
 
   const current = candidates.find(tab => tab.id === old?.tabId);
   if (current) {
-    const answer = await signal(current.id, { kind: "tp.probe" });
+    const answer = await probe(current);
     if (answer?.pageId === old.pageId) {
       if (answer.lease !== old.lease) {
         const restored = await signal(old.tabId, { kind: "tp.role", pageId: old.pageId, lease: old.lease });
@@ -71,7 +85,7 @@ async function syncLeader({ install = false, nudge = false } = {}) {
 
   candidates.sort((a, b) => Number(b.active) - Number(a.active));
   for (const tab of candidates) {
-    const answer = await signal(tab.id, { kind: "tp.probe" });
+    const answer = await probe(tab);
     if (!answer?.pageId) continue;
     const next = { tabId: tab.id, pageId: answer.pageId, lease: crypto.randomUUID() };
     await chrome.storage.session.set({ [web.keys.leader]: next });
@@ -95,12 +109,12 @@ async function foregroundPage() {
   const win = await chrome.windows.getLastFocused({}).catch(() => null);
   if (!win?.focused || !Number.isInteger(win.id) || win.id < 0) return null;
   const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
-  return isPage(tab) ? tab : null;
+  return isReady(tab) ? tab : null;
 }
 
-function activeConversation(tab) {
+function activeConversation(tab, visit = false) {
   const id = web.conversationId(tab?.url);
-  return opening.has(id) ? "" : id;
+  return opening.has(id) || visit && jumpTabs.get(tab?.id) === id ? "" : id;
 }
 
 async function updateBadge(state) {
@@ -109,16 +123,48 @@ async function updateBadge(state) {
   await chrome.action.setBadgeText({ text: total ? String(Math.min(total, 99)) : "" });
 }
 
-async function sendNotices(tasks) {
-  if (!tasks.length || await chrome.notifications.getPermissionLevel() !== "granted") return;
-  for (const task of tasks) {
-    await chrome.notifications.create(REPLY_NOTICE + rules.revision(task), {
-      type: "basic",
-      iconUrl: chrome.runtime.getURL("icon.png"),
-      title: "TaskPulse · 有新回复",
-      message: task.name
-    }).catch(info);
+async function deliverNotices(state) {
+  const outbox = state.outbox;
+  if (!outbox || !Object.keys(outbox).length) return;
+  const now = Date.now();
+  if (await chrome.notifications.getPermissionLevel() !== "granted") return;
+  const existing = await chrome.notifications.getAll();
+  let changed = false;
+  for (const [revision, notice] of Object.entries(outbox)) {
+    if (notice.retryAt > now) continue;
+    const notificationId = REPLY_NOTICE + revision;
+    try {
+      if (!Object.hasOwn(existing, notificationId)) {
+        await chrome.notifications.create(notificationId, {
+          type: "basic", iconUrl: chrome.runtime.getURL("icon.png"),
+          title: "TaskPulse · 有新回复", message: notice.name
+        });
+      }
+      delete outbox[revision];
+    } catch (error) {
+      notice.retryAt = now + 5_000;
+      info(error);
+    }
+    changed = true;
   }
+  if (changed) await saveState(state);
+}
+
+async function acknowledge(state, task, checked = false) {
+  const revision = rules.revision(task);
+  state.tasks[task.id] = rules.acknowledge(task);
+  if (checked) state.tasks[task.id].checkedRevision = revision;
+  const prefix = task.id + "/" + task.agentId + "/";
+  for (const key of Object.keys(state.outbox || {})) {
+    if (key.startsWith(prefix)) delete state.outbox[key];
+  }
+  await saveState(state);
+  await Promise.allSettled([
+    chrome.notifications.getAll().then(existing => Promise.allSettled(
+      Object.keys(existing).filter(key => key.startsWith(REPLY_NOTICE + prefix)).map(key => chrome.notifications.clear(key))
+    )),
+    updateBadge(state)
+  ]);
 }
 
 async function acceptReport(msg, sender) {
@@ -130,7 +176,11 @@ async function acceptReport(msg, sender) {
   const page = await foregroundPage();
   const { state: next, replies } = rules.absorb(state, msg.payload, Date.now(), activeConversation(page));
   if (next !== state) {
-    // Record reply identities before emitting OS notifications so a worker restart cannot replay them.
+    next.outbox = { ...next.outbox };
+    for (const task of replies) next.outbox[rules.revision(task)] = { name: task.name, retryAt: 0, at: next.at };
+    for (const [revision, notice] of Object.entries(next.outbox)) {
+      if (next.at - notice.at > 24 * 60 * 60_000) delete next.outbox[revision];
+    }
     await saveState(next);
     const pageNotices = page && replies.length ? signal(page.id, {
       kind: "tp.replies",
@@ -138,21 +188,21 @@ async function acceptReport(msg, sender) {
         id: task.id, name: task.name, revision: rules.revision(task), failed: task.failed
       }))
     }) : null;
-    await Promise.allSettled([sendNotices(replies), pageNotices, updateBadge(next)]);
+    await Promise.allSettled([deliverNotices(next), pageNotices, updateBadge(next)]);
   }
   return { ok: true };
 }
 
-async function markVisited() {
-  const id = activeConversation(await foregroundPage());
+async function markVisited(tabId, windowId) {
+  const tab = await foregroundPage();
+  if (!tab || tabId !== undefined && tab.id !== tabId || windowId !== undefined && tab.windowId !== windowId) return;
+  const id = activeConversation(tab, true);
   if (!id) return;
   const state = await getState();
   const task = state.tasks[id];
-  if (!task?.pending || task.status !== "attention" || opening.has(id) ||
-      Date.now() - task.observedAt > web.timing.queueStale) return;
-  state.tasks[id] = rules.acknowledge(task);
-  await saveState(state);
-  await updateBadge(state);
+  if (state.error || !task?.pending || task.runAt || task.listedAt !== state.listAt ||
+      task.queueError || Date.now() - task.observedAt > web.timing.queueStale) return;
+  await acknowledge(state, task);
 }
 
 async function raiseWindow(tab) {
@@ -166,20 +216,47 @@ async function focusTab(tab) {
   return { tab: current, focused: await raiseWindow(current) };
 }
 
+function waitForLanding(tabId, id) {
+  return new Promise(resolve => {
+    const finish = tab => {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(updated);
+      chrome.tabs.onRemoved.removeListener(removed);
+      resolve(tab);
+    };
+    const check = tab => {
+      if (!tab) return finish(null);
+      if (tab.status !== "complete" || tab.pendingUrl && tab.pendingUrl !== tab.url ||
+          !tab.url || tab.url === "about:blank") return;
+      finish(isReady(tab) && web.conversationId(tab.url) === id ? tab : null);
+    };
+    const updated = (changedId, _change, tab) => { if (changedId === tabId) check(tab); };
+    const removed = changedId => { if (changedId === tabId) finish(null); };
+    const timer = setTimeout(() => finish(null), 10_000);
+    chrome.tabs.onUpdated.addListener(updated);
+    chrome.tabs.onRemoved.addListener(removed);
+    void chrome.tabs.get(tabId).then(check, () => finish(null));
+  });
+}
+
 async function focusConversation(id, agentId) {
-  // Re-read the tab before using it. A stored ID can now point to a different conversation.
   for (const candidate of await pages()) {
     if (web.conversationId(candidate.url) !== id) continue;
     const actual = await chrome.tabs.get(candidate.id).catch(() => null);
-    if (web.conversationId(actual?.url) !== id) continue;
+    if (!isReady(actual) || web.conversationId(actual.url) !== id) continue;
+    jumpTabs.set(actual.id, id);
     const result = await focusTab(actual).catch(() => null);
-    if (web.conversationId(result?.tab.url) === id) return { opened: true, seen: result.focused };
+    if (!result?.focused) continue;
+    const arrived = await foregroundPage();
+    if (arrived?.id === actual.id && web.conversationId(arrived.url) === id) return true;
   }
   const url = web.conversationUrl(id, agentId);
-  if (!url) return { opened: false };
+  if (!url) return false;
   const created = await chrome.tabs.create({ url, active: true });
-  const focused = await raiseWindow(created);
-  return { opened: true, seen: focused && web.conversationId(created.url) === id };
+  jumpTabs.set(created.id, id);
+  if (!await raiseWindow(created) || !await waitForLanding(created.id, id)) return false;
+  const arrived = await foregroundPage();
+  return arrived?.id === created.id && web.conversationId(arrived.url) === id;
 }
 
 async function openTask(id, revision, allowSavedId = false) {
@@ -191,18 +268,14 @@ async function openTask(id, revision, allowSavedId = false) {
     const task = state.tasks[id];
     if (!task && !allowSavedId) return { ok: false };
     const agentId = task?.agentId ?? web.id(revision.split("/")[1]);
-    const result = await focusConversation(id, agentId);
-    if (result.seen) {
-      await serialize(async () => {
-        const fresh = await getState();
-        const current = fresh.tasks[id];
-        if (!current || rules.revision(current) !== revision) return;
-        fresh.tasks[id] = rules.acknowledge(current);
-        await saveState(fresh);
-        await updateBadge(fresh);
-      });
-    }
-    return { ok: result.opened };
+    if (!await focusConversation(id, agentId)) return { ok: false };
+    return serialize(async () => {
+      const fresh = await getState();
+      if (/HTTP (401|403)/.test(fresh.error)) return { ok: false };
+      const current = fresh.tasks[id];
+      if (current && rules.revision(current) === revision && !current.runAt) await acknowledge(fresh, current);
+      return { ok: true };
+    });
   })();
   opening.set(id, job);
   try {
@@ -217,10 +290,12 @@ async function markChecked(id, revision, checked) {
   const state = await getState();
   const task = state.tasks[id];
   if (!task || rules.revision(task) !== revision || task.runAt || task.status === "running") return { ok: false };
-  if (checked) state.tasks[id] = { ...rules.acknowledge(task), checkedRevision: revision };
-  else if (task.checkedRevision === revision) delete task.checkedRevision;
-  await saveState(state);
-  await updateBadge(state);
+  if (checked) {
+    await acknowledge(state, task, true);
+  } else if (task.checkedRevision === revision) {
+    delete task.checkedRevision;
+    await saveState(state);
+  }
   return { ok: true };
 }
 
@@ -258,7 +333,8 @@ function wake(install = false) {
     if (!await chrome.alarms.get(ALARM)) await chrome.alarms.create(ALARM, { periodInMinutes: 0.5 });
     if (install) await chrome.alarms.clear("tp-sync");
     await syncLeader({ install, nudge: true });
-    await updateBadge(await getState());
+    const state = await getState();
+    await Promise.allSettled([deliverNotices(state), updateBadge(state)]);
   }).catch(() => {});
 }
 
@@ -272,29 +348,44 @@ chrome.tabs.onUpdated.addListener((id, change, tab) => {
   if (change.url || change.discarded !== undefined || change.frozen !== undefined || change.status === "complete") {
     if (isPage(tab)) {
       refreshLeader();
-      if (tab.active && (change.url || change.status === "complete")) void serialize(markVisited).catch(() => {});
+      const cid = web.conversationId(tab.url);
+      if (change.url && jumpTabs.has(id) && jumpTabs.get(id) !== cid) jumpTabs.delete(id);
+      if (tab.active && !jumpTabs.has(id) && !opening.has(cid) && (change.url || change.status === "complete")) {
+        void serialize(() => markVisited(id, tab.windowId)).catch(() => {});
+      }
     } else {
+      if (change.url && tab.url !== "about:blank") jumpTabs.delete(id);
       void getLeader().then(leader => { if (leader?.tabId === id) refreshLeader(); }).catch(info);
     }
   }
 });
 chrome.tabs.onRemoved.addListener(id => {
+  jumpTabs.delete(id);
   void getLeader().then(leader => { if (leader?.tabId === id) refreshLeader(); }).catch(info);
 });
-chrome.tabs.onActivated.addListener(() => { void serialize(markVisited).catch(() => {}); });
-chrome.windows.onFocusChanged.addListener(() => { void serialize(markVisited).catch(() => {}); });
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  for (const id of jumpTabs.keys()) {
+    if (id !== tabId) {
+      void chrome.tabs.get(id).then(tab => { if (tab.windowId === windowId && !tab.active) jumpTabs.delete(id); }).catch(() => {});
+    }
+  }
+  if (!jumpTabs.has(tabId)) void serialize(() => markVisited(tabId, windowId)).catch(() => {});
+});
+chrome.windows.onFocusChanged.addListener(windowId => {
+  void serialize(() => markVisited(undefined, windowId)).catch(() => {});
+});
 
 chrome.action.onClicked.addListener(tab => {
   void (async () => {
-    const target = isPage(tab) ? tab : (await pages()).filter(isPage)[0];
+    const candidates = isReady(tab) ? [tab] : await pages();
+    const target = candidates.find(isReady) ?? (isPage(tab) ? tab : candidates.find(isPage));
     if (!target) {
       await chrome.tabs.create({ url: web.page, active: true });
       return;
     }
     if (target.id !== tab.id) await focusTab(target);
     const shown = await signal(target.id, { kind: "tp.show" });
-    if (!shown && isReady(target)) {
-      await chrome.scripting.executeScript({ target: { tabId: target.id }, files: contentFiles });
+    if (!shown && await probe(target)) {
       await signal(target.id, { kind: "tp.show" });
     }
   })().catch(info);

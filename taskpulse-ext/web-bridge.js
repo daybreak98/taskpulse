@@ -103,13 +103,11 @@
     const updateTime = Number(row.updateTime) || 0;
     if (!updateTime || deadline - Date.now() < 250) return;
     const previous = probes.get(row.id);
-    if (previous?.updateTime === updateTime &&
-        (previous.done || previous.tries >= 3 || Date.now() - previous.at < 10_000)) return;
     const sameVersion = previous?.updateTime === updateTime;
-    const probe = {
-      updateTime, at: Date.now(), tries: sameVersion ? previous.tries + 1 : 1,
-      priorMessage: sameVersion ? previous.priorMessage : messages.get(row.id)?.messageId
-    };
+    if (sameVersion && Date.now() < previous.nextAt) return;
+    const failures = sameVersion ? previous.failures : 0;
+    const probe = { updateTime, failures: failures + 1,
+      nextAt: Date.now() + Math.min(60_000, 10_000 * (2 ** Math.min(failures, 3))) };
     probes.set(row.id, probe);
     try {
       const data = await fetchInfo(api.prefix + api.messages.replace("{cid}", row.id), deadline);
@@ -128,8 +126,8 @@
         atMessage: Number.isSafeInteger(atMessage) ? atMessage : 0
       };
       messages.set(row.id, message);
-      probe.done = sender === "assistant" && (!message.messageId || message.messageId !== probe.priorMessage) &&
-        (!message.atMessage || message.atMessage >= updateTime - 5_000);
+      probe.failures = 0;
+      probe.nextAt = Date.now() + (sender === "assistant" ? 30_000 : 10_000);
       dirty = true;
     } catch {
       // A slow or not-yet-visible reply is retried on a later bounded idle sample.
