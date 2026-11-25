@@ -1239,16 +1239,18 @@ final class MenuToggleView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let r = NSRect(x: 6, y: 2, width: bounds.width - 12, height: bounds.height - 4)
         let shape = NSBezierPath(roundedRect: r, xRadius: 5, yRadius: 5)
+        // 菜单由系统画，浅色模式下是白底；这里必须用系统标签色（随明暗自适应），
+        // 不能用小窗那套浅色文字——那会在白底上糊成一片。
         if on {
-            rgb(0x0F1A21, alpha: 0.55).setFill()
+            rgb(0x0F1A21, alpha: 0.88).setFill()
             shape.fill()
         } else if hovered {
-            rgb(0xC5DCFF, alpha: 0.10).setFill()
+            NSColor.labelColor.withAlphaComponent(0.08).setFill()
             shape.fill()
         }
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12.5, weight: on ? .semibold : .regular),
-            .foregroundColor: on ? mainText : mainText.withAlphaComponent(0.9),
+            .foregroundColor: on ? NSColor.white : NSColor.labelColor,
         ]
         let text = (on ? "✓ " : "") + titled
         let size = (text as NSString).size(withAttributes: attrs)

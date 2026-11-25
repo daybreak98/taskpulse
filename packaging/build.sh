@@ -58,7 +58,7 @@ cp packaging/install.command packaging/uninstall.command packaging/health_check.
    packaging/api_check.command packaging/api_login.command packaging/README.md "$OUT/"
 chmod +x "$OUT/install.command" "$OUT/uninstall.command" "$OUT/health_check.sh" \
          "$OUT/api_check.command" "$OUT/api_login.command"
-mkdir -p "$OUT/docs" && cp docs/product-spec.md docs/INSTALL.md "$OUT/docs/"
+mkdir -p "$OUT/docs" && cp docs/product-spec.md docs/INSTALL.md docs/fixes-summary.md "$OUT/docs/"
 cp docs/INSTALL.md "$OUT/INSTALL.md"     # 用户第一眼就能看到，不用进 docs 目录找
 
 # 内部包：config.json 与 uv-args.txt 来自 packaging/internal/（不入库）
