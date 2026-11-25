@@ -6,9 +6,20 @@
 //   其它会话      60 秒复查
 //   会话列表      30 秒刷新
 (function () {
-  // 后台会对已经开着的页面再注入一次（免去手刷），这里挡住重复启动
-  if (window.__tpWebBridge) return;
-  window.__tpWebBridge = true;
+  // 后台会对已开页面再注入一次。但扩展重载后，旧的 content script 会变成
+  // 「孤儿」——它和扩展的连接已断，却仍在 window 上留了标记。若只判断标记，
+  // 新实例会被直接挡掉，页面从此永远不上报。所以先验旧实例是否还有效。
+  function alive() {
+    try {
+      return !!(chrome.runtime && chrome.runtime.id);
+    } catch (_) {
+      return false;                 // 上下文已失效
+    }
+  }
+  if (window.__tpWebBridge && typeof window.__tpWebBridge === "object" && window.__tpWebBridge.ok && window.__tpWebBridge.ok()) {
+    return;
+  }
+  window.__tpWebBridge = { ok: alive };
 
   let CFG = null;
   let convs = [];
@@ -22,6 +33,7 @@
   let lastListAt = 0;
   let lastReportAt = 0;
   let busy = false;
+  let lastError = "";     // 最近一次采集失败的原因，随上报带出
   let roleWanted = false;   // 后台是否把采集权给了这一页；没给就不该开定时器
   let timer = null;
 
@@ -71,9 +83,7 @@
       throw new Error("列表响应结构无效");
     }
     if (data.success === false) throw new Error("列表接口返回业务失败");
-    if (data.result !== undefined && data.result !== 0 && data.result !== "0") {
-      throw new Error("列表接口 result=" + data.result);
-    }
+    if (data.error_msg) throw new Error("列表接口报错：" + String(data.error_msg).slice(0, 80));
     const d = data.data;
     const out = [];
     for (const g of d.groups || []) {
@@ -141,6 +151,7 @@
     const payload = {
       at: now(),
       url: location.href,
+      error: lastError || undefined,
       conversations: pick,
       queues: queues,
       queueAt: queueAt,
@@ -177,8 +188,11 @@
         if (isBusy(cid) === false && c.updateTime) await pullLastMessage(cid, c.updateTime);
       }
       report();
-    } catch (_) {
-      // 页面切走/登录失效时静默等下轮
+    } catch (exc) {
+      // 页面切走/登录失效都很常见，但这轮失败要带出去：否则后端只看到
+      // 「页面没上报」，分不清是没注入、没登录，还是解析挂了
+      lastError = String((exc && exc.message) || exc || "").slice(0, 120);
+      report();
     } finally {
       busy = false;
     }

@@ -1215,6 +1215,16 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                         state.pop("retry_at", None)
                         state["poller_error"] = ("没有可用的 DataAgent 页面："
                                                  "请打开一个页面并确认扩展已加载、已登录")
+            # 页面自己报上来的采集错误（解析失败、接口报错）优先展示
+            web_err = ""
+            try:
+                with open(WEBSTATE_FILE, encoding="utf-8") as f:
+                    web_err = str((json.load(f) or {}).get("error") or "")
+            except (OSError, ValueError):
+                web_err = ""
+            if web_err:
+                state["poller_error"] = "页面采集失败：%s" % web_err[:100]
+                state["poller_error_at"] = stamp
         if full or any(sample.busy is not None for sample in samples.values()):
             # web 模式的「更新时间」是浏览器里那份数据的生成时刻，不是本次落盘的时刻——
             # 否则页面停了 100 秒，UI 还以为是刚更新过
