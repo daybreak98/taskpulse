@@ -491,6 +491,9 @@ final class PinView: NSView {
     var pinned = false { didSet { needsDisplay = true } }
     var onClick: (() -> Void)?
     private var hovered = false { didSet { needsDisplay = true } }
+    // 诊断入口：TP_TEST_PIN=hover 时把图钉按「鼠标悬浮中」渲染，
+    // 不需要注入鼠标也能核对悬浮配色
+    private static let forceHover = ProcessInfo.processInfo.environment["TP_TEST_PIN"] == "hover"
 
     override var isFlipped: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -507,9 +510,9 @@ final class PinView: NSView {
     override func mouseExited(with event: NSEvent) { hovered = false }
 
     override func draw(_ dirtyRect: NSRect) {
-        // 悬浮时预览「点下去之后会变成什么样」：未固定的先给黄色实心，
-        // 已固定的先给取消后的灰色描边，省得点之前还要猜
-        let preview = hovered ? !pinned : pinned
+        // 只有未固定时才预览「点下去会变黄」；已固定就是黄实心，
+        // 悬浮不再退回灰色描边——那看起来像被取消了，反而是误导
+        let preview = pinned || hovered || PinView.forceHover
         let c = preview
             ? palette["attention"]!
             : secondaryText.withAlphaComponent(0.75)
