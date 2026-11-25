@@ -91,10 +91,14 @@ function refreshLeader() {
   }, 80);
 }
 
-async function activeConversation() {
+async function foregroundPage() {
   const win = await chrome.windows.getLastFocused({}).catch(() => null);
-  if (!win?.focused || !Number.isInteger(win.id) || win.id < 0) return "";
+  if (!win?.focused || !Number.isInteger(win.id) || win.id < 0) return null;
   const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
+  return isPage(tab) ? tab : null;
+}
+
+function activeConversation(tab) {
   const id = web.conversationId(tab?.url);
   return opening.has(id) ? "" : id;
 }
@@ -123,18 +127,24 @@ async function acceptReport(msg, sender) {
     return { ok: false };
   }
   const state = await getState();
-  const active = await activeConversation();
-  const { state: next, replies } = rules.absorb(state, msg.payload, Date.now(), active);
+  const page = await foregroundPage();
+  const { state: next, replies } = rules.absorb(state, msg.payload, Date.now(), activeConversation(page));
   if (next !== state) {
     // Record reply identities before emitting OS notifications so a worker restart cannot replay them.
     await saveState(next);
-    await Promise.allSettled([sendNotices(replies), updateBadge(next)]);
+    const pageNotices = page && replies.length ? signal(page.id, {
+      kind: "tp.replies",
+      tasks: replies.slice(0, 3).reverse().map(task => ({
+        id: task.id, name: task.name, revision: rules.revision(task), failed: task.failed
+      }))
+    }) : null;
+    await Promise.allSettled([sendNotices(replies), pageNotices, updateBadge(next)]);
   }
   return { ok: true };
 }
 
 async function markVisited() {
-  const id = await activeConversation();
+  const id = activeConversation(await foregroundPage());
   if (!id) return;
   const state = await getState();
   const task = state.tasks[id];
@@ -202,6 +212,18 @@ async function openTask(id, revision, allowSavedId = false) {
   }
 }
 
+async function markChecked(id, revision, checked) {
+  if (!web.id(id) || typeof checked !== "boolean") return { ok: false };
+  const state = await getState();
+  const task = state.tasks[id];
+  if (!task || rules.revision(task) !== revision || task.runAt || task.status === "running") return { ok: false };
+  if (checked) state.tasks[id] = { ...rules.acknowledge(task), checkedRevision: revision };
+  else if (task.checkedRevision === revision) delete task.checkedRevision;
+  await saveState(state);
+  await updateBadge(state);
+  return { ok: true };
+}
+
 function senderIsPage(sender) {
   return sender.id === chrome.runtime.id && sender.frameId === 0 &&
     Number.isInteger(sender.tab?.id) && web.conversationPage(sender.url ?? sender.tab.url) !== null;
@@ -217,6 +239,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   }
   if (msg.kind === "tp.webstate") reply = serialize(() => acceptReport(msg, sender));
   if (msg.kind === "tp.open") reply = openTask(msg.id, msg.revision);
+  if (msg.kind === "tp.check") reply = serialize(() => markChecked(msg.id, msg.revision, msg.checked));
   if (!reply) return false;
   reply.then(respond, error => { info(error); respond({ ok: false }); });
   return true;

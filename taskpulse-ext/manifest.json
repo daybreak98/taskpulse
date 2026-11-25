@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TaskPulse · 网页版",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "minimum_chrome_version": "120",
   "description": "在 DataAgent 网页看任务状态，新回复时收系统通知，点一下直达会话。",
   "permissions": ["alarms", "notifications", "scripting", "storage"],

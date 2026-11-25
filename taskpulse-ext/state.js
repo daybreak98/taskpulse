@@ -197,5 +197,5 @@
     return { counts, tasks, stale, offline, error };
   }
 
-  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, queueBusy };
+  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, queueBusy, stuckMs: STUCK };
 })();

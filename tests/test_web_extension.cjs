@@ -283,3 +283,32 @@ test("failed tab action cannot acknowledge the selected reply", async () => {
   assert.equal(response.ok, false);
   assert.equal(app.local.data[web.keys.state].tasks[id].status, "attention");
 });
+
+test("标记已处理只影响当前版本，新回复照常显示和通知", async () => {
+  const app = worker();
+  const task = () => app.local.data[web.keys.state].tasks[id];
+  await app.deliver(report(now, row(), { busy: true }));
+  let version = rules.revision(task());
+  assert.equal((await app.send({ kind: "tp.check", id, revision: version, checked: true })).ok, false);
+
+  await app.deliver(report(now + 5_000, row(now + 1_000), {
+    message: message(now + 1_000, now + 5_000, "first")
+  }));
+  version = rules.revision(task());
+  assert.equal(task().status, "attention");
+  assert.equal((await app.send({ kind: "tp.check", id, revision: version, checked: true })).ok, true);
+  assert.equal(task().status, "seen");
+  assert.equal(task().checkedRevision, version);
+  assert.equal((await app.send({ kind: "tp.check", id, revision: version, checked: false })).ok, true);
+  assert.equal(task().checkedRevision, undefined);
+  await app.send({ kind: "tp.check", id, revision: version, checked: true });
+
+  await app.deliver(report(now + 15_000, row(now + 10_000), {
+    message: message(now + 10_000, now + 15_000, "second")
+  }));
+  assert.equal(task().status, "attention");
+  assert.notEqual(rules.revision(task()), task().checkedRevision);
+  assert.equal((await app.send({ kind: "tp.check", id, revision: version, checked: true })).ok, false);
+  assert.equal(task().status, "attention");
+  assert.equal(app.notices.size, 2);
+});

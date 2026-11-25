@@ -100,8 +100,24 @@ async function trial() {
     const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker", { timeout: 10_000 });
     const page = monitor(context.pages()[0]);
     await page.goto(home);
-    await page.locator(root + " button.running").filter({ hasText: /^1$/ }).waitFor({ timeout: 16_000 });
-    console.log("Chromium installed the extension and rendered the page capsule");
+    const compact = page.locator(root + " .compact");
+    const panel = page.locator(root + " .panel");
+    const horizontal = panel.locator(".horizontal");
+    await compact.locator("[data-filter='running']").filter({ hasText: /^1$/ }).waitFor({ timeout: 16_000 });
+    assert.deepEqual(await compact.boundingBox(), { x: 1356, y: 22, width: 44, height: 84 });
+    await compact.hover();
+    await horizontal.waitFor();
+    assert.deepEqual(await horizontal.boundingBox(), { x: 1170, y: 24, width: 96, height: 24 });
+    assert.equal((await panel.boundingBox()).width, 240);
+    assert.equal(await panel.locator(".source").textContent(), "WEB");
+    await page.mouse.move(600, 400);
+    await panel.waitFor({ state: "hidden" });
+    await compact.hover();
+    const pin = panel.getByRole("button", { name: "固定展开" });
+    await pin.click();
+    assert.equal(await pin.getAttribute("aria-pressed"), "true");
+    await page.mouse.move(600, 400);
+    console.log("Chromium verified the desktop capsule dimensions, hover expansion and pin");
 
     const currentLeader = () => worker.evaluate(async key => (await chrome.storage.session.get(key))[key], leaderKey);
     const leader = await currentLeader();
@@ -110,9 +126,12 @@ async function trial() {
     const other = monitor(await context.newPage());
     await other.goto(existing);
     await page.bringToFront();
-    await page.locator(root + " .all").click();
-    const first = page.locator(root + " [data-cid='11']");
+    const group = panel.locator(".group-head").filter({ hasText: "数据质量" });
+    await group.click();
+    assert.equal((await group.boundingBox()).height, 26);
+    const first = panel.locator("[data-cid='11'] .task-name");
     await first.waitFor();
+    assert.equal((await panel.locator(".row.running").boundingBox()).height, 28);
     assert.equal((await first.textContent()).trim(), task.name);
     assert.equal((await currentLeader()).tabId, leader.tabId);
     assert.equal(listReads(), 1);
@@ -120,7 +139,12 @@ async function trial() {
       (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]?.url), home);
 
     fixture.releaseReply();
-    await page.locator(root + " button.attention").filter({ hasText: /^1$/ }).waitFor({ timeout: 42_000 });
+    const attention = horizontal.locator("[data-filter='attention']");
+    await attention.filter({ hasText: /^1$/ }).waitFor({ timeout: 42_000 });
+    const toast = page.locator(root + " .toast").filter({ hasText: task.name });
+    await toast.waitFor();
+    assert.deepEqual(await toast.boundingBox(), { x: 1098, y: 14, width: 288, height: 64 });
+    assert.equal(await page.locator(root + " .toast").count(), 1);
     const saved = await worker.evaluate(async key => (await chrome.storage.local.get(key))[key], stateKey);
     assert.equal(saved.tasks["11"].status, "attention");
     assert.ok(saved.tasks["11"].notified);
@@ -135,18 +159,22 @@ async function trial() {
     }
     assert.equal(notices.length, 1);
 
-    await first.click();
-    await page.locator(root + " button.attention").filter({ hasText: /^0$/ }).waitFor({ timeout: 8_000 });
-    assert.equal(context.pages().length, 2);
+    await toast.click();
+    await attention.filter({ hasText: /^0$/ }).waitFor({ timeout: 8_000 });
     assert.equal(await worker.evaluate(async () =>
       (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]?.url), existing);
-    console.log("Single collector, system notification registration, existing-tab jump and acknowledgement passed");
+    assert.equal(context.pages().length, 2);
+    console.log("Single collector, system notification and desktop-style toast jump passed");
 
     await page.bringToFront();
-    await page.locator(root + " .panel").waitFor({ state: "hidden" });
-    await page.locator(root + " .all").click();
+    await toast.waitFor({ state: "hidden" });
+    await attention.click();
+    assert.equal(await attention.getAttribute("aria-pressed"), "true");
+    assert.equal(await horizontal.locator(".dimmed").count(), 2);
+    await attention.click();
+    if (await group.getAttribute("aria-expanded") === "false") await group.click();
     const newTab = context.waitForEvent("page", { timeout: 10_000 });
-    await page.locator(root + " [data-cid='12']").click();
+    await panel.locator("[data-cid='12']").click();
     const created = monitor(await newTab);
     await created.waitForURL(/conversationId=12/, { timeout: 12_000 });
     assert.equal(new URL(created.url()).origin, origin);
