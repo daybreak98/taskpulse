@@ -28,9 +28,13 @@ async function rememberJump(tabId, cid) {
   jumpTabs.set(tabId, cid);
   await persistJumps();
 }
-async function forgetJump(tabId) {
+async function forgetJump(tabId, protectOpening = false) {
   await jumpReady;
-  if (jumpTabs.delete(tabId)) await persistJumps().catch(() => {});
+  const cid = jumpTabs.get(tabId);
+  if (!cid || protectOpening && opening.has(cid)) return false;
+  jumpTabs.delete(tabId);
+  await persistJumps().catch(() => {});
+  return true;
 }
 
 const info = error => console.warn("TaskPulse:", error?.message ?? error);
@@ -189,13 +193,20 @@ async function clearReadNotices(state) {
     const revision = key.slice(REPLY_NOTICE.length);
     const [id, agentId, update] = revision.split("/");
     const task = state.tasks[id];
-    if (!task?.readRevision || task.agentId !== agentId ||
+    if (!task || task.agentId !== agentId ||
         task.pending && rules.revision(task) === revision) return false;
+    // Existing 2.1.1 storage may have a confirmed read watermark but no
+    // readRevision yet. Clean up those old notifications on the first sync.
+    const currentRevision = rules.revision(task);
+    const readRevision = task.readRevision ||
+      (!task.pending && rules.verifiedReply(task) &&
+        task.acked >= (task.replyAt || task.replyUpdate || Infinity) ? currentRevision : "");
+    if (!readRevision) return false;
     // Exact read version, older update versions, or all superseded notices
     // when the *current* version is read. Never clear a newer pending version.
-    return revision === task.readRevision ||
-      Number(update) < Number(task.readRevision.split("/")[2]) ||
-      (!task.pending && rules.revision(task) === task.readRevision);
+    return revision === readRevision ||
+      Number(update) < Number(readRevision.split("/")[2]) ||
+      (!task.pending && currentRevision === readRevision);
   }).map(key => chrome.notifications.clear(key)));
 }
 
@@ -399,7 +410,7 @@ async function userVisit(id, sender) {
   if (!web.id(id) || opening.has(id) || jumpTabs.get(sender.tab.id) !== id) return { ok: false };
   const tab = await foregroundPage();
   if (tab?.id !== sender.tab.id || web.conversationId(tab.url) !== id || opening.has(id)) return { ok: false };
-  await forgetJump(tab.id);
+  if (!await forgetJump(tab.id, true)) return { ok: false };
   await markVisited(tab.id, tab.windowId);
   return { ok: true };
 }
@@ -450,21 +461,24 @@ chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === ALARM) wake();
 });
 
-chrome.tabs.onUpdated.addListener((id, change, tab) => {
+chrome.tabs.onUpdated.addListener((id, change) => {
   if (!(change.url || change.discarded !== undefined || change.frozen !== undefined || change.status === "complete")) return;
   void (async () => {
     await jumpReady;
+    // onUpdated snapshots can arrive after a newer route already landed.
+    // Only the actual current tab may release a versioned landing guard.
+    const tab = await chrome.tabs.get(id).catch(() => null);
+    if (!tab) return;
+    const cid = web.conversationId(tab.url);
+    if ((change.url || change.status === "complete") && jumpTabs.has(id) &&
+        jumpTabs.get(id) !== cid && tab.status === "complete" && tab.url !== "about:blank" &&
+        (!tab.pendingUrl || tab.pendingUrl === tab.url)) await forgetJump(id, true);
     if (isPage(tab)) {
       refreshLeader();
-      const cid = web.conversationId(tab.url);
-      if (change.url && jumpTabs.has(id) && jumpTabs.get(id) !== cid) await forgetJump(id);
       if (tab.active && !jumpTabs.has(id) && !opening.has(cid) && (change.url || change.status === "complete")) {
         await serialize(() => markVisited(id, tab.windowId));
       }
-    } else {
-      if (change.url && tab.url !== "about:blank") await forgetJump(id);
-      if ((await getLeader())?.tabId === id) refreshLeader();
-    }
+    } else if ((await getLeader())?.tabId === id) refreshLeader();
   })().catch(info);
 });
 chrome.tabs.onRemoved.addListener(id => {
@@ -478,7 +492,7 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
     for (const id of [...jumpTabs.keys()]) {
       if (id === tabId) continue;
       const tab = await chrome.tabs.get(id).catch(() => null);
-      if (!tab || tab.windowId === windowId && !tab.active) await forgetJump(id);
+      if (!tab || tab.windowId === windowId && !tab.active) await forgetJump(id, true);
     }
     await serialize(() => markVisited(tabId, windowId));
   })().catch(info);
@@ -489,11 +503,13 @@ chrome.windows.onFocusChanged.addListener(windowId => {
     await jumpReady;
     if (!duringJump && !opening.size) {
       const win = await chrome.windows.getLastFocused({}).catch(() => null);
-      // Ignore delayed/temporary blur events when the window is actually focused.
-      if (windowId >= 0 || !win?.focused) {
+      // Both blur and positive focus events can be delayed. Confirm the
+      // reported window still matches the real foreground before releasing.
+      const eventStillCurrent = win && (windowId >= 0 ? win.focused && win.id === windowId : !win.focused);
+      if (eventStillCurrent) {
         for (const id of [...jumpTabs.keys()]) {
           const tab = await chrome.tabs.get(id).catch(() => null);
-          if (!tab || tab.windowId !== windowId) await forgetJump(id);
+          if (!tab || tab.windowId !== windowId) await forgetJump(id, true);
         }
       }
     }

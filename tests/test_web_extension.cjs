@@ -731,3 +731,83 @@ test("disconnect does not deliver a stale outbox; recovery delivers the current 
   assert.equal(app.notices.size, 1);
   assert.deepEqual(app.local.data[web.keys.state].outbox, {});
 });
+
+test("late focus or route events cannot remove an old-notification landing guard", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const updateA = now + 1_000, updateB = now + 10_000;
+  await app.deliver(report(now + 5_000, row(updateA), { message: message(updateA, now + 5_000, "event-old") }));
+  const a = [...app.notices.keys()][0];
+  await app.deliver(report(now + 15_000, row(updateB), { message: message(updateB, now + 15_000, "event-new") }));
+  const b = [...app.notices.keys()].find(key => key !== a);
+  assert.equal((await app.send({ kind: "tp.open", id, revision: a.slice("tp-reply:".length) })).ok, true);
+  const target = app.tabs.find(tab => tab.active);
+  assert.equal(target.url, web.conversationUrl(id, agent));
+  app.chrome.windows.onFocusChanged.listeners[0](2); // stale window event; actual focus is window 1
+  for (const listener of [...app.chrome.tabs.onUpdated.listeners]) {
+    listener(target.id, { url: web.page, status: "complete" }, { ...target, url: web.page });
+  }
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await app.deliver(report(now + 20_000, row(updateB)));
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, true);
+  assert.equal(app.notices.has(b), true);
+  assert.equal(app.session.data["tp-web-jump-tabs-v1"][target.id], id);
+});
+
+test("an activation event during an in-flight focus cannot discard the new guard", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const updateA = now + 1_000, updateB = now + 10_000;
+  await app.deliver(report(now + 5_000, row(updateA), { message: message(updateA, now + 5_000, "focus-old") }));
+  const a = [...app.notices.keys()][0];
+  await app.deliver(report(now + 15_000, row(updateB), { message: message(updateB, now + 15_000, "focus-new") }));
+  const b = [...app.notices.keys()].find(key => key !== a);
+  const target = { id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete", active: false };
+  app.tabs.push(target);
+  let release, waiting = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  const update = app.chrome.tabs.update;
+  app.chrome.tabs.update = async tabId => { waiting = true; await gate; return update(tabId); };
+  const opening = app.send({ kind: "tp.open", id, revision: a.slice("tp-reply:".length) });
+  await until(() => waiting);
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: 7, windowId: 1 });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(app.session.data["tp-web-jump-tabs-v1"][target.id], id);
+  release();
+  assert.equal((await opening).ok, true);
+  await app.deliver(report(now + 20_000, row(updateB)));
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, true);
+  assert.equal(app.notices.has(b), true);
+});
+
+test("genuine window blur and return releases the old-ticket guard and reads current reply", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const updateA = now + 1_000, updateB = now + 10_000;
+  await app.deliver(report(now + 5_000, row(updateA), { message: message(updateA, now + 5_000, "blur-old") }));
+  const a = [...app.notices.keys()][0];
+  await app.deliver(report(now + 15_000, row(updateB), { message: message(updateB, now + 15_000, "blur-new") }));
+  assert.equal((await app.send({ kind: "tp.open", id, revision: a.slice("tp-reply:".length) })).ok, true);
+  let focused = false;
+  app.chrome.windows.getLastFocused = async () => ({ id: 1, focused });
+  app.chrome.windows.onFocusChanged.listeners[0](-1);
+  await until(() => Object.keys(app.session.data["tp-web-jump-tabs-v1"] || {}).length === 0);
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, true);
+  focused = true;
+  app.chrome.windows.onFocusChanged.listeners[0](1);
+  await until(() => app.local.data[web.keys.state].tasks[id].pending === false && app.notices.size === 0);
+});
+
+test("upgrading existing storage clears notices for replies already read by the old build", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), { message: message(update, now + 5_000, "legacy") }));
+  const state = structuredClone(app.local.data[web.keys.state]);
+  state.tasks[id] = rules.acknowledge(state.tasks[id]);
+  delete state.tasks[id].readRevision;
+  const restarted = worker({ local: { [web.keys.state]: state }, notices: [...app.notices] });
+  await restarted.deliver(report(now + 10_000, row(update)));
+  assert.equal(restarted.local.data[web.keys.state].tasks[id].pending, false);
+  assert.equal(restarted.notices.size, 0);
+});
