@@ -65,7 +65,16 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
-    const d = (data && data.data) || {};
+    // 和 API 侧同一套契约：业务失败（success:false / result 非 0）要报错，
+    // 不能当成「空列表」发布出去——那会把当前状态刷成 0 个会话
+    if (!data || !data.data || typeof data.data !== "object") {
+      throw new Error("列表响应结构无效");
+    }
+    if (data.success === false) throw new Error("列表接口返回业务失败");
+    if (data.result !== undefined && data.result !== 0 && data.result !== "0") {
+      throw new Error("列表接口 result=" + data.result);
+    }
+    const d = data.data;
     const out = [];
     for (const g of d.groups || []) {
       for (const c of (g.conversations || [])) out.push(Object.assign({}, c, { groupName: g.name || "" }));

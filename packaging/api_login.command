@@ -86,8 +86,10 @@ RUN+=(--with 'ks-aimate>=1.4.0'
       --index https://pypi.corp.kuaishou.com/kuaishou/prod/+simple/
       python - "$CFG")
 
+LOG="$(mktemp)"
+trap 'rm -f "$LOG"' EXIT
 env "${QR_ENV[@]}" KS_SSO_DISABLE_HTTP_REPLAY=1 KS_SSO_BROWSER_CMD_TIMEOUT=180 \
-  "${RUN[@]}" <<'PY'
+  "${RUN[@]}" >"$LOG" 2>&1 <<'PY'
 import importlib.util, os, sys
 os.environ["TASKPULSE_CONFIG"] = sys.argv[1]
 spec = importlib.util.spec_from_file_location("tp", "poller.py")
@@ -99,10 +101,21 @@ try:
 except Exception as exc:
     print("RESULT FAIL %s: %s" % (type(exc).__name__, str(exc)[:120]))
 PY
+cat "$LOG"                  # 过程照旧给用户看
+RESULT="$(tail -1 "$LOG")"   # 判定只看最后一行
 
 echo
-if [ -f "$HOME/.codeflicker/sso/.ks_sso/sso-state.json" ]; then
-  echo "凭据缓存：已生成。之后再跑 api_check.command 确认取数。"
-else
-  echo "凭据缓存：未生成（扫码可能没完成）。重跑本脚本即可。"
-fi
+# 成功的唯一标准是「真的拿到了会话列表」，不是缓存文件存在——
+# 评审复现过：取数失败但缓存文件在，脚本却报成功
+case "$RESULT" in
+  *"RESULT OK"*)
+    echo "结论：扫码成功，已能读取会话列表。之后跑 api_check.command 可复查。"
+    exit 0 ;;
+  *)
+    if [ -f "$HOME/.codeflicker/sso/.ks_sso/sso-state.json" ]; then
+      echo "结论：缓存文件已写入，但仍读不到会话列表。可能是账号权限问题，见上面的错误。"
+    else
+      echo "结论：未完成授权（扫码可能没扫上）。重跑本脚本再试。"
+    fi
+    exit 1 ;;
+esac

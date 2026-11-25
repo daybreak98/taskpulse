@@ -165,7 +165,28 @@ TP_SCOPE="$(printf '%s' "$CFG_OUT" | awk '{$1=""; sub(/^ /,""); print}')"
 TP_PORT="${TP_PORT:-8899}"
 echo "-- 端口: $TP_PORT    扩展域名: ${TP_SCOPE:-（未配置）}"
 
-# ---------- 3. 拷贝文件 ----------
+# ---------- 3. 先确认运行依赖（失败就别动现有安装）----------
+echo "-- 检查运行依赖（首次会联网安装，约 30 秒）..."
+UV_PREHEAT=()
+if [ -f "./uv-args.txt" ]; then
+  while IFS= read -r ARG; do
+    [ -n "$ARG" ] && UV_PREHEAT+=("$ARG")
+  done < ./uv-args.txt
+fi
+# bash 3.2（macOS 自带）在 set -u 下展开空数组会报错，分两条写
+if [ ${#UV_PREHEAT[@]} -gt 0 ]; then
+  "$UV_BIN" run --quiet --no-project --python ">=3.10" "${UV_PREHEAT[@]}" python -c "print('   -> 依赖就绪')" || {
+    echo "!! 依赖安装失败（多见于公司网络未连内网）。现有安装未改动，连上网络后重跑本脚本。"
+    exit 1
+  }
+else
+  "$UV_BIN" run --quiet --no-project --python ">=3.10" python -c "print('   -> 依赖就绪')" || {
+    echo "!! 依赖安装失败。现有安装未改动，修复后重跑本脚本。"
+    exit 1
+  }
+fi
+
+# ---------- 4. 拷贝文件 ----------
 mkdir -p "$HOME/Applications" "$DEST" "$LOGS" "$AGENTS"
 rm -rf "$HOME/Applications/$APP_NAME.app"
 cp -R "$APP_NAME.app" "$HOME/Applications/" || { echo "!! 拷贝 App 失败"; exit 1; }
@@ -179,7 +200,7 @@ done
 # 去掉 Gatekeeper 隔离标记，避免「已损坏，无法打开」
 xattr -dr com.apple.quarantine "$HOME/Applications/$APP_NAME.app" 2>/dev/null
 
-# ---------- 3.5 本机接口密钥：生成并交给扩展 ----------
+# ---------- 4.5 本机接口密钥：生成并交给扩展 ----------
 # poller / App / 浏览器扩展三方共用这一把钥匙。它只存在本机家目录里：
 # 这里确保它存在（没有就现生成 32 字节 urlsafe base64，权限 0600），
 # 值再写进扩展的 config.js。这样装完就能用，用户不用手动抄一遍密钥。
@@ -208,7 +229,7 @@ if [ -z "$TP_TOKEN" ]; then
   echo "   检查该文件是否可读，或删掉后重新运行本脚本"
 fi
 
-# ---------- 4. 把域名、端口和接口路径写进扩展（不声明 <all_urls>）----------
+# ---------- 5. 把域名、端口和接口路径写进扩展（不声明 <all_urls>）----------
 "$UV_BIN" run --quiet --no-project python - "$DEST/edge-ext" "$CONFIG" "$TP_PORT" "$TP_TOKEN" <<'PY'
 import json, os, sys
 d, cfg_path, port, token = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
@@ -251,7 +272,7 @@ if [ -z "$TP_SCOPE" ]; then
   echo "-- 注意：extension.scope 为空，扩展装上也不会匹配任何页面"
 fi
 
-# ---------- 5. 写入 launchd 配置 ----------
+# ---------- 6. 写入 launchd 配置 ----------
 # 团队内部包可能带 uv-args.txt（每行一个额外参数，如 --with 内部包 --index 私有源）
 UV_EXTRA_XML=""
 
@@ -303,25 +324,6 @@ cat > "$AGENTS/com.taskpulse.ui.plist" <<PLIST
 </plist>
 PLIST
 
-# ---------- 6. 预热依赖（首次要联网装一次，提前跑完更省心）----------
-echo "-- 检查运行依赖（首次会联网安装，约 30 秒）..."
-UV_PREHEAT=()
-if [ -f "./uv-args.txt" ]; then
-  while IFS= read -r ARG; do
-    [ -n "$ARG" ] && UV_PREHEAT+=("$ARG")
-  done < ./uv-args.txt
-fi
-# bash 3.2（macOS 自带）在 set -u 下展开空数组会报错，分两条写
-if [ ${#UV_PREHEAT[@]} -gt 0 ]; then
-  "$UV_BIN" run --quiet --no-project --python ">=3.10" "${UV_PREHEAT[@]}" python -c "print('   -> 依赖就绪')" || {
-    echo "!! 依赖安装失败（多见于公司网络未连内网）。装好后重跑本脚本即可。"
-  }
-else
-  "$UV_BIN" run --quiet --no-project --python ">=3.10" python -c "print('   -> 依赖就绪')" || {
-    echo "!! 依赖安装失败。装好后重跑本脚本即可。"
-  }
-fi
-
 # ---------- 7. 启动 ----------
 if [ "${TP_DRY:-}" = "1" ]; then
   echo "-- 干跑模式：跳过 launchctl / open"
@@ -334,10 +336,17 @@ defaults delete com.hyj.taskpulse onboarded 2>/dev/null || true
 
 launchctl bootout "gui/$(id -u)/com.taskpulse.poller" 2>/dev/null
 launchctl bootout "gui/$(id -u)/com.taskpulse.ui" 2>/dev/null
-launchctl bootstrap "gui/$(id -u)" "$AGENTS/com.taskpulse.poller.plist" 2>/dev/null
-launchctl bootstrap "gui/$(id -u)" "$AGENTS/com.taskpulse.ui.plist" 2>/dev/null
-launchctl kickstart -k "gui/$(id -u)/com.taskpulse.poller" 2>/dev/null
-launchctl kickstart -k "gui/$(id -u)/com.taskpulse.ui" 2>/dev/null
+# bootstrap / kickstart 失败要能看见：以前全吞掉，装完没反应时无从排查
+for svc in com.taskpulse.poller com.taskpulse.ui; do
+  if ! launchctl bootstrap "gui/$(id -u)" "$AGENTS/${svc}.plist" 2>/dev/null; then
+    launchctl bootout "gui/$(id -u)/${svc}" 2>/dev/null
+    if ! launchctl bootstrap "gui/$(id -u)" "$AGENTS/${svc}.plist"; then
+      echo "!! 服务 ${svc} 注册失败，日志：${LOGS}/taskpulse.poll.err"
+    fi
+  fi
+  launchctl kickstart -k "gui/$(id -u)/${svc}" 2>/dev/null \
+    || echo "!! 服务 ${svc} 未能启动（launchctl kickstart 返回非零）"
+done
 
 sleep 3
 # 分别报告「进程在线」与「取数就绪」：服务返回 500 也算进程在线，

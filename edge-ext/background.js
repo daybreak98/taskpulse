@@ -156,6 +156,10 @@ async function focusConversation(cid, url, tabId, stale) {
     const tabs = await chrome.tabs.query({ url: SCOPE });
     hit = tabs.find((t) => t.url && re.test(t.url));
   }
+  // 过期命令一律不执行：后端已经用 AppleScript 兜底动过手了，
+  // 这里再切一次就是两个执行方做同一件事（评审要求二者互斥）
+  if (stale) return "expired";
+
   if (hit) {
     // 切标签与把窗口激活到前台并行发起，省掉一次串行等待
     const jobs = [chrome.tabs.update(hit.id, { active: true })];
@@ -166,9 +170,7 @@ async function focusConversation(cid, url, tabId, stale) {
     return "focused";
   }
 
-  // 命令已过期（TaskPulse 那边已经用兜底路径处理过）：什么都别做，
-  // 否则一次点击会看到两个标签页
-  if (!url || stale) return "expired";
+  if (!url) return "expired";
 
   // 这个会话没有自己的标签页。就用新标签打开，不去改动用户已经打开的页面：
   // 覆盖式导航看似省一个标签，但会把用户正在看的会话换掉，行为不可预期。

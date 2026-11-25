@@ -7,10 +7,18 @@ cd "$(dirname "$0")" || exit 1
 CFG="$HOME/.taskpulse/config.json"
 TOKEN_FILE="$HOME/.taskpulse/token"
 WEBSTATE="$HOME/.taskpulse/webstate.json"
-PORT=8899
 UV="$HOME/.local/bin/uv"
 [ -x "$UV" ] || UV="$(command -v uv || true)"
 PY() { "$UV" run --quiet --no-project --python ">=3.10" python "$@"; }
+
+# 端口必须来自实际配置：当前后台就是按这份配置监听的
+PORT="$(PY -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("ui", {}).get("port") or 8899)
+except Exception:
+    print(8899)
+' "$CFG" 2>/dev/null)"
 
 say() { printf '%-8s %s\n' "$1" "$2"; }
 api() { curl -s -m 4 -H "X-TP-Token: $(cat "$TOKEN_FILE" 2>/dev/null)" "http://127.0.0.1:${PORT}$1" ${2:-} 2>/dev/null; }
@@ -138,15 +146,31 @@ PY
 CASE="${RESULT%% *}"
 DETAIL="${RESULT#* }"
 
+# 切换来源并回读确认：POST 成功不代表配置真的改了（评审复现过误报）
+switch_to() {
+  api "/mode?value=$1" "-X POST" >/dev/null 2>&1
+  api "/mode" 2>/dev/null | PY -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("source") or "")
+except Exception:
+    print("")
+' 2>/dev/null
+}
+
 if [ "$CASE" = "OK" ]; then
-  api "/mode?value=api" "-X POST" >/dev/null
-  ./health_check.sh "$PORT" 2>/dev/null | tail -1
-  say "结论" "API 模式可用（取到 ${DETAIL} 个会话）。数据源已设为 api，不用再操作。"
+  NOW="$(switch_to api)"
+  if [ "$NOW" = "api" ]; then
+    ./health_check.sh "$PORT" 2>/dev/null | tail -1
+    say "结论" "API 模式可用（取到 ${DETAIL} 个会话），数据源已确认切换为 api。"
+  else
+    say "结论" "API 取数可用，但切换数据源未生效（当前 ${NOW:-未知}），请手动点 WEB/API 再试。"
+  fi
   exit 0
 fi
 
 # ── 3b. API 不可用：自动切 WEB，让它立刻能用 ──────────────────────
-api "/mode?value=web" "-X POST" >/dev/null
+NOW="$(switch_to web)"
 FRESH="$(PY -c '
 import json, sys, time
 try:
@@ -169,7 +193,11 @@ case "$DETAIL" in
   *)      WHY="${DETAIL}" ;;
 esac
 say "API" "不可用：${WHY}"
-say "已切到" "WEB（不需要任何凭据）"
+if [ "$NOW" = "web" ]; then
+  say "已切到" "WEB（不需要任何凭据）"
+else
+  say "切换失败" "没能把数据源改到 WEB（当前 ${NOW:-未知}），请在浮窗里点一下 WEB"
+fi
 
 if [ "$FRESH" = "yes" ]; then
   say "结论" "现在就能用：浮窗里已经有数据。"

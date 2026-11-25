@@ -142,6 +142,11 @@ _NUMERIC_FIELDS = {
 def _validate_config(cfg: dict) -> list[str]:
     """按字段校验；不合法的项落回默认值，返回错误清单。"""
     problems: list[str] = []
+    # 整段写成了别的类型（"poll": []）时先换回默认值，否则下面按字段访问会崩
+    for section in ("poll", "ui", "platform", "auth"):
+        if section in cfg and not isinstance(cfg.get(section), dict):
+            cfg[section] = json.loads(json.dumps(DEFAULTS[section]))
+            problems.append("%s 不是对象，已用默认值" % section)
     for (section, field), (low, high) in _NUMERIC_FIELDS.items():
         bucket = cfg.get(section)
         if not isinstance(bucket, dict):
@@ -209,12 +214,14 @@ def source_mode() -> str:
 
 def set_source_mode(mode: str) -> None:
     """只在配置文件里改这一项，其余原样写回。"""
+    global _source_epoch
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
             cfg = json.load(f)
     except Exception:
         cfg = {}
     cfg["source"] = mode
+    _source_epoch += 1          # 版本先加，随后落盘
     tmp = CONFIG_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -363,6 +370,9 @@ def notify(title: str, body: str, cid: str | None = None) -> None:
 _lock = threading.Lock()
 # 唤醒取数循环：来源切换、页面新上报都要立刻重排，不能等原来的 sleep 走完
 _wake = threading.Event()
+# 每次切换数据来源都递增；用来识别「同一模式但已经换过一轮」——只比 api/web
+# 字符串的话，API→WEB→API 往返后旧样本仍会被当成当前来源的
+_source_epoch = 0
 # 截止时间调度自己的唤醒（改截止时间、撤销时立刻重算，不用等下一个整秒）
 _deadline_wake = threading.Event()
 
@@ -598,12 +608,29 @@ class WebProvider:
     """
 
     def __init__(self) -> None:
+        self._round: dict | None = None    # 本轮定格的快照，见 begin_round
         qf = PLATFORM.get("queue_fields") or {}
         self.f_state = qf.get("state") or "state"
         self.f_pending = qf.get("pending") or ""
         self.idle = tuple(qf.get("idle") or ())
         self._mtime = 0.0
         self._data: dict = {}
+
+    def begin_round(self) -> None:
+        """一轮采样开始：把缓存定格一份，之后所有读取都来自同一份。
+
+        页面每几秒就替换一次缓存文件；不固定的话，本轮可能拿到「旧队列 +
+        新时间」，旧状态会被当成刚刚确认过。
+        """
+        try:
+            with open(WEBSTATE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            self._round = data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            self._round = {}
+
+    def _snap(self) -> dict:
+        return self._round if self._round is not None else self._load()
 
     def _load(self) -> dict:
         try:
@@ -652,7 +679,7 @@ class WebProvider:
         return out
 
     def queue(self, cid: int, timeout: float) -> tuple[bool, str | int]:
-        q = (self._load().get("queues") or {}).get(str(cid))
+        q = (self._snap().get("queues") or {}).get(str(cid))
         if not isinstance(q, dict):
             raise NoSample(str(cid))
         raw = q.get(self.f_state)
@@ -663,14 +690,14 @@ class WebProvider:
 
     def queue_at(self, cid: int) -> int | None:
         """这条队列的样本是哪一刻取到的；缓存里的旧值不允许当成刚观测。"""
-        at = (self._load().get("queueAt") or {}).get(str(cid))
+        at = (self._snap().get("queueAt") or {}).get(str(cid))
         try:
             return int(at) if at else None
         except (TypeError, ValueError):
             return None
 
     def last_message(self, cid: int, timeout: float) -> dict:
-        msg = (self._load().get("lastMessages") or {}).get(str(cid))
+        msg = (self._snap().get("lastMessages") or {}).get(str(cid))
         return msg if isinstance(msg, dict) else {}
 
 
@@ -912,6 +939,8 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
         return
     task["queue_observed_at"] = sample.at
     task["raw_state"] = sample.raw
+    # 没翻消息时不再重置 failed，但仍要保证字段存在（下面直接按索引读）
+    task.setdefault("failed", False)
 
     started = task.get("running_since") or 0
     if started and previous and sample.at - previous > RUN_GAP_RESET_SECONDS * 1000:
@@ -934,7 +963,10 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
             task["message_checked_at"] = sample.at
             if sample.failed is not None:
                 task["classified_reply"] = run_reply
-        task["failed"] = bool(sample.failed) if checked else False
+        # 没翻到新消息时保留上一轮结论：否则「已判限流」会被下一次纯队列采样
+        # 抹成 False，状态从卡住退回运行中
+        if checked:
+            task["failed"] = bool(sample.failed)
         task["reply_pending"] = False
         elapsed = (sample.at - started) // 1000
         # 卡住判定看的是「这一阶段」的倒计时：运行中从起跑算，转入待回复后重新起算
@@ -1019,8 +1051,9 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
 
 def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dict:
     deadline = time.monotonic() + ROUND_BUDGET_SECONDS
-    # 本轮的来源代号：落盘前要再核一次，避免旧来源的样本覆盖新来源
-    gen = source_mode()
+    # 本轮的来源身份：模式名 + 版本号。版本号能识别「切走又切回来」，
+    # 光比 api/web 会把往返之后的旧样本当成当前的
+    gen = (source_mode(), _source_epoch)
     base = load_state()
     tasks = base.get("tasks") or {}
     stamp = now_ms()
@@ -1048,6 +1081,10 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             conv for conv in fast_candidates(tasks, stamp) if str(conv["id"]) not in picked]
     else:
         conversations = fast_candidates(tasks, stamp)
+    # WEB 侧每轮只读一份缓存：否则队列与观测时刻可能来自不同批次
+    begin = getattr(agent, "begin_round", None)
+    if callable(begin):
+        begin()
     samples = sample_queues(agent, conversations, tasks, deadline)
     if not full and not samples:
         return base
@@ -1065,6 +1102,7 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             baseline = state["baseline_at"] = stamp
         fresh: set[str] = set()
         for conv in listed:
+            carried: dict = {}       # 必须在每轮重置，否则上一轮的值会串到下一个会话
             cid = str(conv["id"])
             update = conv["updateTime"]
             created = int(conv.get("createTime") or 0)
@@ -1096,7 +1134,8 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                         update_ms=update, seen_ms=stamp,
                         # 会话在 DataAgent 里的分组；取消分组时也要覆盖成空
                         group_name=conv.get("groupName") or "")
-            task.update({k: v for k, v in locals().get("carried", {}).items()})
+            if carried:
+                task.update(carried)
             task["url"] = conv_url(task["agent_id"], cid)
             task["listed_at"] = stamp          # 最后一次出现在监控窗口里
             if task.get("archived") and update > (task.get("acked_update") or 0):
@@ -1166,8 +1205,16 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                     state["poller_error"] = ("浏览器里的页面没有上报数据（页面已关或扩展停用），"
                                              "显示上次缓存")
                     state["poller_error_at"] = stamp
-                    # 后台每 15 秒会去敲一次采集页，据此给一个可等的时长
-                    state["retry_at"] = stamp + WEB_RETRY_HINT_SECONDS * 1000
+                    # 只有「扩展在报 + 确实有页面」时，15 秒这个估算才成立；
+                    # 否则倒计时会一直归零重来，反而误导
+                    alive = (bool(_tab_ids)
+                             and any(stamp - t < 180_000 for t in _tab_report_by_browser.values()))
+                    if alive:
+                        state["retry_at"] = stamp + WEB_RETRY_HINT_SECONDS * 1000
+                    else:
+                        state.pop("retry_at", None)
+                        state["poller_error"] = ("没有可用的 DataAgent 页面："
+                                                 "请打开一个页面并确认扩展已加载、已登录")
         if full or any(sample.busy is not None for sample in samples.values()):
             # web 模式的「更新时间」是浏览器里那份数据的生成时刻，不是本次落盘的时刻——
             # 否则页面停了 100 秒，UI 还以为是刚更新过
@@ -1175,10 +1222,10 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             state["updated"] = fresh_at or stamp
         # 采样是在锁外做的，可能已经跑了几秒。期间来源被切走的话，这批样本
         # 属于旧来源，落盘会把新来源的数据盖掉——直接丢弃，下一轮按新来源重来。
-        if source_mode() == gen:
+        if (source_mode(), _source_epoch) == gen:
             save_state(state)
         else:
-            log("来源已切换，丢弃这轮 %s 的采样结果" % gen)
+            log("来源已切换，丢弃这轮 %s 的采样结果" % (gen,))
             return base
 
     for title, body, cid in notifications:
@@ -1348,7 +1395,10 @@ def view(state: dict) -> dict:
         "counts": {
             **{s: sum(1 for r in rows if r["status"] == s and not r["stale"])
                for s in ("running", "stuck")},
-            **{s: sum(1 for r in rows if r["status"] == s) for s in ("attention", "done", "seen")},
+            # 待处理也要限定在覆盖范围内：掉出监控窗口的历史任务仍会列在列表里，
+            # 但计入胶囊数字就会和「当前还有几件事等我」不符
+            "attention": sum(1 for r in rows if r["status"] == "attention" and r["covered"]),
+            **{s: sum(1 for r in rows if r["status"] == s) for s in ("done", "seen")},
         },
         "out_of_scope_count": sum(1 for r in rows if not r["covered"]),
         "latency": _latency_stats(),
@@ -1435,6 +1485,9 @@ def ingest_tabs(payload: dict, ua: str = "") -> int:
     save_active({"cid": am.group(1) if am else None,
                  "focused": bool(act.get("focused"))})
 
+    # 整份快照替换：同一次上报里没出现的会话，说明它的标签已经不在了。
+    # 不清理的话旧 tabId 会一直留着，点任务时先「聚焦」到不存在的标签再新开。
+    seen: set[str] = set()
     n = 0
     for t in payload.get("tabs") or []:
         url = t.get("url") or ""
@@ -1447,12 +1500,18 @@ def ingest_tabs(payload: dict, ua: str = "") -> int:
             _tab_ids[cid] = tid
         if b:
             _tab_browser[cid] = b
+        seen.add(cid)
         g = (t.get("group") or "").strip()
         if g:
             _tab_groups[cid] = g
         else:
             _tab_groups.pop(cid, None)      # 移出标签组后别再显示旧组名
         n += 1
+    # 这次没报上来的会话：标签已关，映射和组名一起作废
+    for cid in [c for c in _tab_ids if c not in seen]:
+        _tab_ids.pop(cid, None)
+        _tab_browser.pop(cid, None)
+        _tab_groups.pop(cid, None)
     return n
 
 
@@ -1523,7 +1582,10 @@ def focus_tab(win: int, tab: int) -> bool:
         'end tell'
     )
     try:
-        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=6)
+        done = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=6)
+        if done.returncode != 0:
+            log("focus_tab 失败 win=%s tab=%s: %s" % (win, tab, (done.stderr or b"").decode()[:120]))
+            return False
         return True
     except Exception:
         return False
@@ -1626,7 +1688,14 @@ def open_conversation(cid: str) -> str:
         return "focused"
 
     log(f"open {cid}: no tab match, falling back to new tab")
-    subprocess.run(["open", url], check=False)
+    try:
+        done = subprocess.run(["open", url], capture_output=True, timeout=10)
+        if done.returncode != 0:
+            log("open url 失败 cid=%s: %s" % (cid, (done.stderr or b"").decode()[:120]))
+            return "failed"
+    except Exception as exc:
+        log("open url 异常 cid=%s: %s" % (cid, exc))
+        return "failed"
     return "opened"
 
 
@@ -1881,16 +1950,17 @@ class Handler(BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
         """校验 X-TP-Token：只有拿到同一份密钥的本机进程能调这些接口。
 
-        密钥真的建不出来时（家目录只读等）放行并记一次日志：那是装机本身坏了，
-        此时把用户锁在自己的界面外面，比本机进程乱调的风险更糟。
+        密钥建不出来时一律拒绝（fail-closed）：放行等于把「只有配对客户端能调」
+        这条验收标准作废。装机本身坏了应该在安装阶段暴露，而不是在运行时开门。
+        日志和 health_check 会明确写出原因，用户照提示重装修复即可。
         """
         global _auth_warned
         expected = read_token()
         if not expected:
             if not _auth_warned:
                 _auth_warned = True
-                log("本机接口密钥不可用，请求暂未校验（检查 ~/.taskpulse 是否可写）")
-            return True
+                log("本机接口密钥不可用，拒绝请求；检查 ~/.taskpulse 是否可写，或重跑 install.command")
+            return False
         given = self.headers.get(TOKEN_HEADER) or ""
         # 常量时间比较：本机进程也可能反复猜，别留时间侧信道
         return bool(given) and hmac.compare_digest(given, expected)
@@ -2047,7 +2117,8 @@ class Handler(BaseHTTPRequestHandler):
             _cmd_acks[cid] = time.time()
             _cmd_done[cid] = time.time()
             pending = _open_pending.pop(cid, None)
-            if pending:
+            # unknown / expired 表示扩展没真正切过去，不能当成「看过了」
+            if pending and (query.get("result") or [""])[0] in ("focused", "created"):
                 _confirm_open(*pending)
             t0 = _cmd_t0.pop(cid, None)
             how = (query.get("result") or [""])[0]
@@ -2305,7 +2376,10 @@ def _poll_forever() -> None:
                     next_discovery = started + DISCOVERY_POLL_SECONDS
             next_fast = float("inf")
             if ACTIVE_POLL_SECONDS and ACTIVE_WATCH_LIMIT and any(
-                    running(task) for task in (state.get("tasks") or {}).values()):
+                    running(task) or task.get("important")
+                    for task in (state.get("tasks") or {}).values()):
+                # 标了「完成后提醒我」的空闲会话也要走快循环，
+                # 否则 fast_candidates 根本没机会被调用
                 next_fast = started + ACTIVE_POLL_SECONDS
             if TP_DEBUG:
                 kind = "full" if full else ("discovery" if discovery else "active")

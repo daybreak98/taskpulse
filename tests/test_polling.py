@@ -434,6 +434,30 @@ class PollingTests(unittest.TestCase):
         self.assertIn("凭据服务", err, "错误文案对用户不可读")
         self.assertNotIn("SystemExit", err)
 
+    def test_scope_change_does_not_leak_deadline_to_other_tasks(self):
+        """一个会话换数据范围时，它的截止时间不能串写到同一批次的其他会话。"""
+        agent = FakeAgent([{"id": 1, "name": "A", "updateTime": self.stamp, "agentId": 111},
+                           {"id": 2, "name": "B", "updateTime": self.stamp, "agentId": 111}])
+        poller.poll_tick(agent, full=True)
+        deadline1 = self.stamp + 600_000
+        deadline2 = self.stamp + 900_000
+        state = poller.load_state()
+        state["tasks"]["1"]["deadline"] = deadline1
+        state["tasks"]["2"]["deadline"] = deadline2
+        poller.save_state(state)
+
+        # 只有会话 1 换了范围；会话 2 仍在原范围
+        agent.items = [{"id": 1, "name": "A", "updateTime": self.stamp, "agentId": 222},
+                       {"id": 2, "name": "B", "updateTime": self.stamp, "agentId": 111}]
+        self.stamp += 1_000
+        poller.poll_tick(agent, full=True)
+
+        tasks = poller.load_state()["tasks"]
+        self.assertEqual(tasks["1"].get("deadline"), deadline1,
+                         "换范围的会话丢了用户设的截止时间")
+        self.assertEqual(tasks["2"].get("deadline"), deadline2,
+                         "别的会话的截止时间被串写")
+
     def test_retry_countdown_is_exposed_while_backing_off(self):
         """退避期间 /state 要给出「还剩几秒会重试」，界面才能告诉用户等多久。"""
         poller._mark_error("boom", 30)
