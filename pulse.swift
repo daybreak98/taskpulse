@@ -1722,6 +1722,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 自检开关：两台实例同 bundle id 时，隔离测试会被这条挡掉
         let skipInstanceCheck = ProcessInfo.processInfo.environment["TP_SKIP_INSTANCE_CHECK"] == "1"
         if running.count > 1 && !skipInstanceCheck {
+            // 同上：先把已有窗口叫到前面，避免看起来像闪退
+            running.first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier })?
+                .activate(options: [.activateAllWindows])
+            dbg("已有实例在运行（running=\(running.count)），激活并退出")
             NSApp.terminate(nil)
             return
         }
@@ -2660,6 +2664,11 @@ if !FileManager.default.fileExists(atPath: lockPath) {
 }
 let appLock = try? FileHandle(forWritingTo: URL(fileURLWithPath: lockPath))
 if let appLock, flock(appLock.fileDescriptor, LOCK_EX | LOCK_NB) != 0 {
+    // 已经有一个在跑：把它叫到前面来再退出。
+    // 以前这里是静默 exit(0)，用户双击第二次时看到的就是「闪退」。
+    NSRunningApplication.runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
+        .first?.activate(options: [.activateAllWindows])
+    dbg("已有实例在运行（\(isInstalledCopy ? "ui" : "installer")），激活它并退出")
     exit(0)
 }
 
