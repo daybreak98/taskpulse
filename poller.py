@@ -356,7 +356,7 @@ def read_token() -> str:
 # 通知不再走 osascript：macOS 会把 `display notification` 记在「脚本编辑器」名下，
 # 点通知打开的是脚本编辑器而不是会话。改成把事件塞进 /state，由 App 自己的提示条弹出，
 # 点一下就直接跳到对应标签页。
-_STARTED_AT = int(time.time())
+_STARTED_AT = int(time.time() * 1000)
 _events: list[dict] = []
 _events_seq = 0
 _events_lock = threading.Lock()
@@ -367,8 +367,8 @@ def notify(title: str, body: str, cid: str | None = None) -> None:
     with _events_lock:      # 两个线程都可能推事件，序号必须唯一，否则 App 会当成重复丢掉
         _events_seq += 1
         seq = _events_seq
-    _events.append({"seq": seq, "title": title, "body": body, "cid": cid})
-    del _events[:-20]
+        _events.append({"seq": seq, "title": title, "body": body, "cid": cid})
+        del _events[:-20]
 
 
 # ── 存储 ────────────────────────────────────────────────────────────
@@ -586,7 +586,7 @@ class AgentClient:
         if isinstance(status, int) and not 200 <= status < 300:
             raise requests.HTTPError(f"{path.split('?')[0]} 返回 HTTP {status}", response=response)
         result = response.json()
-        if (not isinstance(result, dict) or result.get("success") is False
+        if (not isinstance(result, dict) or result.get("success") is False or result.get("error_msg")
                 or not isinstance(result.get("data"), dict)):
             raise ValueError(f"{path.split('?')[0]} 返回的数据格式无效")
         return result["data"]
@@ -1119,13 +1119,17 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
         mark_seen(task)
 
 
-def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dict:
+def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False,
+              expected_gen: tuple[str, int] | None = None) -> dict:
     deadline = time.monotonic() + ROUND_BUDGET_SECONDS
     # 本轮的来源身份：模式名 + 版本号。版本号能识别「切走又切回来」，
     # 光比 api/web 会把往返之后的旧样本当成当前的
     with _lock:
         gen = (source_mode(), _source_epoch)
         base = load_state()
+        if (expected_gen is not None and gen != expected_gen
+                or isinstance(agent, WebProvider) != (gen[0] == "web")):
+            return base
     # Freeze before reading the list, not just before reading the queues.
     begin = getattr(agent, "begin_round", None)
     if callable(begin):
@@ -1157,7 +1161,7 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
     else:
         conversations = fast_candidates(tasks, stamp)
     samples = sample_queues(agent, conversations, tasks, deadline)
-    if not full and not samples:
+    if not full and not discovery and not samples:
         return base
 
     notifications: list[tuple[str, str, str]] = []
@@ -1246,6 +1250,9 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
             # 重复提交会把「上次成功观测」一路往后推，等于给旧数据续期
             if (sample.from_source and task.get("queue_checked_at")
                     and sample.at <= task["queue_checked_at"]):
+                continue
+            # An idle sample from before the list's new version is not evidence that it finished.
+            if sample.from_source and sample.busy is False and sample.at < update:
                 continue
             if (cid in fresh and sample.busy is False and not task.get("acked_update")
                     and update <= int(conv.get("createTime") or 0)):
@@ -1415,6 +1422,7 @@ def view(state: dict) -> dict:
             "status": task.get("status"),
             "prev": task.get("prev"),
             "reply_version": task.get("reply_version"),
+            "reply_pending": task.get("reply_pending"),
             "stale": stale,
             "covered": covered,
             "progress": round(progress, 3),
@@ -1631,6 +1639,7 @@ def _ingest_tabs(payload: dict, ua: str = "") -> int:
 _edge_tabs = {"ts": 0, "map": {}, "live": set()}
 
 TABS_SCRIPT = """
+if application "%(app)s" is not running then return ""
 tell application "%(app)s"
   set out to ""
   set wi to 0
@@ -1731,20 +1740,24 @@ end targetURL
 
 
 FOCUS_TAB_SCRIPT = APPLESCRIPT_TARGET + """
+if application "%(app)s" is not running then return "absent"
 tell application "%(app)s"
   set u to ""
   try
     set u to (URL of tab %(tab)d of window %(win)d as text)
   end try
-  if not my targetURL(u, %(prefix)s, "%(cid)s") then return "stale"
-  set index of window %(win)d to 1
-  set active tab index of window %(win)d to %(tab)d
+  if not (my targetURL(u, %(prefix)s, "%(cid)s")) then return "stale"
+  set w to window %(win)d
+  set active tab index of w to %(tab)d
+  set index of w to 1
   activate
+  if not (my targetURL((URL of active tab of front window as text), %(prefix)s, "%(cid)s")) then return "stale"
   return "ok"
 end tell
 """
 
 FIND_TAB_SCRIPT = APPLESCRIPT_TARGET + """
+if application "%(app)s" is not running then return "absent"
 tell application "%(app)s"
   set wi to 0
   repeat with w in windows
@@ -1756,10 +1769,11 @@ tell application "%(app)s"
       try
         set u to (URL of t as text)
       end try
-      if my targetURL(u, %(prefix)s, "%(cid)s") then
-        set index of w to 1
+      if (my targetURL(u, %(prefix)s, "%(cid)s")) then
         set active tab index of w to ti
+        set index of w to 1
         activate
+        if not (my targetURL((URL of active tab of front window as text), %(prefix)s, "%(cid)s")) then return "stale"
         return "ok"
       end if
     end repeat
@@ -2594,7 +2608,7 @@ def poll_loop() -> None:
 
 
 def _mark_error(msg: str, retry_seconds: float | None = None,
-                auth_required: bool = False) -> None:
+                auth_required: bool = False, expected_gen: tuple[str, int] | None = None) -> None:
     """把取数故障写进 state，UI/诊断能看到「数字不再更新」的原因。
 
     retry_seconds 是这一轮退避的时长，UI 据此显示「约 N 秒后重试」——
@@ -2602,11 +2616,15 @@ def _mark_error(msg: str, retry_seconds: float | None = None,
     """
     try:
         with _lock:
+            if expected_gen is not None and expected_gen != (source_mode(), _source_epoch):
+                return
             state = load_state()
             state["poller_error"] = msg
             state["poller_error_at"] = now_ms()
             if auth_required:
                 state["auth_required"] = True
+            else:
+                state.pop("auth_required", None)
             if retry_seconds:
                 state["retry_at"] = now_ms() + int(retry_seconds * 1000)
             else:
@@ -2670,10 +2688,12 @@ def _poll_forever() -> None:
         started = time.monotonic()
         full = started >= next_full
         discovery = (not full) and bool(DISCOVERY_POLL_SECONDS) and started >= next_discovery
+        with _lock:
+            gen = (source_mode(), _source_epoch)
         try:
-            if agent is None or isinstance(agent, WebProvider) != (source_mode() == "web"):
+            if agent is None or isinstance(agent, WebProvider) != (gen[0] == "web"):
                 agent = make_agent()   # 数据来源被切换过
-            state = poll_tick(agent, full=full, discovery=discovery)
+            state = poll_tick(agent, full=full, discovery=discovery, expected_gen=gen)
             failures = 0
             if full:
                 next_full = started + POLL_SECONDS
@@ -2713,7 +2733,7 @@ def _poll_forever() -> None:
                 message = f"{type(exc).__name__}: {exc}"
                 backoff = max(POLL_SECONDS, min(60 * 2 ** min(failures - 1, 5), 1800))
                 log(f"取数失败：{message}，{backoff} 秒后重试")
-            _mark_error(message, backoff, auth_required=auth)
+            _mark_error(message, backoff, auth_required=auth, expected_gen=gen)
             agent = None
             next_full = time.monotonic() + backoff
             next_discovery = next_full if DISCOVERY_POLL_SECONDS else float("inf")

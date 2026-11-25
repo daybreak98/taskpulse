@@ -693,6 +693,20 @@ class PollingTests(unittest.TestCase):
                                 headers={"User-Agent": "Mozilla/5.0 Chrome/157"})
         self.assertEqual(r.status_code, 204)
 
+    def test_old_source_round_and_error_are_discarded(self):
+        with patch.object(poller, "source_mode", return_value="web"):
+            agent = FakeAgent([conversation(1)])
+            poller.poll_tick(agent, full=True, expected_gen=("api", poller._source_epoch))
+            self.assertEqual(agent.list_calls, 0)
+            poller._mark_error("old API failure", 30, expected_gen=("api", poller._source_epoch))
+            self.assertNotIn("poller_error", poller.load_state())
+
+    def test_discovery_list_is_kept_even_when_queue_budget_exhausted(self):
+        agent = FakeAgent([conversation(1)])
+        with patch.object(poller, "sample_queues", return_value={}):
+            state = poller.poll_tick(agent, full=False, discovery=True)
+        self.assertIn("1", state["tasks"])
+
     def test_api_does_not_import_old_web_error(self):
         path = Path(self.directory) / "webstate.json"
         path.write_text(json.dumps({"at": NOW, "error": "HTTP 401"}), encoding="utf-8")

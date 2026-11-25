@@ -116,6 +116,7 @@ struct TaskItem: Decodable, Equatable {
     let stale: Bool?
     let reply_version: String?
     let updated_ms: Int?
+    let reply_pending: Bool?
     /// 用户手动标的「完成后提醒我」：行更亮，回话弹窗常驻
     let important: Bool?
     /// 浏览器里是否有这个会话的标签页（清理菜单据此算能关几个）
@@ -1542,10 +1543,12 @@ final class ToastPanel: NSPanel {
 final class ToastHandle {
     let panel: NSPanel
     let item: TaskItem
+    let replyOnly: Bool
     var timer: Timer?
-    init(panel: NSPanel, item: TaskItem) {
+    init(panel: NSPanel, item: TaskItem, replyOnly: Bool) {
         self.panel = panel
         self.item = item
+        self.replyOnly = replyOnly
     }
 }
 
@@ -1772,7 +1775,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self?.showToast(TaskItem(id: 0, name: "测试提示条", group: nil, status: "attention",
                                              prev: nil, progress: 0, elapsed: 0, idle_minutes: 0,
                                              overdue: false, failed: nil, muted: nil, stale: nil,
-                                             reply_version: nil, updated_ms: nil, important: nil, has_tab: nil),
+                                             reply_version: nil, updated_ms: nil, reply_pending: nil, important: nil, has_tab: nil),
                                    title: "测试提示条", body: "如果你看到这条，说明提示条正常")
                     return
                 }
@@ -2395,15 +2398,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         print("[TaskPulse] toast \(item.name)")
         dbg("toast show id=\(item.id) stack=\(toasts.count + 1)")
-        let handle = ToastHandle(panel: np, item: item)
+        let handle = ToastHandle(panel: np, item: item,
+                                 replyOnly: title == "Agent 回话了" || title == "Agent 回话异常")
         tv.onClick = { [weak self, weak hd = handle, weak view = tv] in
             guard let self, let hd else { dbg("toast click dead ref"); return }
             dbg("toast click id=\(hd.item.id)")
             // 先给一个「点到了」的反馈，再走跳转，跳转不等待动效
             view?.highlighted = true
             self.open(hd.item)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-                self?.dismissToast(hd, tapped: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak view] in
+                if hd.replyOnly {
+                    // Wait for confirmed acknowledgement in /state; failed jumps remain retryable.
+                    view?.highlighted = false
+                } else {
+                    self?.dismissToast(hd, tapped: true)
+                }
             }
         }
 
@@ -2475,16 +2484,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 同一会话的新回复也能提示，启动时已有的回复只作为基准。
     func detectReplies(_ payload: Payload) {
+        var next = Dictionary(payload.all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         if statusSeeded {
-            for item in payload.all where item.status == "attention" && item.stale != true {
+            for item in payload.all {
+                if item.stale == true {
+                    // A stale snapshot must not consume a reply's notification version.
+                    next[item.id] = lastStatus[item.id]
+                    continue
+                }
+                let failedReply = item.status == "stuck" && item.failed == true && item.reply_pending == true
+                guard item.status == "attention" || failedReply else { continue }
                 let previous = lastStatus[item.id]
                 let newReply = item.reply_version.map { $0 != previous?.reply_version } ?? false
-                if previous?.status != "attention" || newReply {
-                    showToast(item)
+                let wasReply = previous?.status == "attention" ||
+                    (previous?.status == "stuck" && previous?.failed == true && previous?.reply_pending == true)
+                if !wasReply || newReply || (failedReply && previous?.failed != true) {
+                    if failedReply {
+                        showToast(item, title: "Agent 回话异常", accent: palette["stuck"])
+                    } else {
+                        showToast(item)
+                    }
                 }
             }
         }
-        lastStatus = Dictionary(payload.all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for toast in toasts.filter({ $0.replyOnly }) {
+            guard let item = next[toast.item.id], item.stale != true else { continue }
+            if item.reply_pending == false || item.status == "seen" || item.status == "done" ||
+                (item.reply_version != nil && item.reply_version != toast.item.reply_version) {
+                dismissToast(toast)
+            }
+        }
+        lastStatus = next
         statusSeeded = true
     }
 
@@ -2493,12 +2523,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func detectEvents(_ payload: Payload) {
         guard let events = payload.events else { return }
         let run = payload.event_run ?? 0
-        if eventRun != run {          // 后端重启过：跳过积压，别一次性把历史事件全弹出来
+        if eventRun != run {
+            let firstConnection = eventRun == 0
             eventRun = run
-            lastEventSeq = events.map { $0.seq }.max() ?? 0
-            return
+            lastEventSeq = firstConnection ? (events.map { $0.seq }.max() ?? 0) : 0
+            if firstConnection { return }
         }
-        for event in events where event.seq > lastEventSeq {
+        for event in events.sorted(by: { $0.seq < $1.seq }) where event.seq > lastEventSeq {
             lastEventSeq = max(lastEventSeq, event.seq)
             guard let cid = event.cid, let id = Int(cid),
                   let item = payload.all.first(where: { $0.id == id }) else { continue }
@@ -2539,6 +2570,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self.detectEvents(payload)
                 } else {
                     self.consecutiveReadFailures = min(self.consecutiveReadFailures + 1, 3)
+                    if self.consecutiveReadFailures == 3 { self.poller.startIfNeeded() }
                     self.nextReadAt = ProcessInfo.processInfo.systemUptime + Double(1 << self.consecutiveReadFailures)
                 }
                 let detail = self.view.statusDetail

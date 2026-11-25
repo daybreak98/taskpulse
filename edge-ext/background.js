@@ -349,7 +349,7 @@ chrome.tabs.onRemoved.addListener(() => ensureLeader());
 chrome.tabs.onCreated.addListener(() => ensureLeader());
 chrome.tabs.onUpdated.addListener((_tabId, info) => {
   if (!info) return;
-  if (info.discarded || info.status === "complete" || info.url) ensureLeader();
+  if (info.discarded !== undefined || info.frozen !== undefined || info.status === "complete" || info.url) ensureLeader();
 });
 
 chrome.alarms.create("tp-sync", { periodInMinutes: 0.5 });
@@ -401,7 +401,8 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg.kind === "tp-role-ask") {
     // 页面刚注入时自己来问一句：默认不开采集，否则五十个标签页会同时开火
     const tabId = sender && sender.tab && sender.tab.id;
-    const leader = typeof tabId === "number" && tabId === leaderId && !pausedByApi;
+    const leader = typeof tabId === "number" && tabId === leaderId && sender?.frameId === 0 &&
+      isConversationTab(sender.url) && !pausedByApi;
     if (leader) roleSent = true;
     respond({ leader });
     // 还没选过主（刚装好/刚唤醒）就顺手补一次，问话的那一页也可能是该干活的那页
@@ -409,7 +410,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     return;
   }
   if (msg.kind === "webstate" && msg.payload) {
-    if (pausedByApi || sender?.tab?.id !== leaderId || sender?.frameId !== 0) {
+    if (pausedByApi || sender?.tab?.id !== leaderId || sender?.frameId !== 0 || !isConversationTab(sender.url)) {
       respond({ ok: false });
       return;
     }
@@ -482,7 +483,7 @@ async function pickLeader(tabs) {
   // discarded 的页面里没有 content script 在跑，敲了也不动；
   // status 不到 complete 的还在加载，dom 都还没稳，同样采不到东西
   const usable = tabs.filter((t) =>
-    typeof t.id === "number" && !t.discarded && t.status === "complete");
+    typeof t.id === "number" && !t.discarded && !t.frozen && t.status === "complete" && isConversationTab(t.url));
   if (!usable.length) return -1;
 
   let focusedWin = -1;
@@ -521,7 +522,7 @@ async function doEnsureLeader() {
   if (leaderId !== -1) {
     const cur = alive.get(leaderId);
     // 粘性：leader 还活着就不要换，否则用户每切一次标签都要重新拉一遍会话列表
-    if (cur && !cur.discarded && cur.status === "complete") next = leaderId;
+    if (cur && !cur.discarded && !cur.frozen && cur.status === "complete" && isConversationTab(cur.url)) next = leaderId;
   }
   if (next === -1) next = await pickLeader(tabs);
   applyLeader(next);

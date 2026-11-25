@@ -243,6 +243,7 @@
   function sync() {
     const want = roleWanted && !!CFG;
     if (want && !timer) {
+      lastListAt = 0;
       tick();                                // 刚拿到采集权先补一轮，别干等 2 秒
       timer = setInterval(tick, 2000);
     } else if (!want && timer) {
