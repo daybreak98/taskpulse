@@ -434,6 +434,23 @@ class PollingTests(unittest.TestCase):
         self.assertIn("凭据服务", err, "错误文案对用户不可读")
         self.assertNotIn("SystemExit", err)
 
+    def test_retry_countdown_is_exposed_while_backing_off(self):
+        """退避期间 /state 要给出「还剩几秒会重试」，界面才能告诉用户等多久。"""
+        poller._mark_error("boom", 30)
+        got = poller.view(poller.load_state())
+        self.assertIn("boom", got["poller_error"])
+        self.assertIsNotNone(got["retry_in_seconds"])
+        self.assertAlmostEqual(got["retry_in_seconds"], 30, delta=1)
+
+        # 时间往后走，剩余秒数应递减
+        self.stamp += 10_000
+        got = poller.view(poller.load_state())
+        self.assertAlmostEqual(got["retry_in_seconds"], 20, delta=1)
+
+        # 成功取数后清掉，界面不该再显示倒计时
+        poller._mark_error("", None)
+        self.assertIsNone(poller.view(poller.load_state())["retry_in_seconds"])
+
     def test_important_task_keeps_fast_sampling_while_idle(self):
         """标了「完成后提醒我」的会话即使没在跑，也要按秒级复查，
         否则它掉出监控窗口后再有回话就取不到。"""

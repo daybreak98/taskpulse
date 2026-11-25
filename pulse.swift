@@ -124,6 +124,8 @@ struct Payload: Decodable {
     let source_age: Double?
     let window_limit: Int?
     let poller_error: String?
+    /// 距离下一次重试还有多少秒；null 表示没有退避在跑
+    let retry_in_seconds: Int?
     let stale_after_seconds: Double?
     let stale_count: Int?
     let event_run: Int?
@@ -911,16 +913,23 @@ final class PulseView: NSView {
         return Date().timeIntervalSince1970 - Double(ms) / 1000 > (p.stale_after_seconds ?? 180)
     }
 
+    /// 有退避在跑时补一句「约 N 秒后重试」，让用户知道要不要等
+    private var retrySuffix: String {
+        guard let n = payload?.retry_in_seconds else { return "" }
+        if n <= 0 { return "（正在重试）" }
+        return "（约 \(n) 秒后重试）"
+    }
+
     var statusMessage: String? {
-        if connectionLost { return "本机服务连接中断" }
+        if connectionLost { return "本机服务连接中断" + retrySuffix }
         guard let p = payload else { return "正在连接本机服务…" }
         if let error = p.poller_error {
             // 两种故障要分开说：接口/认证出问题，和「浏览器页面这一会儿没上报」
-            if error.contains("没有上报") { return "浏览器页面暂无数据，显示上次快照" }
-            if error.contains("凭据服务") { return "需要打开 MyFlicker 客户端，API 模式已暂停" }
-            return "取数暂时失败，显示上次快照"
+            if error.contains("没有上报") { return "浏览器页面暂无数据，显示上次快照" + retrySuffix }
+            if error.contains("凭据服务") { return "需要打开 MyFlicker 客户端，API 模式已暂停" + retrySuffix }
+            return "取数暂时失败，显示上次快照" + retrySuffix
         }
-        if p.updated == nil { return "等待首次采样…" }
+        if p.updated == nil { return "等待首次采样…" + retrySuffix }
         if countersUnavailable { return "取数暂未更新，显示上次快照" }
         if let actionMessage { return actionMessage }
         if let n = p.stale_count, n > 0 { return "\(n) 个会话状态待确认" }

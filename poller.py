@@ -193,6 +193,8 @@ WEBSTATE_FILE = os.path.join(HOME, ".taskpulse", "webstate.json")
 # web 模式下缓存超过这么久没更新，就当作「页面没在报」，别让旧数字看着像新的。
 # 页面在后台会被节流，实测有过 80 秒的空档；阈值取 180 秒，避免提示来回闪。
 WEB_STALE_SECONDS = max(180, POLL_SECONDS * 3)
+# 页面没上报时，后台敲一次的周期；UI 用它显示「约 N 秒后重试」
+WEB_RETRY_HINT_SECONDS = 15
 
 
 def source_mode() -> str:
@@ -1157,12 +1159,15 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False) -> dic
                     del tasks[cid]
             state.pop("poller_error", None)
             state.pop("poller_error_at", None)
+            state.pop("retry_at", None)
             if isinstance(agent, WebProvider):
                 age = agent.age_seconds()
                 if age is None or age > WEB_STALE_SECONDS:
                     state["poller_error"] = ("浏览器里的页面没有上报数据（页面已关或扩展停用），"
                                              "显示上次缓存")
                     state["poller_error_at"] = stamp
+                    # 后台每 15 秒会去敲一次采集页，据此给一个可等的时长
+                    state["retry_at"] = stamp + WEB_RETRY_HINT_SECONDS * 1000
         if full or any(sample.busy is not None for sample in samples.values()):
             # web 模式的「更新时间」是浏览器里那份数据的生成时刻，不是本次落盘的时刻——
             # 否则页面停了 100 秒，UI 还以为是刚更新过
@@ -1313,6 +1318,9 @@ def view(state: dict) -> dict:
         "updated": state.get("updated"),
         "source": source, "source_age": source_age,
         "poller_error": state.get("poller_error"),
+        # 还剩几秒会再试；没有退避（比如等页面上报）时为 null
+        "retry_in_seconds": (max(0, round(((state.get("retry_at") or 0) - stamp) / 1000))
+                             if state.get("retry_at") else None),
         "poller_error_at": state.get("poller_error_at"),
         "stale_after_seconds": stale_after_seconds,
         "stale_count": sum(1 for r in rows if r["stale"]),
@@ -2138,13 +2146,21 @@ def poll_loop() -> None:
         _poll_forever()
 
 
-def _mark_error(msg: str) -> None:
-    """把取数故障写进 state，UI/诊断能看到「数字不再更新」的原因。"""
+def _mark_error(msg: str, retry_seconds: float | None = None) -> None:
+    """把取数故障写进 state，UI/诊断能看到「数字不再更新」的原因。
+
+    retry_seconds 是这一轮退避的时长，UI 据此显示「约 N 秒后重试」——
+    切模式后短暂取不到数时，用户能判断要不要等，而不是干看着黄条。
+    """
     try:
         with _lock:
             state = load_state()
             state["poller_error"] = msg
             state["poller_error_at"] = now_ms()
+            if retry_seconds:
+                state["retry_at"] = now_ms() + int(retry_seconds * 1000)
+            else:
+                state.pop("retry_at", None)
             save_state(state)
     except OSError as exc:
         log(f"记录取数故障失败：{exc}")
@@ -2235,7 +2251,7 @@ def _poll_forever() -> None:
                 message = f"{type(exc).__name__}: {exc}"
                 backoff = max(POLL_SECONDS, min(60 * 2 ** min(failures - 1, 5), 1800))
                 log(f"取数失败：{message}，{backoff} 秒后重试")
-            _mark_error(message)
+            _mark_error(message, backoff)
             agent = None
             next_full = time.monotonic() + backoff
             next_discovery = next_full if DISCOVERY_POLL_SECONDS else float("inf")
