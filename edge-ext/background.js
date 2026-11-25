@@ -139,24 +139,9 @@ async function focusConversation(cid, url, tabId, stale) {
   // 否则一次点击会看到两个标签页
   if (!url || stale) return "expired";
 
-  // 这个会话没有独立标签页。原来直接 new tab，结果是每点一次就多一个——
-  // 而用户要的是「在已经打开的 DataAgent 页面里切到那个对话」。
-  // 所以在现有 dataagent 标签页里就地导航：优先当前激活的，否则最近访问的。
-  try {
-    const tabs = SCOPE ? await chrome.tabs.query({ url: SCOPE }) : [];
-    const usable = tabs.filter((t) => typeof t.id === "number" && !t.discarded);
-    if (usable.length) {
-      const target = usable.find((t) => t.active)
-        || usable.slice().sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
-      // DataAgent 是单页应用，换 URL 就等于切会话；同一标签页不丢登录态
-      await chrome.tabs.update(target.id, { url, active: true });
-      if (typeof target.windowId === "number") {
-        await chrome.windows.update(target.windowId, { focused: true }).catch(() => {});
-      }
-      return "navigated";
-    }
-  } catch (_) {}
-
+  // 这个会话没有自己的标签页。就用新标签打开，不去改动用户已经打开的页面：
+  // 覆盖式导航看似省一个标签，但会把用户正在看的会话换掉，行为不可预期。
+  // 上面两次查找已经按 URL 全量扫过，所以「找不到」是真的没有，不是映射过期。
   await chrome.tabs.create({ url, active: true });
   return "created";
 }
