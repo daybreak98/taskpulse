@@ -1574,29 +1574,30 @@ final class PollerRunner {
             dbg("poller: 缺 runtime.json（安装未完成？），不自动启动")
             return
         }
-        let port = rt.port ?? 8899
-        // 端口上已经有服务（上次没退干净、或用户自己在终端跑着）：不重复拉起
-        serviceAlive(port: port) { [weak self] alive in
-            guard let self, !self.stopped else { return }
-            if alive {
-                dbg("poller: 已有服务在 127.0.0.1:\(port)，不重复启动")
-                return
-            }
-            self.spawn(rt)
-        }
+        start(rt)
     }
 
     /// 用首次初始化的结果启动（不读 runtime.json，避免刚写完文件的时序问题）
     func start(with plan: Bootstrap.Plan) {
-        guard !stopped else { return }
-        let rt = Runtime(uv: plan.uv, poller: plan.poller, port: plan.port, args: plan.args)
-        serviceAlive(port: plan.port) { [weak self] alive in
-            guard let self, !self.stopped else { return }
-            if alive {
-                dbg("poller: 已有服务在 127.0.0.1:\(plan.port)，不重复启动")
-                return
+        start(Runtime(uv: plan.uv, poller: plan.poller, port: plan.port, args: plan.args))
+    }
+
+    private func start(_ rt: Runtime, recheck: Bool = true) {
+        let port = rt.port ?? 8899
+        guard !stopped, proc?.isRunning != true else { return }
+        serviceAlive(port: port) { [weak self] alive in
+            guard let self, !self.stopped, self.proc?.isRunning != true else { return }
+            if !alive {
+                self.spawn(rt)
+            } else if recheck {
+                // 旧 App 被强制退出时，旧取数进程可能还在等下一次宿主检查（每 2 秒）。
+                // 只复查一次；手工启动且持续在线的服务仍可沿用。
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    self?.start(rt, recheck: false)
+                }
+            } else {
+                dbg("poller: 已有服务在 127.0.0.1:\(port)，不重复启动")
             }
-            self.spawn(rt)
         }
     }
 
@@ -1829,16 +1830,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             throw installError("复制的 App 缺少可执行文件。")
         }
 
-        // 先完整复制，再结束正在使用安装路径的旧进程。别结束其他目录里的安装器。
-        let others = taskPulseInstances().filter { $0.bundleURL.map(bundlePath) == bundlePath(target) }
-        for instance in others { instance.terminate() }
-        let deadline = Date().addingTimeInterval(3)
-        while others.contains(where: { !$0.isTerminated }) {
-            guard Date() < deadline else {
-                throw installError("旧版 TaskPulse 尚未退出。请退出旧版后重试。")
-            }
-            usleep(100_000)
-        }
+        try stopInstalledApp(at: target)
 
         if !fm.fileExists(atPath: target.path) {
             try fm.moveItem(at: incoming, to: target)
@@ -1856,6 +1848,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 throw installError("替换失败：\(installFailure.localizedDescription)。旧版备份：\(backup.path)")
             }
             throw installFailure
+        }
+    }
+
+    private static func stopInstalledApp(at target: URL) throws {
+        let targetPath = bundlePath(target)
+        func running() -> [NSRunningApplication] {
+            (taskPulseInstances() + taskPulseInstances(bundleIdentifier: "com.taskpulse.ui")).filter { app in
+                guard app.bundleURL.map(bundlePath) == targetPath, app.processIdentifier > 0 else { return false }
+                return kill(app.processIdentifier, 0) == 0 || errno != ESRCH
+            }
+        }
+
+        func waitForExit(seconds: Int) -> [NSRunningApplication] {
+            let deadline = DispatchTime.now() + .seconds(seconds)
+            var instances = running()
+            while !instances.isEmpty && DispatchTime.now() < deadline {
+                usleep(100_000)
+                instances = running()
+            }
+            return instances
+        }
+
+        let old = running()
+        guard !old.isEmpty else { return }
+        for instance in old { instance.terminate() }
+
+        let remaining = waitForExit(seconds: 4)
+        guard !remaining.isEmpty else { return }
+        for instance in remaining {
+            dbg("自我安装：强制退出旧版 TaskPulse pid=\(instance.processIdentifier)")
+            instance.forceTerminate()
+        }
+
+        let stillRunning = waitForExit(seconds: 3)
+        if !stillRunning.isEmpty {
+            let pids = stillRunning.map { String($0.processIdentifier) }.joined(separator: "、")
+            throw installError("旧版 TaskPulse 仍在运行（PID：\(pids)）。请在「活动监视器」结束旧版后重试。")
         }
     }
 
@@ -2676,9 +2705,9 @@ private func bundlePath(_ url: URL) -> String {
     url.standardizedFileURL.resolvingSymlinksInPath().path
 }
 
-private func taskPulseInstances() -> [NSRunningApplication] {
+private func taskPulseInstances(bundleIdentifier: String = "com.hyj.taskpulse") -> [NSRunningApplication] {
     let me = ProcessInfo.processInfo.processIdentifier
-    return NSRunningApplication.runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
+    return NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
         .filter { $0.processIdentifier != me && !$0.isTerminated }
 }
 
