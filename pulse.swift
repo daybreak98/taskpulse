@@ -1653,6 +1653,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // 从「下载」里双击运行：先把自己装到 ~/Applications，
+        // 这样启动台和 Spotlight 才找得到，之后用户从那里打开。
+        if installSelfIfNeeded() { return }
         // 退出按钮会摘掉 LaunchAgent，之后用户双击 App 是「手工启动」的。
         // 若再登录，launchd 也会拉起一个——两个面板叠一起。这里保证只有一个。
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.hyj.taskpulse")
@@ -1711,6 +1714,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 OnboardingController.shared.show()
             }
         }
+    }
+
+    private var installedSelf = false
+
+    /// 把当前这份 App 复制到 ~/Applications 并重启到那里。
+    /// 返回 true 表示本次启动到此为止（调用方直接 return）。
+    ///
+    /// 不覆盖更新的副本：从下载目录又双击了旧 ZIP 时，直接启动已装好的那份，
+    /// 避免把新版盖掉。版本号用 Info.plist 的 CFBundleVersion（构建日期）。
+    private func installSelfIfNeeded() -> Bool {
+        let selfPath = Bundle.main.bundlePath
+        let target = Bootstrap.home + "/Applications/TaskPulse.app"
+        if selfPath == target { return false }
+
+        let fm = FileManager.default
+        let mine = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? ""
+        let existing = (Bundle(path: target)?.infoDictionary?["CFBundleVersion"] as? String) ?? ""
+
+        if !existing.isEmpty && existing >= mine {
+            dbg("已安装 \(existing)（当前 \(mine)），直接启动它")
+            launchLater(target)
+            NSApp.terminate(nil)
+            return true
+        }
+
+        OnboardingController.shared.showInstalling()
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                if fm.fileExists(atPath: target) { try fm.removeItem(atPath: target) }
+                try fm.createDirectory(atPath: (target as NSString).deletingLastPathComponent,
+                                       withIntermediateDirectories: true)
+                try fm.copyItem(atPath: selfPath, toPath: target)
+                DispatchQueue.main.async {
+                    self.launchLater(target)
+                    NSApp.terminate(nil)
+                }
+            } catch {
+                dbg("自我安装失败：\(error)")
+                DispatchQueue.main.async {
+                    // 装不过去也不耽误用：继续在当前路径跑
+                    self.installedSelf = true
+                    OnboardingController.shared.hidePanel()
+                    if Bootstrap.isReady() {
+                        self.poller.startIfNeeded()
+                    } else {
+                        self.runBootstrap()
+                    }
+                }
+            }
+        }
+        return true
+    }
+
+    /// 延迟 1 秒再启动目标 App：本实例要先退出，否则目标的单实例检查会把它挡回去
+    private func launchLater(_ target: String) {
+        let env = ProcessInfo.processInfo.environment
+        let cmd: String
+        if let tpHome = env["TP_HOME"], !tpHome.isEmpty {
+            // 自检：open 不传递环境变量，直接起二进制才能把隔离家目录带过去
+            let bin = target + "/Contents/MacOS/TaskPulse"
+            cmd = "nohup sh -c 'sleep 1; exec \"\(bin)\"' >/dev/null 2>&1 &"
+        } else {
+            cmd = "nohup sh -c \"sleep 1; open -a '\(target)'\" >/dev/null 2>&1 &"
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", cmd]
+        try? p.run()
+        p.waitUntilExit()
     }
 
     private var bootstrapRunning = false

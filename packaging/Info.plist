@@ -17,7 +17,9 @@
   <!-- 必须与 Contents/MacOS/ 下的可执行文件名一致，否则 App 启动即失败 -->
   <key>CFBundleExecutable</key><string>TaskPulse</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleShortVersionString</key><string>2.0</string>
+  <!-- 构建号用日期（build.sh 覆盖），App 自我安装时靠它比较新旧，避免旧副本覆盖新版 -->
+  <key>CFBundleVersion</key><string>0</string>
   <!-- 只在菜单栏显示，不占 Dock：这是后台轮询工具，不是常驻窗口应用 -->
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>13.0</string>

@@ -70,10 +70,11 @@ if [ "${1:-}" = "--terminal" ]; then
   echo "接下来二维码会直接画在这个终端窗口里，用手机上的快手 App 扫它。"
   QR_MODE="terminal"
 else
-  echo "接下来会在屏幕上打开一个浏览器窗口，里面是登录页和二维码，用手机上的快手 App 扫它。"
+  echo "接下来会自动打开一张二维码图片，用手机上的快手 App 扫它。"
+  echo "（图片通常 5-15 秒后弹出；没弹的话，看 ~/.codeflicker/sso/.ks_sso/ 下最新的 png）"
   QR_MODE="browser"
 fi
-echo "二维码有效期约 1 分钟，过期就关掉窗口重跑本脚本。"
+echo "二维码有效期约 1 分钟，过期就重跑本脚本。"
 echo
 read -r -p "准备好了按回车开始..." _
 
@@ -93,6 +94,22 @@ RUN+=(python - "$CFG" "$POLLER_PATH")
 
 LOG="$(mktemp)"
 trap 'rm -f "$LOG"' EXIT
+
+# SDK 的二维码流程是「headless 截图 → 上传 CDN → 打印 markdown 链接」，终端里
+# 只会看到一串 `![](https://...)`，普通用户没法扫。截图本身是落在本机的，
+# 这里盯着它出现就打开预览——不依赖 agent-browser 是否弹窗、也不依赖 CDN。
+QR_DIR="$HOME/.codeflicker/sso/.ks_sso"
+QR_BEFORE="$(ls -t "$QR_DIR"/sso_qr_login_*.png 2>/dev/null | head -1)"
+(
+  for _ in $(seq 1 30); do
+    sleep 2
+    latest="$(ls -t "$QR_DIR"/sso_qr_login_*.png 2>/dev/null | head -1)"
+    if [ -n "$latest" ] && [ "$latest" != "$QR_BEFORE" ]; then
+      open "$latest" 2>/dev/null && break
+    fi
+  done
+) >/dev/null 2>&1 &
+
 env "${QR_ENV[@]}" KS_SSO_DISABLE_HTTP_REPLAY=1 KS_SSO_BROWSER_CMD_TIMEOUT=180 \
   "${RUN[@]}" >"$LOG" 2>&1 <<'PY'
 import importlib.util, os, sys

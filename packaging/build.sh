@@ -30,6 +30,8 @@ trap 'rm -rf "$STAGE"' EXIT
 APP="$STAGE/TaskPulse.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp packaging/Info.plist "$APP/Contents/Info.plist"
+# 构建号用日期：App 自我安装时据此判断新旧，避免把旧副本盖到新版上
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VER" "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
 TMPB="$STAGE/build"

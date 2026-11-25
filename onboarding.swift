@@ -287,6 +287,19 @@ final class OnboardingController {
         beginBootstrap()
     }
 
+    /// 首次从「下载」里运行时，先把 App 自己装进 ~/Applications
+    func showInstalling() {
+        show()
+        renderBootstrapping("安装到「应用程序」文件夹…")
+    }
+
+    /// 自我安装失败时收尾，回到正常流程（名字避开已有的 @objc dismiss）
+    func hidePanel() {
+        panel?.orderOut(nil)
+        panel = nil
+        NSApp.setActivationPolicy(.accessory)
+    }
+
     private func beginBootstrap() {
         renderBootstrapping("检查目录")
         Bootstrap.run(progress: { [weak self] step in
