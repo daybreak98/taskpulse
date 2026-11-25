@@ -69,11 +69,20 @@ func withToken(_ req: inout URLRequest) {
     req.setValue(taskPulseToken(), forHTTPHeaderField: "X-TP-Token")
 }
 
-/// 行为日志：追加到 /tmp/taskpulse-drag.log，用来排查交互问题
+/// 行为日志：追加到 ~/Library/Logs/taskpulse-app.log，用来排查交互问题
 func dbg(_ s: String) {
-    let path = "/tmp/taskpulse-drag.log"
+    // 放用户日志目录：/tmp 重启就没了，用户反馈问题时也找不到。
+    let dir = Bootstrap.home + "/Library/Logs"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let path = dir + "/taskpulse-app.log"
     if !FileManager.default.fileExists(atPath: path) {
         FileManager.default.createFile(atPath: path, contents: nil)
+    }
+    // 长期运行别把磁盘写满：超过 1MB 只留最后 200KB
+    if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+       let size = attrs[.size] as? Int, size > 1_000_000,
+       let data = FileManager.default.contents(atPath: path) {
+        try? data.suffix(200_000).write(to: URL(fileURLWithPath: path))
     }
     guard let h = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) else { return }
     h.seekToEndOfFile()

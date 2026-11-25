@@ -17,6 +17,8 @@
   <!-- 必须与 Contents/MacOS/ 下的可执行文件名一致，否则 App 启动即失败 -->
   <key>CFBundleExecutable</key><string>TaskPulse</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <!-- 启动台/访达里的图标；文件由 build.sh 拷进 Contents/Resources -->
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleShortVersionString</key><string>2.0</string>
   <!-- 构建号用日期（build.sh 覆盖），App 自我安装时靠它比较新旧，避免旧副本覆盖新版 -->
   <key>CFBundleVersion</key><string>0</string>

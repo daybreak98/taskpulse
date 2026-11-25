@@ -63,6 +63,7 @@ cp packaging/api_login.command packaging/api_check.command \
 chmod +x "$RES/api_login.command" "$RES/api_check.command" \
          "$RES/health_check.sh" "$RES/uninstall.command"
 cp -R packaging/vendor/. "$RES/vendor/"
+cp packaging/AppIcon.icns "$RES/"
 echo "   -> 资源 $(du -sh "$RES" | cut -f1)"
 
 echo "== 3/4 签名并校验 =="

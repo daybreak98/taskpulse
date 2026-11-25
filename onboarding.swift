@@ -311,6 +311,8 @@ final class OnboardingController {
                 self.bootstrapReady?(plan)
                 self.renderChoice()
             case let .failure(err):
+                // 失败原因同时写进日志，用户反馈时可以直接发文件
+                dbg("初始化失败：\(err)")
                 self.renderBootstrapFailed("\(err)")
             }
         })

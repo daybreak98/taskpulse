@@ -134,7 +134,7 @@ final class Bootstrap {
             ?? Int((cfg["ui"] as? [String: Any])?["port"] as? String ?? "") ?? 8899
         let args = readUVArgs()
 
-        report("检查取数依赖")
+        report("检查取数依赖（首次要下载，约 10-40 秒）")
         try warmUp(uv: uv, args: args)
 
         report("准备配套脚本")
