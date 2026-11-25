@@ -72,6 +72,7 @@ class PollingTests(unittest.TestCase):
             poller,
             STATE_FILE=str(Path(self.directory) / "state.json"),
             ACTIVE_FILE=str(Path(self.directory) / "active.json"),
+            _open_visit_until={},  # 每个测试独立模拟一个桌面后台进程
             # 身份密钥也指到临时目录：绝不能碰本机真实的那一份
             TOKEN_FILE=str(Path(self.directory) / "token"),
             CONV_URL="https://agent.example.com/chat?conversationId={cid}",
@@ -763,6 +764,21 @@ class PollingTests(unittest.TestCase):
         poller.save_state({"tasks": {"1": task}})
         poller._confirm_open("1", NOW, "run:new")
         self.assertEqual(poller.load_state()["tasks"]["1"]["status"], "stuck")
+
+    def test_programmatic_activation_does_not_clear_pending_reply(self):
+        task = {"id": 1, "status": "attention", "reply_pending": True,
+                "update_ms": NOW, "reply_version": "run:new",
+                "url": "https://agent.example.com/chat?conversationId=1"}
+        poller.save_state({"tasks": {"1": task}})
+        poller._open_visit_until["1"] = time.monotonic() + 15
+        with self.serve() as url:
+            response = self.auth().post(url + "/active", json={"url": task["url"]}, timeout=2)
+            self.assertFalse(response.json()["ok"])
+            self.assertTrue(poller.load_state()["tasks"]["1"]["reply_pending"])
+            poller._open_visit_until.clear()
+            response = self.auth().post(url + "/active", json={"url": task["url"]}, timeout=2)
+            self.assertTrue(response.json()["ok"])
+            self.assertFalse(poller.load_state()["tasks"]["1"]["reply_pending"])
 
     def test_browser_heartbeat_keeps_other_browser_tab_and_focus(self):
         with patch.multiple(poller, _tab_ids={}, _tab_browser={}, _tab_groups={},
