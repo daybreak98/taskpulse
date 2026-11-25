@@ -19,7 +19,7 @@ fi
 BODY="$(mktemp)" || exit 1
 trap 'rm -f "$BODY"' EXIT
 
-# --fail-with-body：HTTP >= 400 时返回非零（22），同时仍把响应体写进 $BODY，
+# --fail-with-body：HTTP >= 400 时返回非零（22），同时仍把响应体写进 ${BODY}，
 # 这样既能判失败，又能在需要时把服务端错误原文带出来；--max-time 3 防止安装流程被卡死。
 # stderr 丢掉，结论由本脚本自己拼成一行，避免 curl 的原始报错刷屏。
 # 本机服务要鉴权（X-TP-Token）。探针自己读密钥文件，否则裸 curl 会拿到 401，

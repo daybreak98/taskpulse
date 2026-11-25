@@ -43,10 +43,10 @@ fi
 
 if [ -n "$UV_BIN" ]; then
   if "$UV_BIN" --version >/dev/null 2>&1; then
-    echo "-- 用本机已有的 uv：$UV_BIN（$("$UV_BIN" --version 2>/dev/null)）"
+    echo "-- 用本机已有的 uv：${UV_BIN}（$("$UV_BIN" --version 2>/dev/null)）"
   else
-    echo "-- 发现 $UV_BIN，但跑不起来"
-    ask_use_bundled "本机已有的 uv（$UV_BIN）无法运行，可能是文件损坏或架构不符（本机 $ARCH）。
+    echo "-- 发现 ${UV_BIN}，但跑不起来"
+    ask_use_bundled "本机已有的 uv（${UV_BIN}）无法运行，可能是文件损坏或架构不符（本机 ${ARCH}）。
 安装包自带一份 $ARCH 的 uv 可以用。要改用自带的吗？" || {
       echo "!! 已停止。修好本机的 uv 后重跑本脚本即可。"
       exit 1
@@ -57,7 +57,7 @@ fi
 
 if [ -z "$UV_BIN" ]; then
   if [ -s "$VENDOR/uv-$UV_ARCH.gz" ]; then
-    echo "-- 解压安装包自带的 uv（$UV_ARCH，约 30MB）..."
+    echo "-- 解压安装包自带的 uv（${UV_ARCH}，约 30MB）..."
     mkdir -p "$HOME/.local/bin"
     gunzip -c "$VENDOR/uv-$UV_ARCH.gz" > "$HOME/.local/bin/uv.tmp" \
       && chmod +x "$HOME/.local/bin/uv.tmp" \
@@ -84,7 +84,7 @@ else
   PY_NAME="cpython-${PY_VERSION}-macos-${UV_ARCH}-none"
   if [ -n "$PY_VERSION" ] && [ -s "$VENDOR/python-$UV_ARCH.tar.xz" ]; then
     PY_DIR="$("$UV_BIN" python dir 2>/dev/null || echo "$HOME/.local/share/uv/python")/$PY_NAME"
-    echo "-- 本机没有可用的 Python，解压自带的 $PY_VERSION（$UV_ARCH，约 80MB）..."
+    echo "-- 本机没有可用的 Python，解压自带的 ${PY_VERSION}（${UV_ARCH}，约 80MB）..."
     mkdir -p "$PY_DIR"
     if tar -xJf "$VENDOR/python-$UV_ARCH.tar.xz" -C "$PY_DIR" \
        && UV_FOUND="$("$UV_BIN" python find '>=3.10' 2>/dev/null)"; then
@@ -292,7 +292,7 @@ chmod 600 "$TOKEN_FILE" 2>/dev/null || true
 # 密钥里不会有空白，顺手把尾随换行去掉
 TP_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE" 2>/dev/null || true)"
 if [ -z "$TP_TOKEN" ]; then
-  echo "!! 读不到本机接口密钥（$TOKEN_FILE）：扩展和 App 会被本机服务拒绝（401）"
+  echo "!! 读不到本机接口密钥（${TOKEN_FILE}）：扩展和 App 会被本机服务拒绝（401）"
   echo "   检查该文件是否可读，或删掉后重新运行本脚本"
 fi
 
