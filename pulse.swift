@@ -1900,13 +1900,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let h0: CGFloat = pinnedStart ? 132 : 84
         let top = saved?.y ?? (vf.maxY - 22)
 
-        // 记住上次贴的是哪条边，重启后按同一条边对齐（不再沿用展开态的 x）
+        // 记住上次贴的是哪条边，重启后按同一条边对齐
         let side = d.string(forKey: "anchorSide") ?? "right"
         var left = saved?.x ?? (vf.maxX - w0 - 4)
-        if side == "right" {
-            left = vf.maxX - w0
-        } else if side == "left" {
-            left = vf.minX
+        if saved == nil {
+            // 首次启动：贴主屏那条边
+            if side == "right" { left = vf.maxX - w0 } else if side == "left" { left = vf.minX }
+        } else if side == "right" || side == "left" {
+            // 有保存位置：在「它所在那块屏」上对齐同一条边。
+            // 以前这里一律用主屏 vf，副屏上的位置每次重启都被拽回主屏。
+            let probe = NSRect(x: left, y: top - h0, width: w0, height: h0)
+            let screen = screenFor(probe)
+            left = (side == "right") ? screen.maxX - w0 : screen.minX
         }
 
         panel = NSPanel(contentRect: NSRect(x: left, y: top - h0, width: w0, height: h0),
@@ -2002,7 +2007,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard panel != nil else { return }
         let d = UserDefaults.standard
         let f = panel.frame
-        let v = visibleFrame()
+        let v = screenFor(f)
         d.set(f.origin.x, forKey: "anchorX")
         d.set(f.maxY, forKey: "anchorTop")
         let side = abs(f.maxX - v.maxX) <= 8 ? "right" : (abs(f.minX - v.minX) <= 8 ? "left" : "none")
@@ -2205,8 +2210,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func finishDrag() {
-        let v = visibleFrame()
         let f = panel.frame
+        // 必须在「窗口所在的那块屏」上判断贴边：副屏在主屏右侧时，
+        // 窗口的 x 远大于主屏 maxX，用主屏判断会误判成「贴右边缘」，
+        // 一松手就被吸回主屏。
+        let v = screenFor(f)
         // 越过屏幕边缘（maxX > v.maxX 等）同样算贴边，不能用 abs 判断
         let nearRight = f.maxX >= v.maxX - EDGE_SNAP
         let nearLeft = f.minX <= v.minX + EDGE_SNAP
@@ -2235,7 +2243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 nf.origin.x = min(max(f.minX, v.minX), v.maxX - w)
             }
             nf.origin.y = f.maxY - h
-            // 兜底：不许跑出主屏
+            // 兜底：不许跑出当前这块屏
             nf.origin.x = min(max(nf.origin.x, v.minX), max(v.minX, v.maxX - w))
             nf.origin.y = min(max(nf.origin.y, v.minY), max(v.minY, v.maxY - h))
             applying = true
@@ -2370,7 +2378,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 最新一条在最上面，越旧越往下，叠压 20pt
     func layoutToasts() {
         let w: CGFloat = 288, h: CGFloat = 64
-        let v = visibleFrame()
+        // 提示条跟随小窗所在的屏幕：小窗在副屏时，提示条也该出现在副屏
+        let v = screenFor(panel?.frame ?? NSRect(x: 0, y: 0, width: 1, height: 1))
         let step: CGFloat = 44
         for (i, t) in toasts.enumerated() {
             let y = v.maxY - h - 14 - CGFloat(i) * step
