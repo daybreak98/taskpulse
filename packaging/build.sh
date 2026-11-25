@@ -57,7 +57,7 @@ for f in "$PWD"/edge-ext/*; do
 done
 # 配套脚本：小窗里的「扫码重新授权」、自查、卸载都指向安装目录里的这几个
 cp packaging/api_login.command packaging/api_check.command \
-   packaging/health_check.sh packaging/uninstall.command "$RES/"
+   packaging/api_runtime.sh packaging/health_check.sh packaging/uninstall.command "$RES/"
 chmod +x "$RES/api_login.command" "$RES/api_check.command" \
          "$RES/health_check.sh" "$RES/uninstall.command"
 cp -R packaging/vendor/. "$RES/vendor/"

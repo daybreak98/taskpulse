@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 /// 首次启动时把运行环境准备到用户目录：配置、密钥、uv、Python、扩展文件。
 ///
@@ -61,23 +62,24 @@ final class Bootstrap {
         return true
     }
 
-    /// 已初始化时，每次启动把 runtime.json 里的路径对齐到当前 App 位置。
-    /// App 被移动/改名后，旧路径会指向不存在的文件；这里顺手纠正，不用重跑初始化。
-    static func refreshPaths() {
+    /// 已初始化时，对齐当前 App 的后台路径和配套脚本。
+    static func refreshPaths() -> Bool {
         let fm = FileManager.default
         guard let data = fm.contents(atPath: runtimePath),
-              var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+              var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let uv = obj["uv"] as? String, fm.isExecutableFile(atPath: uv) else { return false }
         let poller = resources + "/poller.py"
-        guard fm.fileExists(atPath: poller) else { return }
-        obj["poller"] = poller
-        if let uv = obj["uv"] as? String, !fm.isExecutableFile(atPath: uv) {
-            // uv 也没了：删掉 runtime 让上层重新初始化
-            try? fm.removeItem(atPath: runtimePath)
-            return
-        }
-        if let d = try? JSONSerialization.data(withJSONObject: obj,
-                                               options: [.prettyPrinted, .sortedKeys]) {
-            try? d.write(to: URL(fileURLWithPath: runtimePath))
+        guard fm.fileExists(atPath: poller) else { return false }
+        do {
+            if obj["poller"] as? String != poller {
+                obj["poller"] = poller
+                let updated = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+                try updated.write(to: URL(fileURLWithPath: runtimePath), options: .atomic)
+            }
+            try syncScripts()
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -311,14 +313,22 @@ final class Bootstrap {
         let fm = FileManager.default
         let dest = (extDir as NSString).deletingLastPathComponent
         try? fm.createDirectory(atPath: dest, withIntermediateDirectories: true)
-        for name in ["api_login.command", "api_check.command", "health_check.sh", "uninstall.command"] {
+        for name in ["api_runtime.sh", "api_login.command", "api_check.command", "health_check.sh", "uninstall.command"] {
             let from = resources + "/" + name
             guard fm.fileExists(atPath: from) else { continue }
             let to = dest + "/" + name
-            if fm.fileExists(atPath: to) { try? fm.removeItem(atPath: to) }
+            if fm.isExecutableFile(atPath: to), fm.contentsEqual(atPath: from, andPath: to) { continue }
             do {
-                try fm.copyItem(atPath: from, toPath: to)
-                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: to)
+                let staged = URL(fileURLWithPath: to + "." + UUID().uuidString + ".tmp")
+                defer { try? fm.removeItem(at: staged) }
+                try fm.copyItem(at: URL(fileURLWithPath: from), to: staged)
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: staged.path)
+                if fm.fileExists(atPath: to) {
+                    _ = try fm.replaceItemAt(URL(fileURLWithPath: to), withItemAt: staged,
+                                             options: .usingNewMetadataOnly)
+                } else {
+                    try fm.moveItem(at: staged, to: URL(fileURLWithPath: to))
+                }
             } catch {
                 throw BootstrapError.step("准备配套脚本", "\(name)：\(error.localizedDescription)")
             }

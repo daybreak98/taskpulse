@@ -261,7 +261,7 @@ cp poller.py "$DEST/"
 rm -rf "$DEST/edge-ext"
 cp -R edge-ext "$DEST/"
 # 配套脚本都留一份到安装目录：用户以后自查、登录、卸载，都不必再找回当初解压的包
-for f in uninstall.command health_check.sh api_check.command api_login.command; do
+for f in uninstall.command health_check.sh api_check.command api_login.command api_runtime.sh; do
   [ -f "$f" ] && cp "$f" "$DEST/" && chmod +x "$DEST/$f"
 done
 

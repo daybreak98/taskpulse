@@ -1667,10 +1667,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refresh()
         // 首次打开：先把运行环境准备到用户目录（原来由 install.command 做），
         // 之后再起后台。已经初始化过的机器直接起，跳过一次额外检查。
-        if Bootstrap.isReady() {
-            // 先纠正 runtime.json 里的路径（App 可能被移动过）
-            Bootstrap.refreshPaths()
-            if Bootstrap.isReady() { poller.startIfNeeded() } else { runBootstrap() }
+        if Bootstrap.isReady() && Bootstrap.refreshPaths() {
+            poller.startIfNeeded()
         } else {
             runBootstrap()
         }

@@ -9,16 +9,11 @@ cd "$(dirname "$0")" || exit 1
 
 CFG="$HOME/.taskpulse/config.json"
 TOOLS="$HOME/.taskpulse/tools"
-UV="$HOME/.local/bin/uv"
-[ -x "$UV" ] || UV="$(command -v uv || true)"
 AB_VERSION="0.44.0"
 
 echo "== TaskPulse 首次登录 =="
 
-if [ -z "$UV" ]; then
-  echo "!! 找不到 uv（安装程序会自带）。请先双击 install.command，或用「重新打开安装引导」修复。"
-  exit 1
-fi
+. ./api_runtime.sh || exit 1
 
 # 1) 找一个可用的 agent-browser：PATH 里已有的优先
 if ! command -v agent-browser >/dev/null 2>&1; then
@@ -92,11 +87,9 @@ case "$QR_MODE" in
   terminal) QR_ENV=(KS_SSO_QR_TERMINAL=1) ;;
   *)        QR_ENV=(AGENT_BROWSER_HEADED=1) ;;
 esac
-RUN=("$UV" run --quiet --no-project --python ">=3.10")
+RUN=("${API_RUN[@]}")
 [ "$QR_MODE" = "terminal" ] && RUN+=(--with segno)
-RUN+=(--with 'ks-aimate>=1.4.0'
-      --index https://pypi.corp.kuaishou.com/kuaishou/prod/+simple/
-      python - "$CFG")
+RUN+=(python - "$CFG" "$POLLER_PATH")
 
 LOG="$(mktemp)"
 trap 'rm -f "$LOG"' EXIT
@@ -104,7 +97,7 @@ env "${QR_ENV[@]}" KS_SSO_DISABLE_HTTP_REPLAY=1 KS_SSO_BROWSER_CMD_TIMEOUT=180 \
   "${RUN[@]}" >"$LOG" 2>&1 <<'PY'
 import importlib.util, os, sys
 os.environ["TASKPULSE_CONFIG"] = sys.argv[1]
-spec = importlib.util.spec_from_file_location("tp", "poller.py")
+spec = importlib.util.spec_from_file_location("tp", sys.argv[2])
 m = importlib.util.module_from_spec(spec)
 try:
     spec.loader.exec_module(m)
