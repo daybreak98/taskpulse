@@ -1676,4 +1676,6 @@ test("top drag switches to a horizontal capsule, side drag restores vertical; pa
   const clamped = ui.glassLayout(top, 320, 180, true, 1000);
   assert.ok(clamped.left >= 0 && clamped.top >= 0 && clamped.left + clamped.width <= 320 && clamped.top + clamped.height <= 180);
   assert.ok(ui.glassClip(b).startsWith("path('M"));
+  assert.ok(ui.glassClip(b).includes("A16 16 0 0 1"));
+  assert.ok(ui.glassClip(b).includes("A12 12 0 0 1"));
 });

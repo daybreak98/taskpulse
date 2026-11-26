@@ -42,7 +42,7 @@
       <i class="glass-bridge" aria-hidden="true" hidden></i>
       <section class="panel" id="tp-conversations" aria-label="会话列表" hidden>
         <header class="header">
-          <span class="panel-title">TaskPulse</span>
+          ${side ? counter("horizontal") : '<span class="panel-title">TaskPulse</span>'}
           <button type="button" class="header-blank" aria-label="拖动面板或双击切换全部分组" title="拖动 · 双击切换分组"></button>
           <div class="source group-mode" role="group" aria-label="分组方式">
             <button type="button" data-mode="dataagent" aria-label="DataAgent 分组" title="DataAgent 内部分组">DA</button>

@@ -74,12 +74,21 @@
     return { left, top, width, height, horizontal, capsule: local(cap), panel: local(panel),
       bridge: local(bridge), relation };
   }
-  // Clip the iframe's rectangular hit area to the actual surfaces and the
-  // small hover bridge. The glass rounded corners remain transparent.
+  // Clip to the rounded shapes, not to their bounding rectangles: a
+  // rectangular iframe clip leaves visibly cut-off shadow corners on light pages.
   function glassClip(layout) {
-    const path = [layout.capsule, layout.panel, layout.bridge].filter(Boolean).map(r =>
-      "M" + r.left + " " + r.top + "h" + r.width + "v" + r.height + "h-" + r.width + "Z").join(" ");
-    return "path('" + path + "')";
+    const rounded = (r, radius) => {
+      const x = r.left, y = r.top, right = x + r.width, bottom = y + r.height;
+      const k = Math.min(radius, r.width / 2, r.height / 2);
+      if (!k) return "M" + x + " " + y + "H" + right + "V" + bottom + "H" + x + "Z";
+      const arc = (a, b) => "A" + k + " " + k + " 0 0 1 " + a + " " + b;
+      return "M" + (x + k) + " " + y + "H" + (right - k) + arc(right, y + k) +
+        "V" + (bottom - k) + arc(right - k, bottom) + "H" + (x + k) +
+        arc(x, bottom - k) + "V" + (y + k) + arc(x + k, y) + "Z";
+    };
+    return "path('" + [rounded(layout.capsule, 999),
+      layout.panel && rounded(layout.panel, 12), layout.bridge && rounded(layout.bridge, 0)]
+      .filter(Boolean).join(" ") + "')";
   }
   function ordinary(value) {
     try {
