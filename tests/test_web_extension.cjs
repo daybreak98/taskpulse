@@ -1,0 +1,1287 @@
+const assert = require("node:assert/strict");
+const test = require("node:test");
+const fs = require("node:fs");
+const vm = require("node:vm");
+const path = require("node:path");
+const { webcrypto } = require("node:crypto");
+
+require("../taskpulse-ext/config.js");
+require("../taskpulse-ext/state.js");
+const web = globalThis.TaskPulseWeb;
+const rules = globalThis.TaskPulseState;
+const ext = path.join(__dirname, "../taskpulse-ext");
+const manifest = require("../taskpulse-ext/manifest.json");
+const now = 1_760_000_000_000;
+const old = now - 20_000;
+const id = "42";
+const agent = "515";
+const row = (updateTime = old, createTime = old, agentId = agent) => ({
+  id, agentId, name: "核对订单分区", groupName: "数据质量", updateTime, createTime
+});
+const message = (updateTime, at, messageId, more = {}) => ({
+  sender: "assistant", updateTime, messageId, at, ...more
+});
+const report = (at, conversation, options = {}) => ({
+  at, listAt: options.listAt ?? at, error: options.error ?? "",
+  conversations: [conversation],
+  queues: options.busy === null ? {} : { [id]: { sessionState: options.busy ? "BUSY" : "IDLE", pending: [] } },
+  queueAt: options.busy === null ? {} : { [id]: options.queueAt ?? at },
+  queueErrors: options.queueError ? { [id]: at } : {},
+  messageErrors: options.messageError ? { [id]: at } : {},
+  lastMessages: options.message ? { [id]: options.message } : {}
+});
+
+function timeline() {
+  let state = rules.blank();
+  return {
+    next(packet, active = "") {
+      const result = rules.absorb(state, packet, packet.at, active);
+      state = result.state;
+      return { ...result, task: state.tasks[id] };
+    },
+    restore(saved) { state = JSON.parse(JSON.stringify(saved)); }
+  };
+}
+
+test("first successful list seeds historical replies quietly but shows running tasks", () => {
+  const { next } = timeline();
+  const historical = next(report(now, row(), { message: message(old, now, "prior") }));
+  assert.equal(historical.task.status, "seen");
+  assert.equal(historical.task.acked, old);
+  assert.equal(historical.replies.length, 0);
+  const busy = next(report(now + 5_000, row(), { busy: true }));
+  assert.equal(busy.task.status, "running");
+  assert.equal(busy.task.runAt, now + 5_000);
+  assert.equal(rules.queueBusy({ sessionState: "IDLE", pending: [] }), false);
+});
+
+test("短任务回归：队列先空闲仍保留运行中，列表和回复补齐后只通知一次", () => {
+  const tracker = timeline();
+  tracker.next(report(now, row(), { message: message(old, now, "prior") }));
+  tracker.next(report(now + 2_000, row(), { busy: true }));
+  const early = tracker.next(report(now + 8_000, row(), { message: message(old, now + 8_000, "prior") }));
+  assert.equal(early.task.status, "running");
+  assert.equal(early.task.settleUntil, now + 98_000);
+  assert.equal(early.replies.length, 0);
+
+  const update = now + 10_000;
+  const changed = tracker.next(report(now + 14_000, row(update), { message: message(update, now + 14_000, "new") }));
+  assert.equal(changed.task.status, "attention");
+  assert.equal(changed.replies.length, 1);
+  tracker.restore(changed.state);
+  const repeated = tracker.next(report(now + 18_000, row(update), {
+    listAt: now + 14_000, queueAt: now + 14_000,
+    message: message(update, now + 14_000, "new")
+  }));
+  assert.equal(repeated.replies.length, 0);
+  assert.equal(repeated.task.observedAt, now + 14_000);
+  assert.equal(repeated.task.replyKey, changed.task.replyKey);
+});
+
+test("有独立消息证据时立即提醒，列表补齐后不重复通知", () => {
+  const { next } = timeline();
+  next(report(now, row(), { busy: true }));
+  const updated = now + 4_000;
+  const early = next(report(now + 6_000, row(), {
+    message: message(old, now + 6_000, "reply", { atMessage: updated })
+  }));
+  assert.equal(early.task.status, "attention");
+  assert.equal(early.replies.length, 1);
+  const complete = next(report(now + 30_000, row(updated), {
+    message: message(updated, now + 30_000, "reply", { atMessage: updated })
+  }));
+  assert.equal(complete.task.status, "attention");
+  assert.equal(complete.replies.length, 0);
+  assert.equal(rules.revision(complete.task), rules.revision(early.task));
+});
+
+test("仅有用户消息或未知队列时不发新回复通知", () => {
+  const { next } = timeline();
+  next(report(now, row()));
+  let current = next(report(now + 4_000, row(now + 3_000), {
+    message: message(now + 3_000, now + 4_000, "user", { sender: "other" })
+  }));
+  assert.equal(current.task.status, "seen");
+  assert.equal(current.replies.length, 0);
+  current = next(report(now + 8_000, row(now + 7_000), { busy: null }));
+  assert.equal(current.replies.length, 0);
+  assert.equal(current.task.observedAt, now + 4_000);
+});
+
+test("历史队列样本不续期，错误和空名单分开处理", () => {
+  const { next } = timeline();
+  const first = next(report(now, row(), { busy: true }));
+  const heartbeat = now + 130_000;
+  const repeat = next(report(heartbeat, row(), { listAt: now, queueAt: now, busy: true }));
+  assert.equal(repeat.task.observedAt, now);
+  assert.equal(rules.view(repeat.state, heartbeat).counts.running, 0);
+  const error = next(report(heartbeat + 1, row(), {
+    listAt: now, queueAt: now, error: "HTTP 401", queueError: true
+  }));
+  assert.equal(error.task.status, first.task.status);
+  assert.equal(rules.view(error.state, heartbeat + 1).stale, true);
+  const empty = next({ ...report(heartbeat + 2, row()), conversations: [] });
+  assert.deepEqual(rules.view(empty.state, heartbeat + 2).tasks, []);
+});
+
+test("会话正在前台查看时记已查看，跨轮回复继续分别计数", () => {
+  const { next } = timeline();
+  next(report(now, row()));
+  const update1 = now + 1_000;
+  const focused = next(report(now + 5_000, row(update1), { message: message(update1, now + 5_000, "v1") }), id);
+  assert.equal(focused.task.status, "seen");
+  assert.equal(focused.replies.length, 0);
+  const update2 = now + 9_000;
+  const away = next(report(now + 10_000, row(update2), { message: message(update2, now + 10_000, "v2") }));
+  assert.equal(away.task.status, "attention");
+  assert.equal(away.replies.length, 1);
+});
+
+test("长运行和频繁拉取重播的时间基线独立", () => {
+  const { next } = timeline();
+  next(report(now, row(), { busy: true }));
+  const threshold = now + 30 * 60_000;
+  const stuck = next(report(threshold, row(), { busy: true }));
+  assert.equal(stuck.task.status, "stuck");
+  const wake = next(report(threshold + 31 * 60_000, row(), { busy: true }));
+  assert.equal(wake.task.status, "running");
+  assert.equal(wake.task.runAt, threshold + 31 * 60_000);
+});
+
+test("同一回复的限流标记不会随相同列表重播或少一份消息而清掉", () => {
+  const { next } = timeline();
+  next(report(now, row()));
+  const update = now + 1_000;
+  const failed = next(report(now + 4_000, row(update), {
+    message: message(update, now + 4_000, "fail", { failed: true })
+  }));
+  assert.equal(failed.task.status, "stuck");
+  assert.equal(failed.replies.length, 1);
+  const repeat = next(report(now + 8_000, row(update)));
+  assert.equal(repeat.task.status, "stuck");
+  assert.equal(repeat.replies.length, 0);
+});
+
+test("路径验证和扩展权限限制在 DataAgent", () => {
+  assert.equal(web.conversationId(web.conversationUrl(id, agent)), id);
+  assert.equal(web.conversationId(web.page + "-share?conversationId=" + id), "");
+  assert.equal(web.conversationId("https://example.com/?next=" + web.page + "&conversationId=" + id), "");
+  assert.equal(web.conversationId(web.page + "?conversationId=42x"), "");
+  assert.deepEqual(manifest.host_permissions, ["https://dataagent.corp.kuaishou.com/*"]);
+  assert.equal(manifest.content_scripts[0].matches[0], web.match);
+  for (const file of [manifest.background.service_worker, ...manifest.content_scripts[0].js, manifest.icons["128"]]) {
+    assert.ok(fs.existsSync(path.join(ext, file)));
+  }
+});
+
+function worker(seed = {}) {
+  const event = () => {
+    const listeners = [];
+    return {
+      addListener: fn => listeners.push(fn),
+      removeListener(fn) { const index = listeners.indexOf(fn); if (index >= 0) listeners.splice(index, 1); },
+      listeners
+    };
+  };
+  const local = { data: structuredClone(seed.local || {}) }, session = { data: structuredClone(seed.session || {}) };
+  for (const store of [local, session]) {
+    store.get = async key => ({ [key]: structuredClone(store.data[key]) });
+    store.set = async data => Object.assign(store.data, structuredClone(data));
+    store.remove = async key => { delete store.data[key]; };
+  }
+  const notices = new Map(seed.notices || []);
+  const tabs = [{ id: 7, windowId: 1, url: web.page, active: true, status: "complete" }];
+  const sender = { id: "unit", frameId: 0, tab: tabs[0], url: web.page };
+  const chrome = {
+    storage: { local, session },
+    runtime: {
+      id: "unit", getManifest: () => manifest, getURL: file => file,
+      onMessage: event(), onInstalled: event(), onStartup: event()
+    },
+    action: { onClicked: event(), setBadgeText: async () => {} },
+    notifications: {
+      onClicked: event(), onClosed: event(), getPermissionLevel: async () => "granted",
+      create: async (key, value) => notices.set(key, value),
+      clear: async key => notices.delete(key), getAll: async () => Object.fromEntries(notices)
+    },
+    windows: {
+      getLastFocused: async () => ({ id: 1, focused: true }),
+      update: async () => ({ focused: true })
+    },
+    tabs: {
+      onUpdated: event(), onRemoved: event(), onActivated: event(),
+      sendMessage: async () => null,
+      query: async query => query.active ? tabs.filter(tab => tab.active) : tabs,
+      get: async tabId => structuredClone(tabs.find(tab => tab.id === tabId)),
+      create: async ({ url, active = true }) => {
+        if (active) for (const tab of tabs) tab.active = false;
+        const created = { id: tabs.length + 100, windowId: 1, url, status: "complete", active };
+        tabs.push(created);
+        return created;
+      },
+      update: async tabId => {
+        for (const tab of tabs) tab.active = tab.id === tabId;
+        return structuredClone(tabs.find(tab => tab.id === tabId));
+      }
+    },
+    alarms: { onAlarm: event() }
+  };
+  chrome.windows.onFocusChanged = event();
+  let stamp = now;
+  class Clock extends Date { static now() { return stamp; } }
+  const context = vm.createContext({ chrome, URL, console, crypto: webcrypto, setTimeout, clearTimeout, Date: Clock });
+  context.importScripts = (...files) => files.forEach(file =>
+    vm.runInContext(fs.readFileSync(path.join(ext, file), "utf-8"), context, { filename: file }));
+  context.importScripts("background.js");
+
+  session.data[web.keys.leader] = { pageId: "page", lease: "one", tabId: 7 };
+  function send(msg, from = sender) {
+    return new Promise(resolve => {
+      if (!chrome.runtime.onMessage.listeners[0](msg, from, resolve)) resolve(undefined);
+    });
+  }
+  function deliver(payload, lease = "one") {
+    stamp = payload.at;
+    return send({ kind: "tp.webstate", pageId: "page", lease, payload });
+  }
+  return { tabs, sender, send, deliver, notices, local, session, chrome };
+}
+
+test("worker rejects the old page lease and reuses a correctly verified conversation", async () => {
+  const app = worker();
+  assert.equal((await app.deliver(report(now, row()), "retired")).ok, false);
+  assert.equal(app.local.data[web.keys.state], undefined);
+  await app.deliver(report(now, row()));
+  await app.deliver(report(now + 5_000, row(now + 1_000), {
+    message: message(now + 1_000, now + 5_000, "v1")
+  }));
+  assert.equal(app.notices.size, 1);
+  const ticket = [...app.notices.keys()][0];
+  app.tabs.push({ id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete" });
+  const opened = await app.send({ kind: "tp.open", id, revision: ticket.slice("tp-reply:".length) });
+  assert.equal(opened.ok, true);
+  assert.equal(app.tabs.length, 2);
+  assert.equal(app.local.data[web.keys.state].tasks[id].status, "seen");
+});
+
+test("stale jump ticket can navigate but does not mark a newer reply as seen", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  await app.deliver(report(now + 6_000, row(now + 4_000), {
+    message: message(now + 4_000, now + 6_000, "v1")
+  }));
+  const ticket = [...app.notices.keys()][0];
+  await app.deliver(report(now + 20_000, row(now + 16_000), {
+    message: message(now + 16_000, now + 20_000, "v2")
+  }));
+  app.chrome.notifications.onClicked.listeners[0](ticket);
+  for (let i = 0; i < 40 && app.notices.has(ticket); i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(app.notices.has(ticket), false);
+  assert.equal(app.tabs[1].url, web.conversationUrl(id, agent));
+  assert.equal(app.local.data[web.keys.state].tasks[id].status, "attention");
+});
+
+test("failed tab action cannot acknowledge the selected reply", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  await app.deliver(report(now + 6_000, row(now + 4_000), {
+    message: message(now + 4_000, now + 6_000, "v1")
+  }));
+  app.chrome.tabs.create = async () => { throw new Error("test: browser rejected navigation"); };
+  const task = app.local.data[web.keys.state].tasks[id];
+  const response = await app.send({ kind: "tp.open", id, revision: rules.revision(task) });
+  assert.equal(response.ok, false);
+  assert.equal(app.local.data[web.keys.state].tasks[id].status, "attention");
+});
+
+test("标记已处理只影响当前版本，新回复照常显示和通知", async () => {
+  const app = worker();
+  const task = () => app.local.data[web.keys.state].tasks[id];
+  await app.deliver(report(now, row(), { busy: true }));
+  let version = rules.revision(task());
+  assert.equal((await app.send({ kind: "tp.check", id, revision: version, checked: true })).ok, false);
+
+  await app.deliver(report(now + 5_000, row(now + 1_000), {
+    message: message(now + 1_000, now + 5_000, "first")
+  }));
+  version = rules.revision(task());
+  assert.equal(task().status, "attention");
+  assert.equal((await app.send({ kind: "tp.check", id, revision: version, checked: true })).ok, true);
+  assert.equal(task().status, "seen");
+  assert.equal(task().checkedRevision, version);
+  assert.equal((await app.send({ kind: "tp.check", id, revision: version, checked: false })).ok, true);
+  assert.equal(task().checkedRevision, undefined);
+  await app.send({ kind: "tp.check", id, revision: version, checked: true });
+
+  await app.deliver(report(now + 15_000, row(now + 10_000), {
+    message: message(now + 10_000, now + 15_000, "second")
+  }));
+  assert.equal(task().status, "attention");
+  assert.notEqual(rules.revision(task()), task().checkedRevision);
+  assert.equal((await app.send({ kind: "tp.check", id, revision: version, checked: true })).ok, false);
+  assert.equal(task().status, "attention");
+  assert.equal(app.notices.size, 1);
+});
+
+test("已读后的第二条消息独立提醒，列表空档保留未读", () => {
+  const tracker = timeline();
+  tracker.next(report(now, row(), { busy: true }));
+  const first = tracker.next(report(now + 45_000, row(now + 20_000), {
+    message: message(now + 20_000, now + 45_000, "one", { atMessage: now + 20_000 })
+  }));
+  const firstRevision = rules.revision(first.task);
+  const partial = tracker.next(report(now + 50_000, row(now + 40_000)));
+  assert.equal(partial.task.pending, true);
+  assert.equal(rules.revision(partial.task), firstRevision);
+  partial.state.tasks[id] = rules.acknowledge(partial.task);
+  tracker.restore(partial.state);
+
+  const second = tracker.next(report(now + 55_000, row(now + 40_000), {
+    message: message(now + 40_000, now + 55_000, "two", { atMessage: now + 40_000 })
+  }));
+  assert.equal(second.replies.length, 1);
+  assert.notEqual(rules.revision(second.task), firstRevision);
+});
+
+test("首轮名单之外的老会话后来出现时，提醒基线之后的新回复", () => {
+  const { next } = timeline();
+  next({ ...report(now, row()), conversations: [] });
+  const update = now + 10_000;
+  const actual = next(report(now + 30_000, row(update), {
+    message: message(update, now + 30_000, "discovered", { atMessage: update })
+  }));
+  assert.equal(actual.task.status, "attention");
+  assert.equal(actual.replies.length, 1);
+});
+
+test("新采集页只有名单时，保留旧队列故障直到有效样本到达", () => {
+  const { next } = timeline();
+  next(report(now, row(), { busy: true }));
+  next(report(now + 5_000, row(), { queueAt: now, busy: true, queueError: true }));
+  const handoff = next(report(now + 10_000, row(), { busy: null }));
+  assert.equal(handoff.task.queueError, true);
+  assert.equal(rules.view(handoff.state, now + 10_000).counts.running, 0);
+  const recovered = next(report(now + 15_000, row(), { busy: true }));
+  assert.equal(recovered.task.queueError, false);
+  assert.equal(rules.view(recovered.state, now + 15_000).counts.running, 1);
+});
+
+test("复查发现晚写入的限流文案时，更新同一回复的状态", () => {
+  const { next } = timeline();
+  next(report(now, row()));
+  const update = now + 1_000;
+  next(report(now + 5_000, row(update), { message: message(update, now + 5_000, "reply") }));
+  const late = next(report(now + 40_000, row(update), {
+    message: message(update, now + 40_000, "reply", { failed: true })
+  }));
+  assert.equal(late.task.status, "stuck");
+  assert.equal(late.replies.length, 0);
+});
+
+test("通知创建短暂失败时，重启后仍能重试，已处理后撤回通知", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.create = async () => { throw new Error("test: temporary notification failure"); };
+  const update = now + 3_000;
+  await app.deliver(report(now + 6_000, row(update), { message: message(update, now + 6_000, "retry") }));
+  assert.equal(app.notices.size, 0);
+
+  const restarted = worker();
+  restarted.local.data = structuredClone(app.local.data);
+  await restarted.deliver(report(now + 12_000, row(update)));
+  assert.equal(restarted.notices.size, 1);
+  const revision = rules.revision(restarted.local.data[web.keys.state].tasks[id]);
+  await restarted.send({ kind: "tp.check", id, revision, checked: true });
+  assert.equal(restarted.notices.size, 0);
+});
+
+for (const redirected of [false, true]) {
+  test(redirected ? "登录重定向保留系统通知和未读" : "延迟落地的旧通知不会清除新回复", async () => {
+    const app = worker();
+    await app.deliver(report(now, row()));
+    await app.deliver(report(now + 5_000, row(now + 1_000), {
+      message: message(now + 1_000, now + 5_000, "old-target")
+    }));
+    const ticket = [...app.notices.keys()][0];
+    await app.deliver(report(now + 15_000, row(now + 10_000), {
+      message: message(now + 10_000, now + 15_000, "latest")
+    }));
+    const create = app.chrome.tabs.create;
+    app.chrome.tabs.create = async args => {
+      const tab = await create(args);
+      Object.assign(tab, { url: "about:blank", pendingUrl: args.url, status: "loading" });
+      return tab;
+    };
+    app.chrome.notifications.onClicked.listeners[0](ticket);
+    for (let i = 0; i < 20 && app.chrome.tabs.onUpdated.listeners.length < 2; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(app.notices.has(ticket), true);
+    const tab = app.tabs[1];
+    tab.url = redirected ? new URL("/login", web.page).href : tab.pendingUrl;
+    delete tab.pendingUrl;
+    tab.status = "complete";
+    for (const listener of [...app.chrome.tabs.onUpdated.listeners]) listener(tab.id, { url: tab.url, status: "complete" }, tab);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(app.notices.has(ticket), redirected);
+    assert.equal(app.local.data[web.keys.state].tasks[id].status, "attention");
+  });
+}
+
+test("同文档进入 DataAgent 时补装采集脚本，工具栏优先使用已就绪页面", async () => {
+  const app = worker();
+  const page = app.tabs[0];
+  const sent = [];
+  let injected = false;
+  app.chrome.scripting = { executeScript: async () => { injected = true; } };
+  app.chrome.tabs.sendMessage = async (tabId, packet) => {
+    sent.push({ tabId, kind: packet.kind });
+    return injected ? { ok: true, pageId: "page", lease: "one" } : null;
+  };
+  app.chrome.tabs.onUpdated.listeners[0](page.id, { url: web.page }, page);
+  for (let i = 0; i < 40 && !injected; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(injected, true);
+
+  page.discarded = true;
+  const ready = { id: 9, url: web.page, windowId: 1, status: "complete" };
+  app.tabs.push(ready);
+  app.chrome.action.onClicked.listeners[0]({ id: 80, url: "https://example.com" });
+  for (let i = 0; i < 40 && !sent.some(item => item.kind === "tp.show"); i++) {
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.deepEqual(sent.find(item => item.kind === "tp.show"), { tabId: ready.id, kind: "tp.show" });
+});
+
+async function until(predicate, label) {
+  for (let i = 0; i < 100; i++) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.ok(predicate(), label || "event did not settle");
+}
+
+test("idle message failures never settle an unconfirmed run as read; recovery is deduplicated", () => {
+  const { next } = timeline();
+  next(report(now, row(), { message: message(old, now, "historical") }));
+  next(report(now + 5_000, row(), { busy: true }));
+  const idle = next(report(now + 10_000, row(), {
+    message: message(old, now, "historical"), messageError: true
+  }));
+  assert.equal(idle.task.messageUncertain, true);
+  assert.equal(rules.canAcknowledge(idle.task), false);
+  const afterTimeout = next(report(now + 110_000, row(), { messageError: true }));
+  assert.notEqual(afterTimeout.task.status, "seen");
+  assert.equal(afterTimeout.task.acked, old);
+  assert.equal(rules.view(afterTimeout.state, now + 110_000).tasks[0].uncertain, true);
+  const update = now + 120_000;
+  const recovered = next(report(now + 121_000, row(update), {
+    message: message(update, now + 121_000, "recovered", { atMessage: now + 105_000 })
+  }));
+  assert.equal(recovered.task.status, "attention");
+  assert.equal(recovered.task.messageUncertain, false);
+  assert.equal(recovered.replies.length, 1);
+  const repeated = next(report(now + 130_000, row(update), {
+    message: message(update, now + 130_000, "recovered", { atMessage: now + 105_000 })
+  }));
+  assert.equal(repeated.replies.length, 0);
+});
+
+test("distinct server IDs at the same timestamp are independent, replay of either ID is ignored", () => {
+  const tracker = timeline();
+  tracker.next(report(now, row()));
+  const update = now + 1_000;
+  const a = tracker.next(report(now + 5_000, row(update), {
+    message: message(update, now + 5_000, "same-time-a", { atMessage: update })
+  }));
+  a.state.tasks[id] = rules.acknowledge(a.task);
+  tracker.restore(a.state);
+  const b = tracker.next(report(now + 10_000, row(update), {
+    message: message(update, now + 10_000, "same-time-b", { atMessage: update })
+  }));
+  assert.equal(b.replies.length, 1);
+  assert.notEqual(rules.revision(a.task), rules.revision(b.task));
+  const replay = tracker.next(report(now + 15_000, row(update), {
+    message: message(update, now + 15_000, "same-time-a", { atMessage: update })
+  }));
+  assert.equal(replay.replies.length, 0);
+  assert.equal(rules.revision(replay.task), rules.revision(b.task));
+});
+
+test("a late historical message newer than an old list timestamp is quiet at first install", () => {
+  const { next } = timeline();
+  const first = next(report(now, row(), {
+    message: message(old, now, "historical", { atMessage: now - 1_000 })
+  }));
+  assert.equal(first.replies.length, 0);
+  assert.equal(first.task.status, "seen");
+  assert.equal(first.task.lastAssistant, "historical");
+});
+
+test("known active and unconfirmed tasks survive the 24-row discovery window", () => {
+  const rows = Array.from({ length: 30 }, (_, i) => ({ ...row(old - i), id: String(100 + i) }));
+  const localBusy = rows[25].id;
+  const durableBusy = rows[27].id;
+  const uncertain = rows[28].id;
+  const samples = new Map([[localBusy, { queue: { sessionState: "BUSY", pending: [] } }]]);
+  const tracked = {
+    [durableBusy]: { agentId: agent, runAt: old },
+    [uncertain]: { agentId: agent, messageUncertain: true }
+  };
+  const ids = rules.watchRows(rows, samples, tracked, now).map(row => row.id);
+  assert.equal(ids.length, 27);
+  assert.ok(ids.includes(localBusy));
+  assert.ok(ids.includes(durableBusy));
+  assert.ok(ids.includes(uncertain));
+  assert.ok(!ids.includes(rows[29].id));
+});
+
+test("collector actually polls a durable old running task after leader handoff; failed message probes recover", async () => {
+  const rows = Array.from({ length: 27 }, (_, i) => ({ ...row(old - i), id: String(100 + i) }));
+  const trackedId = rows.at(-1).id;
+  const probeId = rows[0].id;
+  let stamp = now, interval, messageFailure = true;
+  let listRequests = 0;
+  const queueReads = [], reports = [], listeners = [];
+  const reply = data => ({ ok: true, json: async () => ({ success: true, data }) });
+  const chrome = {
+    storage: { local: { get: async key => ({ [key]: { tasks: { [trackedId]: { agentId: agent, runAt: old } } } }) } },
+    runtime: {
+      id: "collector-test",
+      onMessage: { addListener: fn => listeners.push(fn) },
+      sendMessage: async packet => { if (packet.kind === "tp.webstate") reports.push(packet.payload); return { ok: true }; }
+    }
+  };
+  class Clock extends Date { static now() { return stamp; } }
+  const context = vm.createContext({
+    chrome, URL, console, crypto: webcrypto, AbortController, Date: Clock,
+    location: new URL(web.page), document: { hidden: false, addEventListener() {} },
+    setTimeout, clearTimeout, setInterval: fn => { interval = fn; return 1; }, clearInterval() {},
+    fetch: async url => {
+      if (url.pathname.endsWith("/list")) {
+        listRequests++;
+        return reply({ groups: [], ungrouped: { conversations: rows } });
+      }
+      const cid = url.pathname.split("/").at(-2);
+      if (url.pathname.endsWith("/queue")) {
+        queueReads.push(cid);
+        return reply({ sessionState: cid === trackedId ? "BUSY" : "IDLE", pending: [] });
+      }
+      if (cid === probeId && messageFailure) throw new Error("message endpoint offline");
+      return reply({ list: [{ sender: "other", id: "user-" + cid, createTime: old }] });
+    }
+  });
+  for (const file of ["config.js", "state.js", "web-bridge.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(ext, file), "utf-8"), context, { filename: file });
+  }
+  let page;
+  listeners[0]({ kind: "tp.probe" }, {}, answer => { page = answer; });
+  listeners[0]({ kind: "tp.role", pageId: page.pageId, lease: "replacement" }, {}, () => {});
+  await until(() => reports.length === 1, "first collector report");
+  assert.ok(reports[0].messageErrors[probeId]);
+  assert.equal(reports[0].lastMessages[probeId], undefined);
+  messageFailure = false;
+  for (let round = 1; round <= 7; round++) {
+    stamp += 5_000;
+    interval();
+    await until(() => reports.length >= round + 1, "collector round " + round);
+  }
+  assert.ok(queueReads.includes(trackedId), "old running task was evicted");
+  assert.ok(!queueReads.includes(rows.at(-2).id), "cold task exceeded discovery budget");
+  assert.ok(reports.some(report => report.lastMessages[probeId] && !report.messageErrors[probeId]));
+  assert.ok(listRequests >= 2, "list refresh was not exercised");
+  assert.ok(reports.at(-1).queueAt[trackedId], "old task was lost after list refresh");
+  listeners[0]({ kind: "tp.role", pageId: page.pageId, lease: "" }, {}, () => {});
+});
+
+test("foreground report acknowledges an already-notified reply and clears the system notification", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), {
+    message: message(update, now + 5_000, "foreground")
+  }));
+  assert.equal(app.notices.size, 1);
+  app.tabs[0].url = web.conversationUrl(id, agent);
+  await app.deliver(report(now + 10_000, row(update)));
+  const state = app.local.data[web.keys.state];
+  assert.equal(state.tasks[id].status, "seen");
+  assert.equal(state.tasks[id].pending, false);
+  assert.equal(app.notices.size, 0);
+  assert.deepEqual(state.outbox, {});
+});
+
+test("foreground read cancels delayed outbox replay after failure and restart", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.create = async () => { throw new Error("temporary delivery failure"); };
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), {
+    message: message(update, now + 5_000, "outbox")
+  }));
+  assert.equal(Object.keys(app.local.data[web.keys.state].outbox).length, 1);
+  const resumed = worker({ local: app.local.data });
+  resumed.tabs[0].url = web.conversationUrl(id, agent);
+  await resumed.deliver(report(now + 15_000, row(update)));
+  assert.equal(resumed.local.data[web.keys.state].tasks[id].pending, false);
+  assert.deepEqual(resumed.local.data[web.keys.state].outbox, {});
+  assert.equal(resumed.notices.size, 0);
+  resumed.tabs[0].url = web.page;
+  await resumed.deliver(report(now + 20_000, row(update)));
+  assert.equal(resumed.notices.size, 0);
+});
+
+test("notification cleanup is retried after a transient clear failure", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), {
+    message: message(update, now + 5_000, "clear-retry")
+  }));
+  const clear = app.chrome.notifications.clear;
+  app.chrome.notifications.clear = async () => { throw new Error("temporary clear failure"); };
+  app.tabs[0].url = web.conversationUrl(id, agent);
+  await app.deliver(report(now + 10_000, row(update)));
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, false);
+  assert.equal(app.notices.size, 1);
+  app.chrome.notifications.clear = clear;
+  app.tabs[0].url = web.page;
+  await app.deliver(report(now + 15_000, row(update)));
+  assert.equal(app.notices.size, 0);
+});
+
+test("different revisions never reuse a successful navigation result; failed second jump keeps its notice", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const updateA = now + 1_000, updateB = now + 10_000;
+  await app.deliver(report(now + 5_000, row(updateA), { message: message(updateA, now + 5_000, "jump-a") }));
+  const a = [...app.notices.keys()][0];
+  await app.deliver(report(now + 15_000, row(updateB), { message: message(updateB, now + 15_000, "jump-b") }));
+  const b = [...app.notices.keys()].find(key => key !== a);
+  let release, attempts = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const create = app.chrome.tabs.create;
+  app.chrome.tabs.create = async args => {
+    if (++attempts !== 1) throw new Error("second navigation failed");
+    await gate;
+    return create(args);
+  };
+  const update = app.chrome.tabs.update;
+  let focusAttempts = 0;
+  app.chrome.tabs.update = async tabId => {
+    // The hardened path creates an inactive tab and must focus it once.
+    if (!app.tabs.find(tab => tab.id === tabId)?.active && ++focusAttempts === 1) return update(tabId);
+    throw new Error("second focus failed");
+  };
+  const first = app.send({ kind: "tp.open", id, revision: a.slice("tp-reply:".length) });
+  await until(() => attempts === 1);
+  app.chrome.notifications.onClicked.listeners[0](b);
+  release();
+  assert.equal((await first).ok, true);
+  await until(() => attempts === 2, "second navigation was incorrectly coalesced");
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(app.notices.has(b), true);
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, true);
+});
+
+test("old jump stays version-protected on subsequent report and worker restart, real visit reads the new reply", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const updateA = now + 1_000, updateB = now + 10_000;
+  await app.deliver(report(now + 5_000, row(updateA), { message: message(updateA, now + 5_000, "old") }));
+  const a = [...app.notices.keys()][0];
+  await app.deliver(report(now + 15_000, row(updateB), { message: message(updateB, now + 15_000, "new") }));
+  const b = [...app.notices.keys()].find(key => key !== a);
+  assert.equal((await app.send({ kind: "tp.open", id, revision: a.slice("tp-reply:".length) })).ok, true);
+  await app.deliver(report(now + 20_000, row(updateB)));
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, true);
+  assert.equal(app.notices.has(b), true);
+  const restarted = worker({ local: app.local.data, session: app.session.data, notices: [...app.notices] });
+  restarted.tabs.splice(0, restarted.tabs.length, ...structuredClone(app.tabs));
+  await restarted.deliver(report(now + 25_000, row(updateB)));
+  assert.equal(restarted.local.data[web.keys.state].tasks[id].pending, true);
+  const target = restarted.tabs.find(tab => tab.active);
+  assert.equal((await restarted.send({ kind: "tp.visit", id }, {
+    id: "unit", frameId: 0, tab: target, url: target.url
+  })).ok, true);
+  assert.equal(restarted.local.data[web.keys.state].tasks[id].pending, false);
+  assert.equal(restarted.notices.has(b), false);
+});
+
+test("unconfirmed message cannot be checked or cleared by a foreground visit", async () => {
+  const app = worker();
+  await app.deliver(report(now, row(), { busy: true }));
+  const update = now + 5_000;
+  await app.deliver(report(now + 10_000, row(update), { messageError: true }));
+  app.tabs[0].url = web.conversationUrl(id, agent);
+  await app.deliver(report(now + 110_000, row(update), { messageError: true }));
+  const task = app.local.data[web.keys.state].tasks[id];
+  assert.equal(task.messageUncertain, true);
+  assert.equal((await app.send({ kind: "tp.check", id, revision: rules.revision(task), checked: true })).ok, false);
+  assert.notEqual(app.local.data[web.keys.state].tasks[id].status, "seen");
+  assert.equal(app.local.data[web.keys.state].tasks[id].acked, old);
+});
+
+test("disconnect does not deliver a stale outbox; recovery delivers the current version only once", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.getPermissionLevel = async () => "denied";
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), { message: message(update, now + 5_000, "reconnect") }));
+  assert.equal(Object.keys(app.local.data[web.keys.state].outbox).length, 1);
+  app.chrome.notifications.getPermissionLevel = async () => "granted";
+  await app.deliver(report(now + 10_000, row(update), { error: "HTTP 401", busy: null }));
+  assert.equal(app.notices.size, 0);
+  await app.deliver(report(now + 15_000, row(update)));
+  assert.equal(app.notices.size, 1);
+  await app.deliver(report(now + 20_000, row(update)));
+  assert.equal(app.notices.size, 1);
+  assert.deepEqual(app.local.data[web.keys.state].outbox, {});
+});
+
+test("late focus or route events cannot remove an old-notification landing guard", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const updateA = now + 1_000, updateB = now + 10_000;
+  await app.deliver(report(now + 5_000, row(updateA), { message: message(updateA, now + 5_000, "event-old") }));
+  const a = [...app.notices.keys()][0];
+  await app.deliver(report(now + 15_000, row(updateB), { message: message(updateB, now + 15_000, "event-new") }));
+  const b = [...app.notices.keys()].find(key => key !== a);
+  assert.equal((await app.send({ kind: "tp.open", id, revision: a.slice("tp-reply:".length) })).ok, true);
+  const target = app.tabs.find(tab => tab.active);
+  assert.equal(target.url, web.conversationUrl(id, agent));
+  app.chrome.windows.onFocusChanged.listeners[0](2); // stale window event; actual focus is window 1
+  for (const listener of [...app.chrome.tabs.onUpdated.listeners]) {
+    listener(target.id, { url: web.page, status: "complete" }, { ...target, url: web.page });
+  }
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await app.deliver(report(now + 20_000, row(updateB)));
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, true);
+  assert.equal(app.notices.has(b), true);
+  assert.equal(app.session.data["tp-web-jump-tabs-v1"][target.id]?.cid ?? app.session.data["tp-web-jump-tabs-v1"][target.id], id);
+});
+
+test("an activation event during an in-flight focus cannot discard the new guard", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const updateA = now + 1_000, updateB = now + 10_000;
+  await app.deliver(report(now + 5_000, row(updateA), { message: message(updateA, now + 5_000, "focus-old") }));
+  const a = [...app.notices.keys()][0];
+  await app.deliver(report(now + 15_000, row(updateB), { message: message(updateB, now + 15_000, "focus-new") }));
+  const b = [...app.notices.keys()].find(key => key !== a);
+  const target = { id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete", active: false };
+  app.tabs.push(target);
+  let release, waiting = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  const update = app.chrome.tabs.update;
+  app.chrome.tabs.update = async tabId => { waiting = true; await gate; return update(tabId); };
+  const opening = app.send({ kind: "tp.open", id, revision: a.slice("tp-reply:".length) });
+  await until(() => waiting);
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: 7, windowId: 1 });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(app.session.data["tp-web-jump-tabs-v1"][target.id]?.cid ?? app.session.data["tp-web-jump-tabs-v1"][target.id], id);
+  release();
+  assert.equal((await opening).ok, true);
+  await app.deliver(report(now + 20_000, row(updateB)));
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, true);
+  assert.equal(app.notices.has(b), true);
+});
+
+test("genuine window blur and return releases the old-ticket guard and reads current reply", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const updateA = now + 1_000, updateB = now + 10_000;
+  await app.deliver(report(now + 5_000, row(updateA), { message: message(updateA, now + 5_000, "blur-old") }));
+  const a = [...app.notices.keys()][0];
+  await app.deliver(report(now + 15_000, row(updateB), { message: message(updateB, now + 15_000, "blur-new") }));
+  assert.equal((await app.send({ kind: "tp.open", id, revision: a.slice("tp-reply:".length) })).ok, true);
+  let focused = false;
+  app.chrome.windows.getLastFocused = async () => ({ id: 1, focused });
+  app.chrome.windows.onFocusChanged.listeners[0](-1);
+  await until(() => Object.keys(app.session.data["tp-web-jump-tabs-v1"] || {}).length === 0);
+  assert.equal(app.local.data[web.keys.state].tasks[id].pending, true);
+  focused = true;
+  app.chrome.windows.onFocusChanged.listeners[0](1);
+  await until(() => app.local.data[web.keys.state].tasks[id].pending === false && app.notices.size === 0);
+});
+
+test("upgrading existing storage clears notices for replies already read by the old build", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), { message: message(update, now + 5_000, "legacy") }));
+  const state = structuredClone(app.local.data[web.keys.state]);
+  state.tasks[id] = rules.acknowledge(state.tasks[id]);
+  delete state.tasks[id].readRevision;
+  const restarted = worker({ local: { [web.keys.state]: state }, notices: [...app.notices] });
+  await restarted.deliver(report(now + 10_000, row(update)));
+  assert.equal(restarted.local.data[web.keys.state].tasks[id].pending, false);
+  assert.equal(restarted.notices.size, 0);
+});
+
+/* Read-only review counterexamples: added before the hardening implementation. */
+const currentTask = app => app.local.data[web.keys.state].tasks[id];
+const exactRevision = app => rules.revision(currentTask(app));
+const replyReport = (at, update, key, extra = {}) => report(at, row(update), {
+  message: message(update, at, key, { atMessage: update, ...extra })
+});
+
+test("P1 normal jump releases guard; a later foreground reply is read without an extra notice", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, now + 1_000, "A"));
+  assert.equal((await app.send({ kind: "tp.open", id, revision: exactRevision(app) })).ok, true);
+  assert.equal(currentTask(app).pending, false);
+  await app.deliver(replyReport(now + 15_000, now + 10_000, "B"));
+  assert.equal(currentTask(app).pending, false);
+  assert.equal(currentTask(app).status, "seen");
+  assert.equal(app.notices.size, 0);
+});
+
+test("P1 failed inactive-target jump cannot block a later genuine tab visit", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, now + 1_000, "A"));
+  const target = { id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete", active: false };
+  app.tabs.push(target);
+  const update = app.chrome.tabs.update;
+  app.chrome.tabs.update = async () => { throw new Error("focus failed"); };
+  app.chrome.tabs.create = async () => { throw new Error("creation failed"); };
+  assert.equal((await app.send({ kind: "tp.open", id, revision: exactRevision(app) })).ok, false);
+  app.chrome.tabs.update = update;
+  await update(target.id);
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: target.id, windowId: 1 });
+  await until(() => currentTask(app).pending === false, "manual tab visit blocked by failed jump");
+  assert.equal(app.notices.size, 0);
+});
+
+test("P1 focus changes between window and tab query: preserve unread", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  app.tabs[0].url = web.conversationUrl(id, agent);
+  let focused = true;
+  app.chrome.windows.getLastFocused = async () => ({ id: 1, focused });
+  const query = app.chrome.tabs.query;
+  app.chrome.tabs.query = async q => {
+    const tabs = await query(q);
+    if (q.active) focused = false;
+    return tabs;
+  };
+  await app.deliver(replyReport(now + 5_000, now + 1_000, "focus-race"));
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(app.notices.size, 1);
+});
+
+test("P1 landing loses focus before serialized acknowledgment: do not clear selected reply", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, now + 1_000, "A"));
+  let release, entered = false, landed = false, focused = true, hold = true;
+  const gate = new Promise(r => { release = r; });
+  const getAll = app.chrome.notifications.getAll;
+  app.chrome.notifications.getAll = async () => {
+    if (hold) { entered = true; await gate; }
+    return getAll();
+  };
+  const packet = replyReport(now + 7_000, now + 1_000, "A");
+  const other = "43", update = now + 6_000;
+  packet.conversations.push({ ...row(update), id: other });
+  packet.queues[other] = { sessionState: "IDLE", pending: [] };
+  packet.queueAt[other] = packet.at;
+  packet.lastMessages[other] = message(update, packet.at, "other", { atMessage: update });
+  const reporting = app.deliver(packet);
+  await until(() => entered);
+  app.chrome.windows.getLastFocused = async () => ({ id: 1, focused });
+  const query = app.chrome.tabs.query;
+  app.chrome.tabs.query = async q => {
+    const tabs = await query(q);
+    if (q.active && tabs[0]?.url.includes("conversationId=42")) landed = true;
+    return tabs;
+  };
+  const opening = app.send({ kind: "tp.open", id, revision: exactRevision(app) });
+  await until(() => landed);
+  await new Promise(r => setTimeout(r, 5));
+  focused = false;
+  hold = false;
+  release();
+  await reporting;
+  const result = await opening;
+  assert.equal(result.ok, false);
+  assert.equal(currentTask(app).pending, true);
+  assert.ok([...app.notices.keys()].some(key => key.endsWith("message.A")));
+});
+
+test("P1 message failure after a user-only success on the same list version remains uncertain", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const update = now + 1_000;
+  await app.deliver(replyReport(now + 5_000, update, "user", { sender: "other" }));
+  await app.deliver(report(now + 10_000, row(update), { messageError: true }));
+  assert.equal(currentTask(app).messageUncertain, true);
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 10_000).tasks[0].uncertain, true);
+  assert.equal((await app.send({ kind: "tp.check", id, revision: exactRevision(app), checked: true })).ok, false);
+  await app.deliver(replyReport(now + 15_000, update, "B"));
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(currentTask(app).messageUncertain, false);
+  assert.equal(app.notices.size, 1);
+});
+
+test("P1 unread A cannot terminate B while latest message still returns A", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, now + 1_000, "A"));
+  await app.deliver(report(now + 12_000, row(now + 10_000), { busy: true }));
+  const oldA = { atMessage: now + 1_000 };
+  await app.deliver(replyReport(now + 15_000, now + 10_000, "A", oldA));
+  assert.equal(currentTask(app).awaitingReply, true);
+  assert.equal(currentTask(app).status, "running");
+  assert.equal(currentTask(app).pending, true);
+  await app.deliver(replyReport(now + 110_000, now + 10_000, "A", oldA));
+  assert.equal(currentTask(app).messageUncertain, true);
+  assert.equal((await app.send({ kind: "tp.check", id, revision: exactRevision(app), checked: true })).ok, false);
+  await app.deliver(replyReport(now + 115_000, now + 10_000, "B", { atMessage: now + 114_000 }));
+  assert.equal(currentTask(app).awaitingReply, false);
+  assert.equal(currentTask(app).status, "attention");
+  assert.ok(currentTask(app).replyKey.endsWith("B"));
+});
+
+test("P1 distinct server IDs with missing timestamps and the same list version are recognized once", () => {
+  const tracker = timeline(), update = now + 1_000;
+  tracker.next(report(now, row(), { message: message(old, now, "history") }));
+  const a = tracker.next(report(now + 5_000, row(update), { message: message(update, now + 5_000, "A") }));
+  a.state.tasks[id] = rules.acknowledge(a.task);
+  tracker.restore(a.state);
+  const b = tracker.next(report(now + 10_000, row(update), { message: message(update, now + 10_000, "B") }));
+  assert.equal(b.replies.length, 1);
+  assert.equal(b.task.replyKey, "message.B");
+  assert.equal(tracker.next(report(now + 15_000, row(update), {
+    message: message(update, now + 15_000, "A")
+  })).replies.length, 0);
+  assert.equal(tracker.next(report(now + 20_000, row(update), {
+    message: message(update, now + 20_000, "history")
+  })).task.replyKey, "message.B");
+});
+
+test("P1 invalid or cached list cannot clear a prior source failure or auto-read", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  await app.deliver(report(now + 10_000, row(update), { listAt: now + 5_000, busy: null, error: "HTTP 401" }));
+  app.tabs[0].url = web.conversationUrl(id, agent);
+  await app.deliver(report(now + 15_000, row(update), { listAt: 0, busy: null }));
+  assert.equal(app.local.data[web.keys.state].error, "HTTP 401");
+  assert.equal(currentTask(app).pending, true);
+  await app.deliver(report(now + 20_000, row(update), { listAt: now + 5_000, busy: null }));
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(app.notices.size, 1);
+  await app.deliver(report(now + 25_000, row(update)));
+  assert.equal(currentTask(app).pending, false);
+  assert.equal(app.notices.size, 0);
+});
+
+test("P1 durable old active task remains pollable when absent from a bounded service list", () => {
+  const tracker = timeline();
+  const active = tracker.next(report(now, row(), { busy: true }));
+  const newer = Array.from({ length: 27 }, (_, i) => ({ ...row(now + i + 1), id: String(100 + i) }));
+  const watched = rules.watchRows(newer, new Map(), active.state.tasks, now + 5_000);
+  const retained = watched.find(item => item.id === id);
+  assert.ok(retained, "missing retained task");
+  assert.equal(retained.retained, true);
+  assert.equal(watched.length, 25);
+  const result = tracker.next({ ...report(now + 10_000, retained, {
+    message: message(old, now + 10_000, "completion", { atMessage: now + 8_000 })
+  }), conversations: [retained] });
+  assert.equal(result.task.status, "attention");
+  assert.equal(result.replies.length, 1);
+  assert.equal(rules.view(result.state, now + 10_000).tasks[0].id, id);
+  const expired = rules.watchRows(newer, new Map(), active.state.tasks, now + 8 * 24 * 60 * 60_000);
+  assert.ok(!expired.some(item => item.id === id), "retention must stay bounded");
+});
+
+test("P2 current pending outbox survives a 24-hour permission outage", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.getPermissionLevel = async () => "denied";
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  assert.equal(app.notices.size, 0);
+  app.chrome.notifications.getPermissionLevel = async () => "granted";
+  const at = now + 24 * 60 * 60_000 + 10_000;
+  await app.deliver(replyReport(at, update, "A"));
+  assert.equal(app.notices.size, 1);
+  await app.deliver(replyReport(at + 5_000, update, "A"));
+  assert.equal(app.notices.size, 1);
+});
+
+test("P2 explicit tab visit restores original failed-reply acknowledgment behavior", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "failed", { failed: true }));
+  assert.equal(currentTask(app).status, "stuck");
+  app.tabs[0].url = web.conversationUrl(id, agent);
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: 7, windowId: 1 });
+  await until(() => currentTask(app).pending === false, "failed reply manual visit did not acknowledge");
+  assert.equal(app.notices.size, 0);
+});
+
+test("P2 stale queue or failed queue prevents explicit check and jump acknowledgment", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  await app.deliver(report(now + 10_000, row(update), { busy: null, queueError: true }));
+  assert.equal((await app.send({ kind: "tp.check", id, revision: exactRevision(app), checked: true })).ok, false);
+  const result = await app.send({ kind: "tp.open", id, revision: exactRevision(app) });
+  assert.equal(result.ok, true);
+  assert.equal(result.clearNotice, false);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(app.notices.size, 1);
+});
+
+test("P1 new tab is not activated before its version guard is persisted", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, now + 1_000, "A"));
+  const oldRevision = exactRevision(app);
+  await app.deliver(replyReport(now + 15_000, now + 10_000, "B"));
+  const create = app.chrome.tabs.create, update = app.chrome.tabs.update;
+  let createdInactive = false, protectedBeforeFocus = false;
+  app.chrome.tabs.create = async args => {
+    createdInactive = args.active === false;
+    return create(args);
+  };
+  app.chrome.tabs.update = async tabId => {
+    protectedBeforeFocus = !!app.session.data["tp-web-jump-tabs-v1"]?.[tabId];
+    return update(tabId);
+  };
+  assert.equal((await app.send({ kind: "tp.open", id, revision: oldRevision })).ok, true);
+  assert.equal(createdInactive, true);
+  assert.equal(protectedBeforeFocus, true);
+  assert.equal(currentTask(app).pending, true);
+});
+
+test("P1 notification closure is durable evidence of delivery, even after interrupted persistence", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.getPermissionLevel = async () => "denied";
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  const saved = app.local.data[web.keys.state];
+  const rev = exactRevision(app), ticket = "tp-reply:" + rev;
+  // Simulate the create/commit gap: the notification appeared and was closed,
+  // but the durable outbox still contains the revision when the worker restarts.
+  const restarted = worker({ local: { [web.keys.state]: saved } });
+  const listener = restarted.chrome.notifications.onClosed.listeners[0];
+  assert.equal(typeof listener, "function");
+  listener(ticket, true);
+  await restarted.deliver(replyReport(now + 10_000, update, "A"));
+  assert.equal(currentTask(restarted).pending, true);
+  assert.equal(restarted.notices.size, 0);
+  assert.deepEqual(restarted.local.data[web.keys.state].outbox, {});
+});
+
+test("P2 foreground changes while permission check is pending: cancel delayed delivery", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.getPermissionLevel = async () => {
+    app.tabs[0].url = web.conversationUrl(id, agent);
+    return "granted";
+  };
+  let creates = 0;
+  const create = app.chrome.notifications.create;
+  app.chrome.notifications.create = async (...args) => { creates++; return create(...args); };
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  assert.equal(currentTask(app).pending, false);
+  assert.equal(creates, 0);
+  assert.equal(app.notices.size, 0);
+});
+
+test("P1 normal row jump while running allows a later foreground reply to auto-read", async () => {
+  const app = worker();
+  await app.deliver(report(now, row(), { busy: true }));
+  const opened = await app.send({ kind: "tp.open", id, revision: exactRevision(app), intent: "row" });
+  assert.equal(opened.ok, true);
+  assert.equal(currentTask(app).status, "running");
+  await app.deliver(replyReport(now + 10_000, now + 8_000, "A"));
+  assert.equal(currentTask(app).pending, false);
+  assert.equal(app.notices.size, 0);
+});
+
+test("P1 a replayed notification for an already read version is not a normal row visit", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, now + 1_000, "A"));
+  const revision = exactRevision(app);
+  await app.send({ kind: "tp.check", id, revision, checked: true });
+  assert.equal(currentTask(app).pending, false);
+  const opened = await app.send({ kind: "tp.open", id, revision, intent: "notice" });
+  assert.equal(opened.ok, true);
+  await app.deliver(replyReport(now + 15_000, now + 10_000, "B"));
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(app.notices.size, 1);
+});
+
+test("P1 notification closure during a pending permission check suppresses duplicate creation", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.getPermissionLevel = async () => "denied";
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  const ticket = "tp-reply:" + exactRevision(app);
+  let release, waiting = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  app.chrome.notifications.getPermissionLevel = async () => {
+    waiting = true;
+    await gate;
+    return "granted";
+  };
+  const reportPromise = app.deliver(replyReport(now + 10_000, update, "A"));
+  await until(() => waiting);
+  app.chrome.notifications.onClosed.listeners[0](ticket, true);
+  release();
+  await reportPromise;
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(app.notices.size, 0);
+  assert.deepEqual(app.local.data[web.keys.state].outbox, {});
+});
+
+test("P1 exact durable jump commit permits normal foreground reading after interrupted guard cleanup", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, now + 1_000, "A"));
+  const rev = exactRevision(app);
+  // Persisted acknowledgement and token, but the session guard was not removed.
+  const saved = structuredClone(app.local.data);
+  saved[web.keys.state].tasks[id] = { ...rules.acknowledge(currentTask(app)), jumpCommit: "exact-commit" };
+  const resumed = worker({ local: saved, session: {
+    "tp-web-jump-tabs-v1": { "7": { cid: id, revision: rev, token: "exact-commit", at: now + 5_000 } }
+  } });
+  resumed.tabs[0].url = web.conversationUrl(id, agent);
+  await resumed.deliver(replyReport(now + 15_000, now + 10_000, "B"));
+  assert.equal(currentTask(resumed).pending, false);
+  assert.equal(resumed.notices.size, 0);
+});
+
+test("P1 collector retains a missing active row and clears cached samples on same-token reacquisition", async () => {
+  const actual = [{ ...row(old), id: "100" }];
+  const trackedId = id;
+  const tracked = { [trackedId]: { id: trackedId, agentId: agent, name: "old active", group: "",
+    update: old, created: old, listedAt: now, runAt: old } };
+  let stamp = now, interval, failQueues = false;
+  const queueReads = [], reports = [], listeners = [];
+  const reply = data => ({ ok: true, json: async () => ({ success: true, data }) });
+  const chrome = {
+    storage: { local: { get: async key => ({ [key]: { tasks: tracked } }) } },
+    runtime: {
+      id: "collector-test",
+      onMessage: { addListener: fn => listeners.push(fn) },
+      sendMessage: async packet => {
+        if (packet.kind === "tp.webstate") reports.push(packet.payload);
+        return { ok: true };
+      }
+    }
+  };
+  class Clock extends Date { static now() { return stamp; } }
+  const context = vm.createContext({
+    chrome, URL, console, crypto: webcrypto, AbortController, Date: Clock,
+    location: new URL(web.page), document: { hidden: false, addEventListener() {} },
+    setTimeout, clearTimeout, setInterval: fn => { interval = fn; return 1; }, clearInterval() {},
+    fetch: async url => {
+      if (url.pathname.endsWith("/list")) return reply({ groups: [], ungrouped: { conversations: actual } });
+      const cid = url.pathname.split("/").at(-2);
+      if (url.pathname.endsWith("/queue")) {
+        queueReads.push(cid);
+        if (failQueues) throw new Error("queue endpoint offline");
+        return reply({ sessionState: cid === trackedId ? "BUSY" : "IDLE", pending: [] });
+      }
+      return reply({ list: [{ sender: "other", id: "u", createTime: old }] });
+    }
+  });
+  for (const file of ["config.js", "state.js", "web-bridge.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(ext, file), "utf-8"), context, { filename: file });
+  }
+  let page;
+  listeners[0]({ kind: "tp.probe" }, {}, answer => { page = answer; });
+  const role = lease => listeners[0]({ kind: "tp.role", pageId: page.pageId, lease }, {}, () => {});
+  role("stable-token");
+  await until(() => reports.length === 1);
+  assert.ok(queueReads.includes(trackedId));
+  assert.ok(reports[0].conversations.some(item => item.id === trackedId && item.retained));
+  assert.ok(reports[0].queueAt[trackedId]);
+  await new Promise(r => setTimeout(r, 5));
+  role("");
+  failQueues = true;
+  stamp += 6_000;
+  role("stable-token");
+  await until(() => reports.length >= 2);
+  assert.equal(reports.at(-1).queueAt[trackedId], undefined, "old lease queue sample was relabeled");
+  assert.ok(reports.at(-1).queueErrors[trackedId]);
+  role("");
+});
+
+test("P1 previously rejected old assistant ID cannot become new when its timestamp disappears", () => {
+  const tracker = timeline();
+  tracker.next(report(now, row()));
+  const first = tracker.next(replyReport(now + 5_000, now + 1_000, "A"));
+  first.state.tasks[id] = rules.acknowledge(first.task);
+  tracker.restore(first.state);
+  const late = tracker.next(replyReport(now + 10_000, now + 1_000, "older", { atMessage: old }));
+  assert.equal(late.replies.length, 0);
+  const replay = tracker.next(report(now + 15_000, row(now + 1_000), {
+    message: message(now + 1_000, now + 15_000, "older")
+  }));
+  assert.equal(replay.replies.length, 0);
+  assert.equal(replay.task.replyKey, "message.A");
+});
+
+test("P2 same-time read history retries removal of older notifications without clearing new pending C", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  const a = "tp-reply:" + exactRevision(app);
+  await app.deliver(replyReport(now + 10_000, update, "B"));
+  const b = "tp-reply:" + exactRevision(app);
+  const clear = app.chrome.notifications.clear;
+  app.chrome.notifications.clear = async key => {
+    if (key === a) throw new Error("temporary old notice cleanup failure");
+    return clear(key);
+  };
+  await app.send({ kind: "tp.check", id, revision: exactRevision(app), checked: true });
+  assert.equal(app.notices.has(a), true);
+  assert.equal(app.notices.has(b), false);
+  app.chrome.notifications.clear = clear;
+  await app.deliver(replyReport(now + 15_000, update, "C"));
+  const c = "tp-reply:" + exactRevision(app);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(app.notices.has(a), false);
+  assert.equal(app.notices.has(c), true);
+  assert.equal(app.notices.size, 1);
+});
+
+test("P1 stale landing event snapshot cannot cancel a still-loading correct new tab", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, now + 1_000, "A"));
+  const create = app.chrome.tabs.create;
+  app.chrome.tabs.create = async args => {
+    const tab = await create(args);
+    Object.assign(tab, { url: "about:blank", pendingUrl: args.url, status: "loading" });
+    return tab;
+  };
+  const opening = app.send({ kind: "tp.open", id, revision: exactRevision(app), intent: "notice" });
+  await until(() => app.chrome.tabs.onUpdated.listeners.length >= 2);
+  const tab = app.tabs[1];
+  const stale = { ...tab, url: new URL("/login", web.page).href, status: "complete" };
+  delete stale.pendingUrl;
+  for (const listener of [...app.chrome.tabs.onUpdated.listeners]) listener(tab.id, { url: stale.url, status: "complete" }, stale);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  tab.url = tab.pendingUrl;
+  delete tab.pendingUrl;
+  tab.status = "complete";
+  for (const listener of [...app.chrome.tabs.onUpdated.listeners]) listener(tab.id, { url: tab.url, status: "complete" }, tab);
+  assert.equal((await opening).ok, true);
+  assert.equal(currentTask(app).pending, false);
+  assert.equal(app.notices.size, 0);
+});
+
+test("P2 webpage toast may dismiss only after the worker authorizes clearing that notice", () => {
+  assert.equal(rules.mayDismissNotice({ ok: true, clearNotice: false }), false);
+  assert.equal(rules.mayDismissNotice({ ok: false, clearNotice: true }), false);
+  assert.equal(rules.mayDismissNotice({ ok: true, clearNotice: true }), true);
+  assert.equal(rules.mayDismissNotice(null), false);
+});
