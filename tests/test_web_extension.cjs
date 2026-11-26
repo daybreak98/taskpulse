@@ -1743,3 +1743,88 @@ test("new-tab completion retries the real document after early activation and tr
   assert.ok(probes > before);
   assert.equal(attempts, 2, "installed but not ready host handles its own recovery");
 });
+
+
+test("uncertain row can be dismissed without false read evidence; same version stays hidden across refresh and restart", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), { messageError: true }));
+  const before = structuredClone(currentTask(app));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 5_000).tasks[0].uncertain, true);
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version: rules.displayVersion(before) })).ok, true);
+  const hidden = currentTask(app);
+  assert.equal(hidden.acked, before.acked);
+  assert.equal(hidden.pending, before.pending);
+  assert.equal(hidden.readRevision, before.readRevision);
+  assert.equal(hidden.messageUncertain, true);
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 5_000).tasks.length, 0);
+  const restarted = worker({ local: app.local.data, session: app.session.data });
+  await restarted.deliver(report(now + 10_000, row(update), { messageError: true }));
+  assert.equal(rules.view(restarted.local.data[web.keys.state], now + 10_000).tasks.length, 0);
+  await restarted.deliver(replyReport(now + 15_000, update, "new-after-dismiss"));
+  assert.equal(rules.view(restarted.local.data[web.keys.state], now + 15_000).tasks.length, 1);
+  assert.equal(currentTask(restarted).pending, true);
+  assert.equal(restarted.notices.size, 1);
+});
+
+test("checked verified reply disappears from counts, rows and notices; new run at same list timestamp returns", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  const version = rules.displayVersion(currentTask(app));
+  assert.equal(app.notices.size, 1);
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version })).ok, true);
+  assert.equal(currentTask(app).pending, false);
+  assert.equal(app.notices.size, 0);
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 5_000).tasks.length, 0);
+  await app.deliver(replyReport(now + 10_000, update, "A"));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 10_000).tasks.length, 0);
+  await app.deliver(report(now + 15_000, row(update), { busy: true }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 15_000).counts.running, 1);
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version })).ok, false, "old checkbox cannot dismiss a new run");
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version: rules.displayVersion(currentTask(app)) })).ok, false, "known running task cannot be marked handled");
+  await app.deliver(replyReport(now + 20_000, update, "B", { atMessage: now + 18_000 }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 20_000).counts.attention, 1);
+  assert.equal(app.notices.size, 1);
+});
+
+test("a dismissed uncertain pending reply cancels delayed delivery without marking it read", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.getPermissionLevel = async () => "denied";
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  assert.equal(Object.keys(app.local.data[web.keys.state].outbox).length, 1);
+  await app.deliver(report(now + 10_000, row(update), { busy: null, queueError: true }));
+  const before = currentTask(app);
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version: rules.displayVersion(before) })).ok, true);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(currentTask(app).acked, before.acked);
+  assert.deepEqual(app.local.data[web.keys.state].outbox, {});
+  app.chrome.notifications.getPermissionLevel = async () => "granted";
+  await app.deliver(replyReport(now + 15_000, update, "A"));
+  assert.equal(app.notices.size, 0);
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 15_000).tasks.length, 0);
+});
+
+test("48-hour display window uses activity rather than polling; older tasks remain in collector tracking", () => {
+  const tracker = timeline();
+  const age = 48 * 60 * 60_000;
+  const older = now - age - 1, edge = now - age;
+  const oldRow = { ...row(older, older), id: "43" };
+  const edgeRow = { ...row(edge, edge), id: "44" };
+  const packet = report(now, row());
+  packet.conversations.push(oldRow, edgeRow);
+  const initial = tracker.next(packet);
+  assert.deepEqual(rules.view(initial.state, now).tasks.map(t => t.id).sort(), ["42", "44"]);
+  const oldTask = initial.state.tasks["43"];
+  assert.ok(oldTask, "visibility filtering must not delete durable state");
+  assert.ok(rules.watchRows(Array.from({length: 24}, (_, i) => ({ ...row(), id: String(100 + i) })).concat(oldRow),
+    new Map(), { "43": { ...oldTask, pending: true } }, now).some(r => r.id === "43"));
+  const later = tracker.next({ ...packet, at: now + 1, listAt: now + 1, queueAt: { [id]: now + 1, "43": now + 1, "44": now + 1 },
+    queues: { [id]: { sessionState: "IDLE", pending: [] }, "43": { sessionState: "IDLE", pending: [] }, "44": { sessionState: "IDLE", pending: [] } } });
+  assert.deepEqual(rules.view(later.state, now + 1).tasks.map(t => t.id), ["42"]);
+  const renewed = tracker.next({ ...packet, at: now + 5_000, listAt: now + 5_000,
+    conversations: [row(), { ...oldRow, updateTime: now + 3_000 }, edgeRow] });
+  assert.ok(rules.view(renewed.state, now + 5_000).tasks.some(t => t.id === "43"));
+});

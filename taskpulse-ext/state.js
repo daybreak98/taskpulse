@@ -4,6 +4,7 @@
   const STUCK = 30 * 60_000;
   const SETTLE = 90_000;
   const HISTORY = 7 * 24 * 60 * 60_000;
+  const DISPLAY_HISTORY = 48 * 60 * 60_000;
   const order = { attention: 0, stuck: 1, running: 2, seen: 3 };
   const time = value => {
     const number = Number(value);
@@ -17,6 +18,39 @@
 
   function revision(task) {
     return [task.id, task.agentId, task.replyUpdate || task.update, task.replyKey || "-"].join("/");
+  }
+
+  // A display ticket includes the current list version and observed run,
+  // unlike a reply ticket which intentionally refers to an exact reply.
+  function displayVersion(task) {
+    return JSON.stringify([task.id, task.agentId, task.created || 0, task.update || 0,
+      task.replyKey || "", task.runCycleAt || task.runAt || 0, task.lastUserMessage || ""]);
+  }
+
+  function isDismissed(task) {
+    if (task.dismissedVersion) return task.dismissedVersion === displayVersion(task);
+    // Migrate the old checkbox's persistent marker without hiding a new run.
+    return Boolean(task.checkedRevision && task.checkedRevision === revision(task) &&
+      !task.runAt && !task.awaitingReply && (!task.replyUpdate || task.update <= task.replyUpdate));
+  }
+
+  function recentActivity(task, now) {
+    // Never use listAt, observedAt or the latest polling timestamp as activity.
+    const activity = Math.max(task.created || 0, task.update || 0, task.replyAt || 0,
+      task.runCycleAt || task.runAt || 0, task.replyActivityAt || 0);
+    return activity > 0 && now - activity <= DISPLAY_HISTORY;
+  }
+
+  function canDismiss(state, task, now) {
+    if (!taskAccessible(state, task) || task.listedAt !== state.listAt ||
+        !recentActivity(task, now) || isDismissed(task)) return false;
+    const uncertain = !taskFresh(state, task, now) || task.messageUncertain;
+    return Boolean(uncertain || (!task.runAt && !task.awaitingReply && task.status !== "running"));
+  }
+
+  function dismiss(task) {
+    return { ...task, dismissedVersion: displayVersion(task),
+      dismissedNoticeRevision: revision(task) };
   }
 
   function acknowledge(task) {
@@ -152,6 +186,7 @@
     task.observedAt = at;
 
     if (busy) {
+      task.runCycleAt = task.runAt ? (task.runCycleAt || task.runAt) : at;
       task.runAt = started || at;
       task.awaitingReply = true;
       task.lastBusyAt = at;
@@ -188,6 +223,7 @@
       task.replyKey = key;
       task.replyUpdate = task.update;
       task.replyAt = time(message.atMessage);
+      task.replyActivityAt = task.replyAt || at;
       task.phaseAt = at;
       task.pending = true;
       task.failed = Boolean(message.failed);
@@ -308,7 +344,7 @@
         if (cid === activeId && task.status === "attention") {
           // Auto-read must also apply to a reply that has already been notified.
           task = acknowledge(task);
-        } else if (task.notified !== task.replyKey) {
+        } else if (!isDismissed(task) && recentActivity(task, now) && task.notified !== task.replyKey) {
           task.notified = task.replyKey;
           replies.push(task);
         }
@@ -330,7 +366,8 @@
     const counts = { running: 0, attention: 0, stuck: 0 };
     const tasks = [];
     for (const task of Object.values(state.tasks)) {
-      if (task.listedAt !== state.listAt || !taskAccessible(state, task)) continue;
+      if (task.listedAt !== state.listAt || !taskAccessible(state, task) ||
+          !recentActivity(task, now) || isDismissed(task)) continue;
       const uncertain = !taskFresh(state, task, now) || task.messageUncertain;
       if (!uncertain && Object.hasOwn(counts, task.status)) counts[task.status]++;
       tasks.push({ ...task, uncertain });
@@ -339,5 +376,5 @@
     return { counts, tasks, stale, offline, error };
   }
 
-  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, mayDismissNotice, authError, taskAccessible, taskFresh, isNewReply, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
+  globalThis.TaskPulseState = { blank, absorb, view, revision, displayVersion, isDismissed, recentActivity, canDismiss, dismiss, acknowledge, mayDismissNotice, authError, taskAccessible, taskFresh, isNewReply, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
 })();

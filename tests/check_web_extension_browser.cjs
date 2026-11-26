@@ -19,6 +19,8 @@ async function startFixture() {
   let updated = seed, working = true, lastReply = seed, pendingReply = seed, replyReadyAt = 0;
   let account = "a";
   const alternate = { id: 21, agentId: 515, name: "合成账号 B 的会话" };
+  const expired = { id: 22, agentId: 515, name: "49 小时前的会话" };
+  const completed = { id: 23, agentId: 515, name: "已查看的近期会话" };
 
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
@@ -46,14 +48,20 @@ async function startFixture() {
     }
     requests.push({ path: url.pathname, from: request.headers.referer || "" });
     if (account === "logout" ||
-        account === "b" && !url.pathname.endsWith("/list") && !url.pathname.includes("/21/")) {
+        account === "b" && !url.pathname.endsWith("/list") &&
+          !["21", "22", "23"].some(id => url.pathname.includes("/" + id + "/"))) {
       response.writeHead(account === "logout" ? 401 : 403).end();
       return;
+    }
+    if (account === "b" && url.pathname.endsWith("/21/queue")) {
+      response.writeHead(503).end(); return;
     }
     let data;
     if (url.pathname.endsWith("/list") && account === "b") {
       data = { groups: [{ name: "账号 B", conversations: [
-        { ...alternate, updateTime: seed, createTime: seed }
+        { ...alternate, updateTime: seed, createTime: seed },
+        { ...completed, updateTime: seed - 1, createTime: seed - 1 },
+        { ...expired, updateTime: seed - 49 * 60 * 60_000, createTime: seed - 49 * 60 * 60_000 }
       ] }], ungrouped: { conversations: [] } };
     } else if (url.pathname.endsWith("/list")) {
       data = { groups: [{ name: "数据质量", conversations: [
@@ -615,7 +623,34 @@ async function trial() {
     await boundedCompact.waitFor({ state: "visible" });
     const bounds = await assertFitsContentViewport(recovering, boundedCompact);
     assert.equal(bounds.width, 28); assert.equal(bounds.height, 96);
+    // Verify the user's actual checkbox interaction in the isolated frame.
     await worker.evaluate(() => chrome.storage.local.remove("tp-web-position"));
+    await boundedCompact.hover();
+    await boundedPanel.waitFor({ state: "visible" });
+    await boundedPanel.locator(".pin").click();
+    const newGroup = boundedPanel.locator(".group-head").filter({ hasText: "账号 B" });
+    await newGroup.waitFor();
+    if (await newGroup.getAttribute("aria-expanded") === "false") await newGroup.click();
+    await waitState(s => s?.tasks["21"]?.queueError && s?.tasks["23"]?.observedAt &&
+      s.tasks["22"]?.listedAt === s.listAt, "uncertain/recent/expired fixture rows");
+    assert.equal(await boundedPanel.locator("[data-cid='22']").count(), 0);
+    assert.ok((await newGroup.textContent()).includes("2 个会话"));
+    const beforeDismiss = (await readState()).tasks["21"];
+    const check = boundedPanel.locator("[data-check='21']");
+    assert.equal(await check.isEnabled(), true);
+    await check.click();
+    await boundedPanel.locator("[data-cid='21']").waitFor({ state: "detached" });
+    const dismissed = (await readState()).tasks["21"];
+    assert.equal(dismissed.acked, beforeDismiss.acked);
+    assert.equal(dismissed.readRevision, beforeDismiss.readRevision);
+    assert.ok(dismissed.dismissedVersion);
+    const known = boundedPanel.locator("[data-check='23']");
+    await known.waitFor({ state: "visible" });
+    assert.equal(await known.isEnabled(), true);
+    await known.click();
+    await boundedPanel.locator("[data-cid='23']").waitFor({ state: "detached" });
+    assert.equal(await boundedPanel.locator(".task-open").count(), 0);
+    console.log("Uncertain and verified checkbox dismissal removes rows, keeps evidence, and excludes 49-hour history");
     await recovering.close();
     await worker.evaluate(value => chrome.scripting.registerContentScripts(value), registrations);
     console.log("New-tab completion, bounded failed-register/frame recovery, detached-host repair and isolated scrollbar geometry passed");

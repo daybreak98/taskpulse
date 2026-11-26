@@ -304,7 +304,8 @@ async function readForeground(state, tabId, windowId, manual = false) {
 function noticeTask(state, revision) {
   const [id, agentId] = revision.split("/");
   const task = state.tasks[id];
-  return task?.agentId === agentId && task.pending && rules.revision(task) === revision ? task : null;
+  return task?.agentId === agentId && task.pending && rules.revision(task) === revision &&
+    !rules.isDismissed(task) && rules.recentActivity(task, Date.now()) ? task : null;
 }
 
 function pruneOutbox(state) {
@@ -330,8 +331,12 @@ async function clearReadNotices(state) {
     // pending watermark/outbox; do not mark the task read.
     if (state.authBlocked || rules.authError(state.error)) return true;
     if (task && !rules.taskAccessible(state, task)) return true;
-    if (!task || task.agentId !== agentId ||
-        task.pending && rules.revision(task) === revision) return false;
+    if (!task || task.agentId !== agentId) return false;
+    if (rules.isDismissed(task) && rules.revision(task) === revision ||
+        !rules.recentActivity(task, Date.now())) return true;
+    // Do not clear the newly pending version of a previously dismissed row.
+    if (task.pending && rules.revision(task) === revision) return false;
+    if (task.dismissedNoticeRevision === revision) return true;
     // Existing 2.1.1 storage may have a confirmed read watermark but no
     // readRevision yet. Clean up those old notifications on the first sync.
     const currentRevision = rules.revision(task);
@@ -421,7 +426,7 @@ async function acknowledge(state, task, checked = false, jumpToken = "") {
   const revision = rules.revision(task);
   state.tasks[task.id] = rules.acknowledge(task);
   if (jumpToken) state.tasks[task.id].jumpCommit = jumpToken;
-  if (checked) state.tasks[task.id].checkedRevision = revision;
+  if (checked) state.tasks[task.id] = { ...rules.dismiss(state.tasks[task.id]), checkedRevision: revision };
   pruneOutbox(state);
   await saveState(state);
   await syncNotices(state);
@@ -633,8 +638,27 @@ async function markChecked(id, revision, checked) {
     await acknowledge(state, task, true);
   } else if (task.checkedRevision === revision) {
     delete task.checkedRevision;
+    delete task.dismissedVersion;
+    delete task.dismissedNoticeRevision;
     await saveState(state);
   }
+  return { ok: true };
+}
+
+async function dismissTask(id, version) {
+  if (!web.id(id) || typeof version !== "string" || version.length > 4096) return { ok: false };
+  const state = await getState();
+  const task = state.tasks[id], now = Date.now();
+  if (!task || rules.displayVersion(task) !== version) return { ok: false };
+  if (rules.isDismissed(task)) return { ok: true };
+  if (!rules.canDismiss(state, task, now)) return { ok: false };
+  // Verified replies may be acknowledged. An uncertain row is only
+  // dismissed from the presentation, without advancing any read watermark.
+  const confirmed = freshTask(state, task, now) && rules.canAcknowledge(task);
+  state.tasks[id] = rules.dismiss(confirmed ? rules.acknowledge(task) : task);
+  pruneOutbox(state);
+  await saveState(state);
+  await syncNotices(state);
   return { ok: true };
 }
 
@@ -663,11 +687,12 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   else if (surfaces.candidate(sender)) {
     if (msg.kind === "tp.surface.attach") reply = surfaces.attach(sender, msg.token);
     else if (msg.kind === "tp.surface.toasts") reply = surfaces.toastData(sender, msg.token);
-    else if (["tp.open", "tp.check", "tp.settings"].includes(msg.kind)) {
+    else if (["tp.open", "tp.check", "tp.dismiss", "tp.settings"].includes(msg.kind)) {
       reply = surfaces.validate(sender, msg.token).then(allowed => {
         if (!allowed) return { ok: false };
         if (msg.kind === "tp.open") return openTask(msg.id, msg.revision, false, msg.intent);
         if (msg.kind === "tp.check") return serialize(() => markChecked(msg.id, msg.revision, msg.checked));
+        if (msg.kind === "tp.dismiss") return serialize(() => dismissTask(msg.id, msg.version));
         return chrome.runtime.openOptionsPage().then(() => ({ ok: true }));
       });
     }
@@ -688,6 +713,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg.kind === "tp.settings") reply = chrome.runtime.openOptionsPage().then(() => ({ ok: true }));
   if (msg.kind === "tp.open") reply = openTask(msg.id, msg.revision, false, msg.intent);
   if (msg.kind === "tp.check") reply = serialize(() => markChecked(msg.id, msg.revision, msg.checked));
+  if (msg.kind === "tp.dismiss") reply = serialize(() => dismissTask(msg.id, msg.version));
   if (msg.kind === "tp.visit" && !opening.has(msg.id)) {
     const visitAt = Number(msg.at) || Date.now();
     reply = serialize(() => userVisit(msg.id, sender, visitAt));

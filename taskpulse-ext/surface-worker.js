@@ -69,7 +69,8 @@
       for (const revision of notice.revisions || []) {
         const task = state.tasks[revision.split("/")[0]];
         if (task?.pending && rules.taskFresh(state, task, Date.now()) &&
-            rules.canAcknowledge(task) && rules.revision(task) === revision)
+            rules.canAcknowledge(task) && !rules.isDismissed(task) &&
+            rules.recentActivity(task, Date.now()) && rules.revision(task) === revision)
           tasks.push({ id: task.id, name: task.name, revision, failed: task.failed });
       }
       return { ok: true, tasks, remaining: Math.max(0, 15_000 - (Date.now() - notice.at)) };

@@ -247,12 +247,21 @@
     check.type = "button";
     check.dataset.check = task.id;
     check.setAttribute("aria-pressed", String(done));
-    const checkLabel = done ? "取消本轮处理标记" : "标记本轮已处理";
+    const checkLabel = task.uncertain ? "移除此待确认会话" : "标记本轮已处理并移除";
     check.setAttribute("aria-label", checkLabel + " · " + title);
     check.title = checkLabel;
-    check.disabled = !done && (task.uncertain || !rules.canAcknowledge(task));
+    check.disabled = !rules.canDismiss(state, task, Date.now());
     check.addEventListener("click", async () => {
-      await command("tp.check", task, { checked: !done });
+      check.disabled = true;
+      const version = rules.displayVersion(task);
+      const result = await command("tp.dismiss", task, { version });
+      // Storage broadcasts can lag the acknowledgment: hide the exact
+      // version immediately, never a newer version already in local state.
+      if (result?.ok && state.tasks[task.id] &&
+          rules.displayVersion(state.tasks[task.id]) === version) {
+        state = { ...state, tasks: { ...state.tasks, [task.id]: rules.dismiss(state.tasks[task.id]) } };
+        render();
+      } else if (!result?.ok) check.disabled = false;
     });
     row.append(plate, link, check);
     rowViews.push({ task, plate, name, time, title });
@@ -309,7 +318,7 @@
 
   function drawRows(tasks, unavailable) {
     const key = JSON.stringify([filter, groupMode, [...choices], unavailable, tasks.map(task => [
-      rules.revision(task), ui.groupFor(task, groupMode, tabGroups), task.name, task.status, task.uncertain,
+      rules.displayVersion(task), ui.groupFor(task, groupMode, tabGroups), task.name, task.status, task.uncertain,
       task.checkedRevision, task.uncertain ? task.observedAt : 0, task.runAt, task.phaseAt, task.failed, task.messageUncertain
     ])]);
     if (key === lastRows) return;
@@ -606,7 +615,8 @@
       state = changes[web.keys.state].newValue ?? rules.blank();
       for (const toast of [...toasts]) {
         const task = state.tasks[toast.id];
-        if (!task?.pending || !rules.taskAccessible(state, task) || rules.revision(task) !== toast.revision) removeToast(toast.revision);
+        if (!task?.pending || !rules.taskAccessible(state, task) || rules.isDismissed(task) ||
+            !rules.recentActivity(task, Date.now()) || rules.revision(task) !== toast.revision) removeToast(toast.revision);
       }
     }
     if (changes[pinKey]) {
@@ -659,6 +669,7 @@
         for (const task of msg.tasks ?? []) {
           const current = saved.tasks[task.id];
           if (current?.pending && rules.taskFresh(saved, current, Date.now()) && rules.canAcknowledge(current) &&
+              !rules.isDismissed(current) && rules.recentActivity(current, Date.now()) &&
               rules.revision(current) === task.revision) showToast(task);
         }
         reply({ ok: true });
