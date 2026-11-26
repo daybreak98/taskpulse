@@ -882,6 +882,41 @@ class PollingTests(unittest.TestCase):
         self.assertFalse(poller.confirm_active_evidence(task, {**evidence, "at": NOW,
             "collector": "edge-b"}))
 
+    def test_uncertain_focus_retry_never_creates_second_tab(self):
+        task = {"id": 1, "agent_id": 7, "url": "https://agent.example.com/chat?conversationId=1",
+                "reply_version": "a", "pending_replies": [{"version": "a", "observed_at": NOW}]}
+        poller.save_state({"tasks": {"1": task}})
+        ticket = ("1", NOW, "a", poller.action_scope(), "7")
+        route = {"key": "chrome-a", "collector": "chrome-a", "browser": "chrome", "tabId": 1}
+        with patch.object(poller, "_focus_attempt", side_effect=["unknown", "focused"]) as attempt:
+            result = poller.run_open_transaction(ticket, task["url"], route)
+        self.assertEqual(result, "focused")
+        self.assertEqual([call.args[-1] for call in attempt.call_args_list], [True, False])
+        self.assertFalse(poller.load_state()["tasks"]["1"]["reply_pending"])
+
+    def test_focus_claim_ack_is_bound_to_profile_and_attempt(self):
+        ticket = ("1", NOW, "a", poller.action_scope(), "7")
+        route = {"key": "chrome-a", "collector": "chrome-a", "browser": "chrome", "tabId": 1}
+        outcome = []
+        with self.serve() as url:
+            thread = threading.Thread(target=lambda: outcome.append(poller._focus_attempt(
+                ticket, "https://agent.example.com/chat?conversationId=1", route, True)))
+            thread.start()
+            try:
+                cmd = self.auth().get(url + "/cmd?collector=chrome-a", timeout=3).json()
+                wrong = self.auth().post(url + "/cmd/ack", params={"id": cmd["id"], "collector": "edge-b",
+                    "result": "focused"}, timeout=2)
+                self.assertFalse(wrong.json()["ok"])
+                good = self.auth().post(url + "/cmd/ack", params={"id": cmd["id"], "collector": "chrome-a",
+                    "result": "focused"}, timeout=2)
+                self.assertTrue(good.json()["ok"])
+            finally:
+                thread.join(15)
+            self.assertEqual(outcome, ["focused"])
+            late = self.auth().post(url + "/cmd/ack", params={"id": cmd["id"], "collector": "chrome-a",
+                "result": "focused"}, timeout=2)
+            self.assertFalse(late.json()["ok"])
+
     def test_open_confirmation_is_bound_to_reply_and_not_running(self):
         task = {"id": 1, "status": "attention", "reply_pending": True,
                 "update_ms": NOW, "reply_version": "run:new"}

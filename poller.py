@@ -2270,6 +2270,55 @@ def _confirm_open(cid: str, clicked_update: int, clicked_reply: str | None = Non
         save_state(state)
 
 
+_focus_attempts: dict[str, dict] = {}
+
+
+def _focus_attempt(ticket: tuple, url: str, route: dict, allow_create: bool) -> str:
+    cid, _update, _reply, scope, _agent_id = ticket
+    if scope != action_scope():
+        return "old_scope"
+    command_id = "open-" + secrets.token_hex(12)
+    claimed, done = threading.Event(), threading.Event()
+    attempt = {"claimed": claimed, "done": done, "scope": scope,
+               "route": route["key"], "result": None}
+    command = {"cmd": "focus", "cid": cid, "url": url, "tabId": route.get("tabId"),
+               "id": command_id, "scope": scope, "collector": route.get("collector"),
+               "browser": route.get("browser"), "allowCreate": allow_create,
+               "claimExpires": now_ms() + 2000, "expires": now_ms() + 15000}
+    with _cmd_claim_lock:
+        _focus_attempts[command_id] = attempt
+        _cmd_queue(route["key"]).put(command)
+    if claimed.wait(2.0):
+        done.wait(12.0)
+    with _cmd_claim_lock:
+        _focus_attempts.pop(command_id, None)
+        _cmd_done[command_id] = time.time()
+        return attempt["result"] or ("unknown" if claimed.is_set() else "unclaimed")
+
+
+def run_open_transaction(ticket: tuple, url: str, route: dict | None) -> str:
+    if ticket[3] != action_scope() or not url:
+        return "old_scope"
+    if route is None or not route.get("collector"):
+        # Native fallback cannot prove a WEB profile. In API mode it may navigate, but
+        # must not acknowledge an identity-based reply without a verified browser receipt.
+        if source_mode() == "web" or len(current_profiles()) > 1:
+            return "unconfirmed"
+        return open_conversation(ticket[0], target_url=url)
+    first = _focus_attempt(ticket, url, route, True)
+    if first in ("focused", "created"):
+        _confirm_open(*ticket)
+        return first
+    if first == "old_scope" or ticket[3] != action_scope():
+        return "old_scope"
+    # A possible side effect can only be retried by finding the existing/loading tab.
+    second = _focus_attempt(ticket, url, route, first in ("unclaimed", "not_started", "expired"))
+    if second in ("focused", "created"):
+        _confirm_open(*ticket)
+        return second
+    return "unconfirmed"
+
+
 def _cmd_queue(browser: str) -> "queue.Queue[dict]":
     q = _cmd_queues.get(browser)
     if q is None:
@@ -2304,7 +2353,7 @@ _open_seen: dict[str, float] = {}
 _open_guard = threading.Lock()
 
 
-def open_conversation(cid: str) -> str:
+def open_conversation(cid: str, *, target_url: str | None = None) -> str:
     # 双击会连发两次 /open：1.5 秒内同一会话只处理一次，避免连开两个标签
     with _open_guard:
         now = time.time()
@@ -2313,7 +2362,7 @@ def open_conversation(cid: str) -> str:
         _open_seen[cid] = now
 
     task = (load_state().get("tasks") or {}).get(cid) or {}
-    url = task.get("url")
+    url = target_url or task.get("url")
     if not url:
         return "missing"
 
@@ -2667,7 +2716,10 @@ class Handler(BaseHTTPRequestHandler):
             global _cmd_waiters
             _ext_seen = time.time()
             browser = browser_of(self.headers.get("User-Agent") or "", "")
-            q = _cmd_queue(browser)
+            params = parse_qs(urlparse(self.path).query)
+            collector = (params.get("collector") or [""])[0]
+            route_key = collector or browser
+            q = _cmd_queue(route_key)
             with _cmd_waiters_lock:
                 _cmd_waiters += 1
             item = None
@@ -2686,7 +2738,13 @@ class Handler(BaseHTTPRequestHandler):
                         command_id = candidate.get("id")
                         if command_id in _cmd_done or _cmd_expired(candidate):
                             continue
-                        if candidate.get("cmd") == "focus" and command_id:
+                        if candidate.get("scope") and candidate.get("cmd") == "focus":
+                            attempt = _focus_attempts.get(command_id)
+                            if (not attempt or attempt["route"] != route_key or
+                                    candidate["scope"] != action_scope() or now_ms() > candidate.get("claimExpires", 0)):
+                                continue
+                            attempt["claimed"].set()
+                        elif candidate.get("cmd") == "focus" and command_id:
                             _cmd_done[command_id] = time.time()
                         item = candidate
                     break
@@ -2826,6 +2884,20 @@ class Handler(BaseHTTPRequestHandler):
 
         # 扩展收到命令并执行完后回报
         if parsed.path == "/cmd/ack":
+            if cid.startswith("open-"):
+                result = (query.get("result") or ["unknown"])[0]
+                collector = (query.get("collector") or [""])[0]
+                route_key = collector or browser_of(self.headers.get("User-Agent") or "", "")
+                accepted = False
+                with _cmd_claim_lock:
+                    attempt = _focus_attempts.get(cid)
+                    if (attempt and attempt["route"] == route_key and attempt["claimed"].is_set()
+                            and attempt["scope"] == action_scope() and not attempt["done"].is_set()):
+                        attempt["result"] = result
+                        attempt["done"].set()
+                        accepted = True
+                self._json({"ok": accepted})
+                return
             with _cmd_claim_lock:
                 _cmd_acks[cid] = time.time()
                 _cmd_done[cid] = time.time()
@@ -2855,8 +2927,34 @@ class Handler(BaseHTTPRequestHandler):
             if not re.fullmatch(r"[0-9]+", cid):
                 self._json({"ok": False, "result": "missing"}, 400)
                 return
+            requested_scope = (query.get("scope") or [""])[0]
+            with _lock:
+                state = load_state()
+                task0 = (state.get("tasks") or {}).get(cid) or {}
+                if requested_scope or "pending_replies" in task0:
+                    agent_id = (query.get("agent") or [""])[0]
+                    if (requested_scope != action_scope() or not task0 or
+                            agent_id != str(task0.get("agent_id") or "")):
+                        self._json({"ok": False, "result": "old_scope"}, 409)
+                        return
+                    version = (query.get("version") or ["-"])[0]
+                    try:
+                        update = int((query.get("update") or ["0"])[0])
+                    except ValueError:
+                        self._json({"ok": False, "result": "invalid version"}, 400)
+                        return
+                    ticket = (cid, update, "" if version == "-" else version, requested_scope, agent_id)
+                    route = route_for_task(task0)
+                    task0["jump_guard_at"] = now_ms()
+                    save_state(state)
+                else:
+                    ticket = None
+            if ticket is not None:
+                result = run_open_transaction(ticket, task0.get("url") or "", route)
+                self._json({"ok": result in ("focused", "created", "opened"), "result": result})
+                return
+            # Legacy provider/clients without reply identity cannot use the modern acknowledgement path.
             cmd_id = "%s-%s" % (cid, secrets.token_hex(8))
-            task0 = (load_state().get("tasks") or {}).get(cid) or {}
             url0 = task0.get("url")
             if not url0:
                 self._json({"ok": False, "result": "missing"}, 404)
