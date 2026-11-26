@@ -19,6 +19,7 @@
 
 import fcntl
 import hmac
+import hashlib
 import importlib
 import inspect
 import json
@@ -219,19 +220,22 @@ def source_mode() -> str:
 
 def set_source_mode(mode: str) -> None:
     """只在配置文件里改这一项，其余原样写回。"""
-    global _source_epoch
+    global _source_epoch, _mode_epoch
     with _lock:
         try:
             with open(CONFIG_FILE, encoding="utf-8") as f:
                 cfg = json.load(f)
         except Exception:
             cfg = {}
+        previous_mode = source_mode()
         cfg["source"] = mode
         tmp = CONFIG_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         os.replace(tmp, CONFIG_FILE)
-        _source_epoch += 1
+        if mode != previous_mode:
+            _source_epoch += 1
+            _mode_epoch += 1
 ACTIVE_POLL_SECONDS = max(0, int(CFG["poll"]["active_interval_seconds"]))
 DISCOVERY_POLL_SECONDS = max(0, int(CFG["poll"].get("discovery_interval_seconds", 5)))
 ACTIVE_WATCH_LIMIT = min(WATCH_LIMIT, max(0, int(CFG["poll"]["active_watch_limit"])))
@@ -379,6 +383,43 @@ _wake = threading.Event()
 # 每次切换数据来源都递增；用来识别「同一模式但已经换过一轮」——只比 api/web
 # 字符串的话，API→WEB→API 往返后旧样本仍会被当成当前来源的
 _source_epoch = 0
+_mode_epoch = 0
+_boot_id = secrets.token_hex(16)
+
+
+def web_generation() -> str:
+    return f"{_boot_id}:{_mode_epoch}"
+
+
+def read_web_snapshot() -> dict:
+    try:
+        with open(WEBSTATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def current_web_snapshot() -> dict:
+    data = read_web_snapshot()
+    return data if data.get("generation") == web_generation() and data.get("collector") else {}
+
+
+def source_scope() -> str:
+    if source_mode() != "web":
+        return "api"
+    return "web:" + str(read_web_snapshot().get("collector") or "unbound")
+
+
+def scoped_state_path() -> str:
+    # The legacy state.json did not identify its source/account. Retain it intact.
+    scope = source_scope()
+    return STATE_FILE + "." + ("api" if scope == "api" else "web-" + hashlib.sha256(scope.encode()).hexdigest()[:24])
+
+
+def action_scope() -> str:
+    return f"{web_generation()}:{_source_epoch}:{source_scope()}"
+
 # 截止时间调度自己的唤醒（改截止时间、撤销时立刻重算，不用等下一个整秒）
 _deadline_wake = threading.Event()
 
@@ -389,16 +430,17 @@ STATE_SCHEMA = 2
 
 
 def load_state() -> dict:
+    path = scoped_state_path()
     try:
-        with open(STATE_FILE) as f:
+        with open(path) as f:
             state = json.load(f)
     except OSError:
         return {}
     except ValueError as exc:
         # 损坏的状态文件留着当证据，然后从空状态重建：视图必须还能打开
-        bad = STATE_FILE + ".corrupt"
+        bad = path + ".corrupt"
         try:
-            os.replace(STATE_FILE, bad)
+            os.replace(path, bad)
             log("状态文件损坏，已备份到 %s：%s" % (bad, exc))
         except OSError:
             pass
@@ -409,14 +451,16 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    path = scoped_state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     state["schema"] = STATE_SCHEMA
+    state["scope"] = source_scope()
     # 临时文件名要唯一：取数循环和 /webstate 会同时写，共用一个 .tmp 时
     # 先 replace 的那个会把文件搬走，另一个就 ENOENT
-    tmp = "%s.%d.%d.tmp" % (STATE_FILE, os.getpid(), threading.get_ident())
+    tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
     with open(tmp, "w") as f:
         json.dump(state, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, STATE_FILE)
+    os.replace(tmp, path)
 
 
 # ── 认证 ────────────────────────────────────────────────────────────
@@ -670,12 +714,7 @@ class WebProvider:
         页面每几秒就替换一次缓存文件；不固定的话，本轮可能拿到「旧队列 +
         新时间」，旧状态会被当成刚刚确认过。
         """
-        try:
-            with open(WEBSTATE_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            self._round = data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            self._round = {}
+        self._round = current_web_snapshot()
 
     def _snap(self) -> dict:
         return self._round if self._round is not None else self._load()
@@ -1130,10 +1169,10 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False,
         if (expected_gen is not None and gen != expected_gen
                 or isinstance(agent, WebProvider) != (gen[0] == "web")):
             return base
-    # Freeze before reading the list, not just before reading the queues.
-    begin = getattr(agent, "begin_round", None)
-    if callable(begin):
-        begin()
+        # Select snapshot and namespace atomically with the source epoch.
+        begin = getattr(agent, "begin_round", None)
+        if callable(begin):
+            begin()
     tasks = base.get("tasks") or {}
     stamp = now_ms()
     listed: list[dict] = []
@@ -1166,6 +1205,8 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False,
 
     notifications: list[tuple[str, str, str]] = []
     with _lock:
+        if (source_mode(), _source_epoch) != gen:
+            return base
         state = load_state()
         tasks = state.setdefault("tasks", {})
         act = load_active()
@@ -1313,7 +1354,8 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False,
             # web 模式的「更新时间」是浏览器里那份数据的生成时刻，不是本次落盘的时刻——
             # 否则页面停了 100 秒，UI 还以为是刚更新过
             fresh_at = agent.last_at() if isinstance(agent, WebProvider) else None
-            state["updated"] = fresh_at or stamp
+            if fresh_at or not isinstance(agent, WebProvider):
+                state["updated"] = fresh_at or stamp
         # 采样是在锁外做的，可能已经跑了几秒。期间来源被切走的话，这批样本
         # 属于旧来源，落盘会把新来源的数据盖掉——直接丢弃，下一轮按新来源重来。
         if (source_mode(), _source_epoch) == gen:
@@ -1322,8 +1364,10 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False,
             log("来源已切换，丢弃这轮 %s 的采样结果" % (gen,))
             return base
 
-    for title, body, cid in notifications:
-        notify(title, body, cid)
+    with _lock:
+        if (source_mode(), _source_epoch) == gen:
+            for title, body, cid in notifications:
+                notify(title, body, cid)
     if full and sys.platform == "darwin":
         snapshot_edge_tabs(timeout=2)
     return state
@@ -1341,8 +1385,7 @@ def _view_source(mode: str | None = None) -> tuple[str, float | None]:
     if mode != "web":
         return mode, None
     try:
-        with open(WEBSTATE_FILE, encoding="utf-8") as f:
-            at = int(json.load(f).get("at") or 0)
+        at = int(current_web_snapshot().get("at") or 0)
     except (OSError, ValueError):
         return mode, None
     return mode, (now_ms() - at) / 1000 if at else None
@@ -1465,7 +1508,8 @@ def view(state: dict) -> dict:
     active = [r for r in rows if visible(r)]
     return {
         "updated": state.get("updated"),
-        "source": source, "source_age": source_age,
+        "source": source, "source_age": source_age, "scope": source_scope(),
+        "action_scope": action_scope(),
         "poller_error": state.get("poller_error"),
         # 401：凭据失效，只有重新扫码能恢复。App 据此显示「重新授权」按钮
         "auth_required": bool(state.get("auth_required")),
@@ -2228,7 +2272,9 @@ class Handler(BaseHTTPRequestHandler):
         global _ext_seen
         path = urlparse(self.path).path
         if path == "/state":
-            self._json(view(load_state()))
+            with _lock:
+                data = view(load_state())
+            self._json(data)
         elif path == "/diag":
             self._json({"ext_seen_age": round(time.time() - _ext_seen, 1),
                         "cmd_queue": {b: q.qsize() for b, q in _cmd_queues.items()},
@@ -2275,7 +2321,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(item)
         elif path == "/mode":
             # GET 只查询当前来源；切换走 POST（带 value）
-            self._json({"ok": True, "source": source_mode()})
+            with _lock:
+                mode = source_mode()
+                generation = web_generation()
+            self._json({"ok": True, "source": mode, "generation": generation})
         elif path in ("/", "/index.html"):
             # 令牌随页面一起下发（同源）：看板不必再走一次单独取密钥的接口，
             # 也不需要在服务端为它开一个免鉴权的口子。json.dumps 负责转义。
@@ -2285,6 +2334,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def _post(self) -> None:
+        global _source_epoch
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         cid = (query.get("id") or [""])[0]
@@ -2333,14 +2383,26 @@ class Handler(BaseHTTPRequestHandler):
                     if source_mode() != "web":
                         self._json({"ok": True, "ignored": "source is api"})
                         return
-                    try:
-                        with open(WEBSTATE_FILE, encoding="utf-8") as f:
-                            previous_at = int(json.load(f).get("at") or 0)
-                    except (OSError, ValueError, AttributeError):
-                        previous_at = 0
-                    if previous_at >= at:
+                    if payload.get("generation") != web_generation():
+                        self._json({"ok": True, "ignored": "old generation"})
+                        return
+                    collector = payload.get("collector")
+                    browser = payload.get("browser")
+                    if (not isinstance(collector, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", collector)
+                            or browser not in ("chrome", "edge")):
+                        self._json({"ok": False, "error": "missing collector identity"}, 400)
+                        return
+                    previous = read_web_snapshot()
+                    owner = previous.get("collector")
+                    previous_at = int(previous.get("at") or 0)
+                    if owner and owner != collector and now_ms() - previous_at <= WEB_STALE_SECONDS * 1000:
+                        self._json({"ok": True, "ignored": "other collector"})
+                        return
+                    if previous.get("generation") == web_generation() and previous_at >= at:
                         self._json({"ok": True, "ignored": "older snapshot"})
                         return
+                    if owner != collector:
+                        _source_epoch += 1
                     os.makedirs(os.path.dirname(WEBSTATE_FILE), exist_ok=True)
                     tmp = "%s.%d.tmp" % (WEBSTATE_FILE, threading.get_ident())
                     with open(tmp, "w", encoding="utf-8") as f:

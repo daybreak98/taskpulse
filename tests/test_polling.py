@@ -71,6 +71,7 @@ class PollingTests(unittest.TestCase):
         stack.enter_context(patch.multiple(
             poller,
             STATE_FILE=str(Path(self.directory) / "state.json"),
+            WEBSTATE_FILE=str(Path(self.directory) / "webstate.json"),
             ACTIVE_FILE=str(Path(self.directory) / "active.json"),
             _open_visit_until={},  # 每个测试独立模拟一个桌面后台进程
             # 身份密钥也指到临时目录：绝不能碰本机真实的那一份
@@ -564,7 +565,7 @@ class PollingTests(unittest.TestCase):
         path = str(Path(self.directory) / "webstate.json")
         old_at = NOW - 300_000          # 五分钟前取到的队列
         payload = {
-            "at": self.stamp,
+            "at": self.stamp, "generation": poller.web_generation(), "collector": "test-web", "browser": "edge",
             "conversations": [{"id": 1, "name": "会话 1", "updateTime": self.stamp - 1000}],
             "queues": {"1": {"state": "RUNNING", "pending": []}},
             "queueAt": {"1": old_at},
@@ -694,6 +695,38 @@ class PollingTests(unittest.TestCase):
                                 headers={"User-Agent": "Mozilla/5.0 Chrome/157"})
         self.assertEqual(r.status_code, 204)
 
+    def test_scoped_state_and_web_generation_reject_other_collectors(self):
+        path = str(Path(self.directory) / "webstate.json")
+        config = str(Path(self.directory) / "config.json")
+        Path(config).write_text('{"source":"api"}', encoding="utf-8")
+        with patch.multiple(poller, WEBSTATE_FILE=path, CONFIG_FILE=config):
+            poller.save_state({"tasks": {"api": {"name": "API"}}})
+            poller.set_source_mode("web")
+            first_gen = poller.web_generation()
+            with self.serve() as url:
+                def report(collector, browser, gen=first_gen):
+                    return self.auth().post(url + "/webstate", json={
+                        "at": self.stamp, "generation": gen, "collector": collector,
+                        "browser": browser, "conversations": [], "queues": {}
+                    }, timeout=2).json()
+                self.assertTrue(report("chrome-a", "chrome")["ok"])
+                poller.save_state({"tasks": {"chrome": {"name": "Chrome"}}})
+                self.stamp += 1000
+                self.assertEqual(report("edge-b", "edge").get("ignored"), "other collector")
+                self.assertIn("chrome", poller.load_state()["tasks"])
+                poller.set_source_mode("api")
+                self.assertIn("api", poller.load_state()["tasks"])
+                poller.set_source_mode("web")
+                self.stamp += 1000
+                self.assertEqual(report("chrome-a", "chrome").get("ignored"), "old generation")
+                self.assertTrue(report("chrome-a", "chrome", poller.web_generation())["ok"])
+                self.assertIn("chrome", poller.load_state()["tasks"])
+                self.stamp += poller.WEB_STALE_SECONDS * 1000 + 1000
+                self.assertTrue(report("edge-b", "edge", poller.web_generation())["ok"])
+                self.assertNotIn("chrome", poller.load_state().get("tasks", {}))
+                poller.save_state({"tasks": {"edge": {"name": "Edge"}}})
+                self.assertIn("edge", poller.load_state()["tasks"])
+
     def test_old_source_round_and_error_are_discarded(self):
         with patch.object(poller, "source_mode", return_value="web"):
             agent = FakeAgent([conversation(1)])
@@ -717,7 +750,8 @@ class PollingTests(unittest.TestCase):
 
     def test_web_round_freezes_list_and_health_as_well_as_queue(self):
         path = Path(self.directory) / "webstate.json"
-        first = {"at": NOW, "conversations": [conversation(1)],
+        first = {"at": NOW, "generation": poller.web_generation(), "collector": "test-web", "browser": "edge",
+                 "conversations": [conversation(1)],
                  "queues": {"1": {"state": "IDLE", "pending": []}}, "queueAt": {"1": NOW}}
         path.write_text(json.dumps(first), encoding="utf-8")
         with patch.object(poller, "WEBSTATE_FILE", str(path)):
