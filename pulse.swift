@@ -99,6 +99,12 @@ let COMPACT_CAPSULE_H: CGFloat = 72
 let EDGE_SNAP: CGFloat = 26
 let ANIM = 0.06
 
+struct PendingReply: Decodable, Equatable {
+    let version: String
+    let failed: Bool?
+    let observed_at: Int?
+}
+
 struct TaskItem: Decodable, Equatable {
     let id: Int
     let name: String
@@ -115,6 +121,13 @@ struct TaskItem: Decodable, Equatable {
     let muted: Bool?
     let stale: Bool?
     let reply_version: String?
+    let updated_ms: Int?
+    let reply_pending: Bool?
+    let pending_replies: [PendingReply]?
+    let scope: String?
+    let action_scope: String?
+    let agent_id: String?
+    let action_revision: String?
     /// 用户手动标的「完成后提醒我」：行更亮，回话弹窗常驻
     let important: Bool?
     /// 浏览器里是否有这个会话的标签页（清理菜单据此算能关几个）
@@ -130,6 +143,8 @@ struct Payload: Decodable {
     let updated: Int?
     /// 当前取数来源："api"（本机 OBO token）或 "web"（浏览器内 cookie）
     let source: String?
+    let scope: String?
+    let action_scope: String?
     /// web 来源的缓存新鲜度（秒）
     let source_age: Double?
     let window_limit: Int?
@@ -154,6 +169,8 @@ struct NoticeEvent: Decodable {
     let title: String
     let body: String
     let cid: String?
+    let agent_id: String?
+    let revision: String?
 }
 
 func rgb(_ value: UInt32, alpha: CGFloat = 1) -> NSColor {
@@ -1053,7 +1070,8 @@ final class PulseView: NSView {
 
     /// 真·处于该状态（有色行）。「已查看」只是暗色历史，不算命中
     func isLive(_ it: TaskItem, _ f: String) -> Bool {
-        it.status == f && (it.stale != true || f == "attention")
+        if f == "attention" && it.status == "running" && it.reply_pending == true { return true }
+        return it.status == f && (it.stale != true || f == "attention")
     }
 
     /// 筛选时列表不再裁到命中项：全部的组都要留下来，
@@ -1541,10 +1559,14 @@ final class ToastPanel: NSPanel {
 final class ToastHandle {
     let panel: NSPanel
     let item: TaskItem
+    let replyOnly: Bool
+    let replyVersion: String?
     var timer: Timer?
-    init(panel: NSPanel, item: TaskItem) {
+    init(panel: NSPanel, item: TaskItem, replyOnly: Bool, replyVersion: String?) {
         self.panel = panel
         self.item = item
+        self.replyOnly = replyOnly
+        self.replyVersion = replyVersion
     }
 }
 
@@ -1652,8 +1674,16 @@ final class PollerRunner {
         p.environment = env
         p.standardOutput = logHandle("taskpulse.poll.out")
         p.standardError = logHandle("taskpulse.poll.err")
-        p.terminationHandler = { done in
+        p.terminationHandler = { [weak self] done in
             dbg("poller 退出 status=\(done.terminationStatus)")
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.stopped, self.proc === done else { return }
+                self.proc = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    guard let self, !self.stopped else { return }
+                    self.start(rt)
+                }
+            }
         }
         do {
             try p.run()
@@ -1707,9 +1737,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var toasts: [ToastHandle] = []
     var lastStatus: [Int: TaskItem] = [:]
     var statusSeeded = false
+    var replyScope: String?
+    var statusByScope: [String: [Int: TaskItem]] = [:]
+    var sourceChangeInFlight = false
+    var wantedSource: String?
     /// 提示事件的游标：后端重启（event_run 变化）时只记基准，不补弹历史
-    var eventRun = 0
-    var lastEventSeq = 0
+    var eventCursors: [String: (run: Int, seq: Int)] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -1763,7 +1796,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self?.showToast(TaskItem(id: 0, name: "测试提示条", group: nil, status: "attention",
                                              prev: nil, progress: 0, elapsed: 0, idle_minutes: 0,
                                              overdue: false, failed: nil, muted: nil, stale: nil,
-                                             reply_version: nil, important: nil, has_tab: nil),
+                                             reply_version: nil, updated_ms: nil, reply_pending: nil, pending_replies: nil,
+                                             scope: nil, action_scope: nil, agent_id: nil, action_revision: nil,
+                                             important: nil, has_tab: nil),
                                    title: "测试提示条", body: "如果你看到这条，说明提示条正常")
                     return
                 }
@@ -2344,7 +2379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 右上角提示条：Agent 回话时弹出，点一下直接跳到对应标签页。
     /// 多条同时到来时往下堆叠，叠压 20pt，保证每条的标题和正文都露出来。
     func showToast(_ item: TaskItem, title: String = "Agent 回话了", body: String? = nil,
-                   accent: NSColor? = nil) {
+                   accent: NSColor? = nil, replyVersion: String? = nil) {
         let w: CGFloat = 288, h: CGFloat = 64
 
         let tv = ToastView(frame: NSRect(x: 0, y: 0, width: w, height: h))
@@ -2386,15 +2421,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         print("[TaskPulse] toast \(item.name)")
         dbg("toast show id=\(item.id) stack=\(toasts.count + 1)")
-        let handle = ToastHandle(panel: np, item: item)
+        let replyOnly = title == "Agent 回话了" || title == "Agent 回话异常"
+        let handle = ToastHandle(panel: np, item: item, replyOnly: replyOnly,
+                                 replyVersion: replyVersion ?? (replyOnly ? item.reply_version : "-"))
         tv.onClick = { [weak self, weak hd = handle, weak view = tv] in
             guard let self, let hd else { dbg("toast click dead ref"); return }
             dbg("toast click id=\(hd.item.id)")
             // 先给一个「点到了」的反馈，再走跳转，跳转不等待动效
             view?.highlighted = true
-            self.open(hd.item)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-                self?.dismissToast(hd, tapped: true)
+            self.open(hd.item, replyVersion: hd.replyVersion)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak view] in
+                if hd.replyOnly {
+                    // Wait for confirmed acknowledgement in /state; failed jumps remain retryable.
+                    view?.highlighted = false
+                } else {
+                    self?.dismissToast(hd, tapped: true)
+                }
             }
         }
 
@@ -2465,17 +2507,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     /// 同一会话的新回复也能提示，启动时已有的回复只作为基准。
+    func selectReplyScope(_ payload: Payload) {
+        let scope = payload.scope ?? payload.source ?? "legacy"
+        if replyScope != scope {
+            if let prior = replyScope, statusSeeded { statusByScope[prior] = lastStatus }
+            for toast in toasts { dismissToast(toast) }
+            lastStatus = statusByScope[scope] ?? [:]
+            statusSeeded = statusByScope[scope] != nil
+            replyScope = scope
+        }
+    }
+
     func detectReplies(_ payload: Payload) {
+        selectReplyScope(payload)
+        var next = Dictionary(payload.all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         if statusSeeded {
-            for item in payload.all where item.status == "attention" && item.stale != true {
+            for item in payload.all {
+                if item.stale == true {
+                    next[item.id] = lastStatus[item.id]
+                    continue
+                }
                 let previous = lastStatus[item.id]
+                if let replies = item.pending_replies {
+                    let old = Set(previous?.pending_replies?.map { $0.version } ?? [])
+                    for reply in replies where !old.contains(reply.version) {
+                        if reply.failed == true {
+                            showToast(item, title: "Agent 回话异常", accent: palette["stuck"], replyVersion: reply.version)
+                        } else {
+                            showToast(item, replyVersion: reply.version)
+                        }
+                    }
+                    continue
+                }
+                // Compatibility for an older local backend.
+                let failedReply = item.status == "stuck" && item.failed == true && item.reply_pending == true
+                guard item.status == "attention" || failedReply else { continue }
                 let newReply = item.reply_version.map { $0 != previous?.reply_version } ?? false
-                if previous?.status != "attention" || newReply {
-                    showToast(item)
+                let wasReply = previous?.status == "attention" ||
+                    (previous?.status == "stuck" && previous?.failed == true && previous?.reply_pending == true)
+                if !wasReply || newReply {
+                    if failedReply { showToast(item, title: "Agent 回话异常", accent: palette["stuck"]) }
+                    else { showToast(item) }
                 }
             }
         }
-        lastStatus = Dictionary(payload.all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for toast in toasts.filter({ $0.replyOnly }) {
+            guard let item = next[toast.item.id], item.stale != true else { continue }
+            if let replies = item.pending_replies {
+                if !replies.contains(where: { $0.version == toast.replyVersion }) { dismissToast(toast) }
+            } else if item.reply_pending == false || item.status == "seen" || item.status == "done" ||
+                (item.reply_version != nil && item.reply_version != toast.item.reply_version) {
+                dismissToast(toast)
+            }
+        }
+        lastStatus = next
         statusSeeded = true
     }
 
@@ -2483,20 +2568,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 之前走 osascript 的系统通知会被 macOS 记在「脚本编辑器」名下，点了只会打开编辑器。
     func detectEvents(_ payload: Payload) {
         guard let events = payload.events else { return }
+        let scope = payload.scope ?? payload.source ?? "legacy"
         let run = payload.event_run ?? 0
-        if eventRun != run {          // 后端重启过：跳过积压，别一次性把历史事件全弹出来
-            eventRun = run
-            lastEventSeq = events.map { $0.seq }.max() ?? 0
+        guard let cursor = eventCursors[scope] else {
+            eventCursors[scope] = (run, events.map { $0.seq }.max() ?? 0)
             return
         }
-        for event in events where event.seq > lastEventSeq {
-            lastEventSeq = max(lastEventSeq, event.seq)
+        var last = cursor.run == run ? cursor.seq : 0
+        for event in events.sorted(by: { $0.seq < $1.seq }) where event.seq > last {
+            last = max(last, event.seq)
             guard let cid = event.cid, let id = Int(cid),
-                  let item = payload.all.first(where: { $0.id == id }) else { continue }
+                  let item = payload.all.first(where: { $0.id == id }),
+                  event.agent_id == nil || event.agent_id == item.agent_id,
+                  event.revision == nil || event.revision == item.action_revision else { continue }
             let accent = event.title.contains("限流") || event.title.contains("卡住")
                 ? palette["stuck"] : palette["attention"]
             showToast(item, title: event.title, body: event.body, accent: accent)
         }
+        eventCursors[scope] = (run, last)
     }
 
     func refresh() {
@@ -2523,13 +2612,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if let payload {
                     self.view.payload = payload
                     // 后端确认切换到位后，清掉点击时的乐观标记
-                    if self.view.pendingSource == payload.source { self.view.pendingSource = nil }
+                    if !self.sourceChangeInFlight && self.wantedSource == nil &&
+                        self.view.pendingSource == payload.source { self.view.pendingSource = nil }
                     self.consecutiveReadFailures = 0
                     self.nextReadAt = 0
+                    self.selectReplyScope(payload)
                     if !self.view.countersUnavailable { self.detectReplies(payload) }
                     self.detectEvents(payload)
                 } else {
                     self.consecutiveReadFailures = min(self.consecutiveReadFailures + 1, 3)
+                    if self.consecutiveReadFailures == 3 { self.poller.startIfNeeded() }
                     self.nextReadAt = ProcessInfo.processInfo.systemUptime + Double(1 << self.consecutiveReadFailures)
                 }
                 let detail = self.view.statusDetail
@@ -2552,33 +2644,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     /// 点击任务行：跳到对应标签页（不再自动算完成）
-    func open(_ item: TaskItem) {
-        activateEdge()
-        guard let url = URL(string: endpoint + "/open?id=\(item.id)") else { return }
+    func open(_ item: TaskItem, replyVersion: String? = nil) {
+        guard var components = URLComponents(string: endpoint + "/open") else { return }
+        let version = replyVersion ?? item.reply_version ?? "-"
+        var scope = item.action_scope ?? ""
+        // A backend restart changes the transport generation, not the identity of a persisted reply.
+        if let current = view.payload?.all.first(where: { $0.id == item.id }),
+           current.scope == item.scope, current.agent_id == item.agent_id,
+           current.pending_replies?.contains(where: { $0.version == version }) == true ||
+           current.action_revision == item.action_revision {
+            scope = current.action_scope ?? scope
+        }
+        components.queryItems = [URLQueryItem(name: "id", value: String(item.id)),
+                                 URLQueryItem(name: "version", value: version),
+                                 URLQueryItem(name: "scope", value: scope),
+                                 URLQueryItem(name: "agent", value: item.agent_id ?? "")]
+        if let update = item.updated_ms {
+            components.queryItems?.append(URLQueryItem(name: "update", value: String(update)))
+        }
+        guard let url = components.url else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.timeoutInterval = 15
+        req.timeoutInterval = 35
         withToken(&req)
         let t0 = Date()
         dbg("open req id=\(item.id)")
-        URLSession.shared.dataTask(with: req) { data, resp, err in
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
             let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            let result = data.flatMap { try? JSONDecoder().decode(ActionResult.self, from: $0) }
             dbg("open resp id=\(item.id) code=\(code) \(ms)ms err=\(err?.localizedDescription ?? "-") body=\(body)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.refresh() }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.view.actionMessage = code == 200 && result?.ok == true ? nil : "会话跳转未确认，请重试"
+                self.nextReadAt = 0
+                self.applyLayout()
+                self.refresh()
+            }
         }.resume()
     }
 
-    /// 勾选框：手动确认完成
-    func ack(_ item: TaskItem) {
-        post("/ack?id=\(item.id)")
+    func taskAction(_ path: String, _ item: TaskItem, extra: [URLQueryItem] = []) {
+        var components = URLComponents()
+        components.queryItems = [URLQueryItem(name: "id", value: String(item.id)),
+                                 URLQueryItem(name: "scope", value: item.action_scope ?? ""),
+                                 URLQueryItem(name: "agent", value: item.agent_id ?? ""),
+                                 URLQueryItem(name: "revision", value: item.action_revision ?? "")] + extra
+        guard let query = components.percentEncodedQuery else { return }
+        post(path + "?" + query)
     }
 
-    /// 取消勾选：恢复对该会话的监控
-    func unack(_ item: TaskItem) {
-        post("/unack?id=\(item.id)")
-    }
+    /// 勾选框：手动确认完成，仅处理点击时的任务版本
+    func ack(_ item: TaskItem) { taskAction("/ack", item) }
+
+    func unack(_ item: TaskItem) { taskAction("/unack", item) }
 
     func applicationWillTerminate(_ notification: Notification) {
         poller.stop()
@@ -2613,8 +2733,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 切换取数来源：api = 本机 token，web = 浏览器里用 cookie 取数
     func setSource(_ mode: String) {
         view.pendingSource = mode
+        wantedSource = mode
         applyLayout()
-        post("/mode?value=\(mode)")
+        driveSourceChange()
+    }
+
+    func driveSourceChange() {
+        guard !sourceChangeInFlight, let mode = wantedSource,
+              let url = URL(string: endpoint + "/mode?value=\(mode)") else { return }
+        wantedSource = nil
+        sourceChangeInFlight = true
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 10
+        withToken(&req)
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, _ in
+            let result = data.flatMap { try? JSONDecoder().decode(ActionResult.self, from: $0) }
+            let ok = (response as? HTTPURLResponse)?.statusCode == 200 && result?.ok == true
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.sourceChangeInFlight = false
+                if self.wantedSource != nil { self.driveSourceChange() }
+                else if !ok {
+                    self.view.pendingSource = nil
+                    self.view.actionMessage = "来源切换未确认，请重试"
+                }
+                self.nextReadAt = 0
+                self.applyLayout()
+                self.refresh()
+            }
+        }.resume()
     }
 
     func post(_ path: String) {
@@ -2639,7 +2787,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 批量关掉没在用的会话标签；服务端按同一套规则再筛一次。
     /// 单独实现而不用 post()：要把实际关掉的条数回显出来，用户才知道生效了。
     func closeTabs(_ mode: String) {
-        guard let url = URL(string: endpoint + "/tabs/close?mode=\(mode)") else { return }
+        guard let scope = view.payload?.action_scope else { return }
+        var components = URLComponents(string: endpoint + "/tabs/close")
+        components?.queryItems = [URLQueryItem(name: "mode", value: mode), URLQueryItem(name: "scope", value: scope)]
+        guard let url = components?.url else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 12
@@ -2649,7 +2800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
             DispatchQueue.main.async {
                 guard let self else { return }
-                if code == 200, let n = result?.closed {
+                if code == 200, result?.ok == true, let n = result?.closed {
                     self.view.actionMessage = n > 0 ? "已关闭 \(n) 个标签页" : "没有可关闭的标签页"
                 } else {
                     self.view.actionMessage = "清理未完成，请重试"
@@ -2668,12 +2819,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 「完成后提醒我」：只影响展示与弹窗，不改状态判定
     func setImportant(_ item: TaskItem, _ on: Bool) {
-        post("/important?id=\(item.id)&value=\(on ? 1 : 0)")
+        taskAction("/important", item, extra: [URLQueryItem(name: "value", value: on ? "1" : "0")])
     }
 
     func setDeadline(_ item: TaskItem, minutes: Int?) {
-        let duration = minutes.map { "&minutes=\($0)" } ?? ""
-        post("/deadline?id=\(item.id)" + duration)
+        taskAction("/deadline", item, extra: minutes.map { [URLQueryItem(name: "minutes", value: String($0))] } ?? [])
     }
 }
 

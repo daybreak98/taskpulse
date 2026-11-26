@@ -1,6 +1,8 @@
 import json
 import os
 import tempfile
+import shutil
+import subprocess
 import threading
 import time
 import unittest
@@ -71,7 +73,11 @@ class PollingTests(unittest.TestCase):
         stack.enter_context(patch.multiple(
             poller,
             STATE_FILE=str(Path(self.directory) / "state.json"),
+            WEBSTATE_FILE=str(Path(self.directory) / "webstate.json"),
             ACTIVE_FILE=str(Path(self.directory) / "active.json"),
+            _open_visit_until={},  # 每个测试独立模拟一个桌面后台进程
+            _profile_tabs={}, _tab_sample_at={}, _active_browser="",
+            _active_tab={"cid": None, "focused": False, "ts": 0},
             # 身份密钥也指到临时目录：绝不能碰本机真实的那一份
             TOKEN_FILE=str(Path(self.directory) / "token"),
             CONV_URL="https://agent.example.com/chat?conversationId={cid}",
@@ -558,12 +564,85 @@ class PollingTests(unittest.TestCase):
         self.assertTrue(task.get("deadline"), "用户设的截止时间被采样落盘覆盖了")
         self.assertGreater(task["deadline"], self.stamp)
 
+    @unittest.skipUnless(shutil.which("node"), "Node is required for desktop bridge runtime regression")
+    def test_desktop_bridge_runtime_regression(self):
+        script = Path(__file__).with_name("test_desktop_bridge.cjs")
+        result = subprocess.run(["node", "--test", str(script)], capture_output=True,
+                                text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_notice_events_are_persisted_and_source_scoped(self):
+        task = {"id": 1, "name": "A", "agent_id": "agent", "status": "running",
+                "deadline": NOW - 1, "run_version": "run:1", "update_ms": NOW - 100}
+        with patch.object(poller, "source_mode", return_value="api"):
+            poller.save_state({"tasks": {"1": task}})
+            poller._check_deadlines()
+            state = poller.load_state()
+            self.assertEqual(len(state["events"]), 1)
+            self.assertEqual(state["events"][0]["agent_id"], "agent")
+            self.assertEqual(poller.view(state)["events"][0]["revision"], poller.task_revision(state["tasks"]["1"]))
+            poller._check_deadlines()
+            self.assertEqual(len(poller.load_state()["events"]), 1)
+        with patch.object(poller, "source_mode", return_value="web"):
+            self.assertEqual(poller.view(poller.load_state())["events"], [])
+
+    def test_bulk_close_uses_current_profile_not_other_browser(self):
+        path = Path(self.directory) / "webstate.json"
+        path.write_text(json.dumps({"at": NOW, "generation": poller.web_generation(),
+            "collector": "edge-owner", "browser": "edge", "conversations": []}), encoding="utf-8")
+        url = "https://agent.example.com/chat?conversationId=1"
+        with patch.multiple(poller, WEBSTATE_FILE=str(path), source_mode=lambda: "web"):
+            poller.save_state({"tasks": {"1": {"id": 1, "url": url, "status": "seen",
+                                              "update_ms": NOW - 86400000}}})
+            for collector, browser, tab in [("edge-owner", "edge", 11), ("chrome-other", "chrome", 22)]:
+                poller.ingest_tabs({"at": NOW, "collector": collector, "browser": browser,
+                    "tabs": [{"url": url, "tabId": tab}], "active": {"focused": False}})
+            self.assertEqual(poller.closeable_tabs("idle"), [("1", 11)])
+            state = poller.load_state()
+            state["tasks"]["1"]["awaiting_reply"] = True
+            poller.save_state(state)
+            self.assertEqual(poller.closeable_tabs("idle"), [])
+
+    def test_web_full_reports_keep_tracking_running_tasks_outside_limit(self):
+        path = Path(self.directory) / "webstate.json"
+        with patch.multiple(poller, WEBSTATE_FILE=str(path), source_mode=lambda: "web", WATCH_LIMIT=1):
+            def report(convs, queues, messages):
+                path.write_text(json.dumps({
+                    "at": self.stamp, "listAt": self.stamp,
+                    "generation": poller.web_generation(), "collector": "tracked-web", "browser": "edge",
+                    "conversations": convs, "queues": queues,
+                    "queueAt": {cid: self.stamp for cid in queues}, "lastMessages": messages,
+                }), encoding="utf-8")
+                return poller.poll_tick(poller.WebProvider(), full=True)
+            a = {"id": 1, "name": "A", "updateTime": NOW - 1000}
+            b = {"id": 2, "name": "B", "updateTime": NOW + 1000}
+            busy = {"state": "RUNNING", "pending": []}
+            idle = {"state": "IDLE", "pending": []}
+            first = report([a], {"1": busy}, {"1": {"sampledAt": NOW, "messages": []}})
+            self.assertEqual(first["tasks"]["1"]["status"], "running")
+            self.stamp += 4000
+            result = report([b, a], {"1": idle, "2": busy},
+                {"1": {"sampledAt": self.stamp, "messages": [
+                    {"id": "reply-a", "sender": "assistant", "createTime": self.stamp}]}})
+            self.assertTrue(result["tasks"]["1"]["reply_pending"])
+            self.assertEqual(result["tasks"]["2"]["status"], "running")
+
+    def test_web_missing_generation_does_not_create_baseline_or_advance_tasks(self):
+        path = Path(self.directory) / "webstate.json"
+        path.write_text(json.dumps({"at": NOW, "generation": "old-process", "collector": "test-web",
+                                    "conversations": [conversation(1)]}), encoding="utf-8")
+        with patch.multiple(poller, WEBSTATE_FILE=str(path), source_mode=lambda: "web"):
+            result = poller.poll_tick(poller.WebProvider(), full=True)
+            self.assertTrue(result.get("poller_error"))
+            self.assertFalse(result.get("baseline_at"))
+            self.assertFalse(result.get("tasks"))
+
     def test_web_old_queue_sample_is_not_renewed(self):
         """页面重复上报同一份旧队列，不能把观测时间一路往后推。"""
         path = str(Path(self.directory) / "webstate.json")
         old_at = NOW - 300_000          # 五分钟前取到的队列
         payload = {
-            "at": self.stamp,
+            "at": self.stamp, "generation": poller.web_generation(), "collector": "test-web", "browser": "edge",
             "conversations": [{"id": 1, "name": "会话 1", "updateTime": self.stamp - 1000}],
             "queues": {"1": {"state": "RUNNING", "pending": []}},
             "queueAt": {"1": old_at},
@@ -692,6 +771,276 @@ class PollingTests(unittest.TestCase):
             r = self.auth().get(url + "/cmd", timeout=15,
                                 headers={"User-Agent": "Mozilla/5.0 Chrome/157"})
         self.assertEqual(r.status_code, 204)
+
+    def test_scoped_state_and_web_generation_reject_other_collectors(self):
+        path = str(Path(self.directory) / "webstate.json")
+        config = str(Path(self.directory) / "config.json")
+        Path(config).write_text('{"source":"api"}', encoding="utf-8")
+        with patch.multiple(poller, WEBSTATE_FILE=path, CONFIG_FILE=config):
+            poller.save_state({"tasks": {"api": {"name": "API"}}})
+            poller.set_source_mode("web")
+            first_gen = poller.web_generation()
+            with self.serve() as url:
+                def report(collector, browser, gen=first_gen):
+                    return self.auth().post(url + "/webstate", json={
+                        "at": self.stamp, "generation": gen, "collector": collector,
+                        "browser": browser, "conversations": [], "queues": {}
+                    }, timeout=2).json()
+                self.assertTrue(report("chrome-a", "chrome")["ok"])
+                mode = self.auth().get(url + "/mode", timeout=2).json()
+                self.assertEqual(mode["collector"], "chrome-a")
+                self.assertEqual(mode["generation"], first_gen)
+                poller.save_state({"tasks": {"chrome": {"name": "Chrome"}}})
+                self.stamp += 1000
+                self.assertEqual(report("edge-b", "edge").get("ignored"), "other collector")
+                self.assertIn("chrome", poller.load_state()["tasks"])
+                poller.set_source_mode("api")
+                self.assertIn("api", poller.load_state()["tasks"])
+                poller.set_source_mode("web")
+                self.stamp += 1000
+                self.assertEqual(report("chrome-a", "chrome").get("ignored"), "old generation")
+                self.assertTrue(report("chrome-a", "chrome", poller.web_generation())["ok"])
+                self.assertIn("chrome", poller.load_state()["tasks"])
+                self.stamp += poller.WEB_STALE_SECONDS * 1000 + 1000
+                self.assertTrue(report("edge-b", "edge", poller.web_generation())["ok"])
+                self.assertNotIn("chrome", poller.load_state().get("tasks", {}))
+                poller.save_state({"tasks": {"edge": {"name": "Edge"}}})
+                self.assertIn("edge", poller.load_state()["tasks"])
+
+    def test_old_source_round_and_error_are_discarded(self):
+        with patch.object(poller, "source_mode", return_value="web"):
+            agent = FakeAgent([conversation(1)])
+            poller.poll_tick(agent, full=True, expected_gen=("api", poller._source_epoch))
+            self.assertEqual(agent.list_calls, 0)
+            poller._mark_error("old API failure", 30, expected_gen=("api", poller._source_epoch))
+            self.assertNotIn("poller_error", poller.load_state())
+
+    def test_discovery_list_is_kept_even_when_queue_budget_exhausted(self):
+        agent = FakeAgent([conversation(1)])
+        with patch.object(poller, "sample_queues", return_value={}):
+            state = poller.poll_tick(agent, full=False, discovery=True)
+        self.assertIn("1", state["tasks"])
+
+    def test_api_does_not_import_old_web_error(self):
+        path = Path(self.directory) / "webstate.json"
+        path.write_text(json.dumps({"at": NOW, "error": "HTTP 401"}), encoding="utf-8")
+        with patch.multiple(poller, WEBSTATE_FILE=str(path), source_mode=lambda: "api"):
+            state = poller.poll_tick(FakeAgent([conversation()]), full=True)
+        self.assertNotIn("poller_error", state)
+
+    def test_web_round_freezes_list_and_health_as_well_as_queue(self):
+        path = Path(self.directory) / "webstate.json"
+        first = {"at": NOW, "generation": poller.web_generation(), "collector": "test-web", "browser": "edge",
+                 "conversations": [conversation(1)],
+                 "queues": {"1": {"state": "IDLE", "pending": []}}, "queueAt": {"1": NOW}}
+        path.write_text(json.dumps(first), encoding="utf-8")
+        with patch.object(poller, "WEBSTATE_FILE", str(path)):
+            provider = poller.WebProvider()
+            provider.begin_round()
+            path.write_text(json.dumps({"at": NOW + 5000, "conversations": [conversation(2)]}), encoding="utf-8")
+            self.assertEqual(provider.conversations(1)[0]["id"], 1)
+            self.assertEqual(provider.last_at(), NOW)
+            self.assertEqual(provider.queue(1, 1), (False, "IDLE"))
+
+    def test_no_sample_does_not_advance_queue_watermark(self):
+        task = {"id": 1, "queue_checked_at": NOW - 10000, "queue_observed_at": NOW - 10000}
+        poller.apply_queue_sample(task, poller.QueueSample(NOW, None), {}, [])
+        self.assertEqual(task["queue_checked_at"], NOW - 10000)
+        self.assertEqual(task["queue_observed_at"], NOW - 10000)
+
+    def test_evidence_preserves_unread_during_next_run_and_deduplicates_two_replies(self):
+        task = {"id": 1, "name": "task", "update_ms": NOW, "reply_floor": NOW,
+                "created_ms": NOW - 100000, "status": "seen"}
+        def sample(at, busy, messages=None):
+            batch = None if messages is None else poller.normalise_messages(messages)
+            poller.apply_queue_sample(task, poller.QueueSample(at, busy, "RUNNING" if busy else "IDLE",
+                evidence_required=True, messages=batch, message_at=at if batch is not None else 0), {}, [])
+        def msg(mid, at, sender="assistant"):
+            return {"id": mid, "createTime": at, "sender": sender, "content": "ok"}
+        sample(NOW, False, [msg("old", NOW - 1000)])
+        self.assertFalse(task["reply_pending"])
+        sample(NOW + 1000, True)
+        first_run = task["run_version"]
+        sample(NOW + 2000, False, [msg("a", NOW + 1900), msg("old", NOW - 1000)])
+        first = task["reply_version"]
+        self.assertEqual(len(task["pending_replies"]), 1)
+        sample(NOW + 3000, True)
+        self.assertNotEqual(task["run_version"], first_run)
+        self.assertTrue(task["reply_pending"])
+        self.assertEqual(task["pending_replies"][0]["version"], first)
+        sample(NOW + 4000, False, None)   # message fetch failed
+        self.assertTrue(task["awaiting_reply"])
+        self.assertTrue(task["reply_pending"])
+        sample(NOW + 5000, False, [msg("c", NOW + 4800), msg("b", NOW + 3900), msg("a", NOW + 1900)])
+        self.assertEqual(len(task["pending_replies"]), 3)
+        self.assertNotEqual(task["reply_version"], first)
+        sample(NOW + 6000, False, [msg("c", NOW + 4800), msg("b", NOW + 3900), msg("a", NOW + 1900)])
+        self.assertEqual(len(task["pending_replies"]), 3)
+
+    def test_user_only_and_message_failure_do_not_confirm_idle_run(self):
+        task = {"id": 1, "name": "task", "update_ms": NOW, "reply_floor": NOW, "status": "seen"}
+        def apply(at, busy, batch):
+            poller.apply_queue_sample(task, poller.QueueSample(at, busy, "IDLE",
+                evidence_required=True, messages=batch, message_at=at if batch is not None else 0), {}, [])
+        apply(NOW, False, [])
+        apply(NOW + 1000, True, None)
+        apply(NOW + 2000, False, None)
+        self.assertTrue(task["awaiting_reply"])
+        self.assertFalse(task["reply_pending"])
+        apply(NOW + 100000, False, poller.normalise_messages([
+            {"id": "user", "sender": "user", "createTime": NOW + 1000}]))
+        self.assertTrue(task["awaiting_reply"])
+        self.assertFalse(task["reply_pending"])
+        self.assertNotEqual(task["status"], "seen")
+        apply(NOW + 110000, False, poller.normalise_messages([
+            {"id": "reply", "sender": "assistant", "createTime": NOW + 109000},
+            {"id": "user", "sender": "user", "createTime": NOW + 1000}]))
+        self.assertTrue(task["reply_pending"])
+        self.assertFalse(task["awaiting_reply"])
+
+    def test_new_run_resets_old_failure_and_settle_state(self):
+        task = {"id": 1, "name": "test", "status": "stuck", "failed": True,
+                "update_ms": NOW, "running_since": 0, "settle_until": NOW + 1000}
+        events = []
+        poller.apply_queue_sample(task, poller.QueueSample(NOW, True, "RUNNING"), {}, events)
+        self.assertEqual(task["status"], "running")
+        self.assertFalse(task["failed"])
+        self.assertNotIn("settle_until", task)
+        self.assertEqual(events, [])
+
+    def test_new_pending_reply_resets_countdown(self):
+        task = {"id": 1, "name": "test", "status": "attention", "update_ms": NOW,
+                "acked_update": NOW - 1000000, "reply_version": "update:old",
+                "reply_pending": True, "countdown_since": NOW - 1000000}
+        events = []
+        poller.apply_queue_sample(task, poller.QueueSample(NOW, False, "IDLE"), {}, events)
+        self.assertEqual(task["status"], "attention")
+        self.assertEqual(task["countdown_since"], NOW)
+        self.assertEqual(events, [])
+
+    def test_versioned_actions_cannot_ack_new_reply_or_new_scope(self):
+        task = {"id": 1, "name": "A", "agent_id": 7, "status": "attention",
+                "url": "https://agent.example.com/chat?conversationId=1",
+                "update_ms": NOW, "reply_version": "b", "reply_pending": True,
+                "pending_replies": [{"version": "a", "observed_at": NOW - 1000},
+                                    {"version": "b", "observed_at": NOW}]}
+        poller.save_state({"tasks": {"1": task}})
+        scope = poller.action_scope()
+        revision = poller.task_revision(task)
+        poller._confirm_open("1", NOW - 1000, "a", scope, "7")
+        got = poller.load_state()["tasks"]["1"]
+        self.assertEqual([x["version"] for x in got["pending_replies"]], ["b"])
+        self.assertTrue(got["reply_pending"])
+        poller._confirm_open("1", NOW, "b", "old-scope", "7")
+        self.assertTrue(poller.load_state()["tasks"]["1"]["reply_pending"])
+        with self.serve() as url:
+            r = self.auth().post(url + "/ack", params={"id": "1", "scope": scope,
+                "revision": revision, "agent": "7"}, timeout=2)
+            self.assertFalse(r.json()["ok"])
+        self.assertTrue(poller.load_state()["tasks"]["1"]["reply_pending"])
+
+    def test_active_observation_only_acks_replies_visible_at_event_time(self):
+        task = {"id": 1, "name": "A", "agent_id": 7, "status": "attention",
+                "url": "https://agent.example.com/chat?conversationId=1",
+                "reply_version": "b", "reply_pending": True, "update_ms": NOW,
+                "pending_replies": [{"version": "a", "observed_at": NOW - 2000},
+                                    {"version": "b", "observed_at": NOW}]}
+        scope = poller.action_scope()
+        poller.ingest_tabs({"at": NOW - 1500, "browser": "chrome", "collector": "chrome-a",
+            "action_scope": scope, "tabs": [{"url": task["url"], "tabId": 1}]})
+        evidence = {"action_scope": scope, "collector": "chrome-a", "focused": True,
+                    "url": task["url"], "at": NOW - 1000}
+        task["jump_guard_at"] = NOW - 3000
+        self.assertFalse(poller.confirm_active_evidence(task, evidence))
+        self.assertTrue(poller.confirm_active_evidence(task, {**evidence, "explicit": True}))
+        self.assertEqual([x["version"] for x in task["pending_replies"]], ["b"])
+        self.assertFalse(poller.confirm_active_evidence(task, {**evidence, "at": NOW,
+            "collector": "edge-b"}))
+
+    def test_uncertain_focus_retry_never_creates_second_tab(self):
+        task = {"id": 1, "agent_id": 7, "url": "https://agent.example.com/chat?conversationId=1",
+                "reply_version": "a", "pending_replies": [{"version": "a", "observed_at": NOW}]}
+        poller.save_state({"tasks": {"1": task}})
+        ticket = ("1", NOW, "a", poller.action_scope(), "7")
+        route = {"key": "chrome-a", "collector": "chrome-a", "browser": "chrome", "tabId": 1}
+        with patch.object(poller, "_focus_attempt", side_effect=["unknown", "focused"]) as attempt:
+            result = poller.run_open_transaction(ticket, task["url"], route)
+        self.assertEqual(result, "focused")
+        self.assertEqual([call.args[-1] for call in attempt.call_args_list], [True, False])
+        self.assertFalse(poller.load_state()["tasks"]["1"]["reply_pending"])
+
+    def test_focus_claim_ack_is_bound_to_profile_and_attempt(self):
+        ticket = ("1", NOW, "a", poller.action_scope(), "7")
+        route = {"key": "chrome-a", "collector": "chrome-a", "browser": "chrome", "tabId": 1}
+        outcome = []
+        with self.serve() as url:
+            thread = threading.Thread(target=lambda: outcome.append(poller._focus_attempt(
+                ticket, "https://agent.example.com/chat?conversationId=1", route, True)))
+            thread.start()
+            try:
+                cmd = self.auth().get(url + "/cmd?collector=chrome-a", timeout=3).json()
+                wrong = self.auth().post(url + "/cmd/ack", params={"id": cmd["id"], "collector": "edge-b",
+                    "result": "focused"}, timeout=2)
+                self.assertFalse(wrong.json()["ok"])
+                good = self.auth().post(url + "/cmd/ack", params={"id": cmd["id"], "collector": "chrome-a",
+                    "result": "focused"}, timeout=2)
+                self.assertTrue(good.json()["ok"])
+            finally:
+                thread.join(15)
+            self.assertEqual(outcome, ["focused"])
+            late = self.auth().post(url + "/cmd/ack", params={"id": cmd["id"], "collector": "chrome-a",
+                "result": "focused"}, timeout=2)
+            self.assertFalse(late.json()["ok"])
+
+    def test_open_confirmation_is_bound_to_reply_and_not_running(self):
+        task = {"id": 1, "status": "attention", "reply_pending": True,
+                "update_ms": NOW, "reply_version": "run:new"}
+        poller.save_state({"tasks": {"1": task}})
+        poller._confirm_open("1", NOW, "run:old")
+        self.assertTrue(poller.load_state()["tasks"]["1"]["reply_pending"])
+        task.update(status="stuck", running_since=NOW - 1000)
+        poller.save_state({"tasks": {"1": task}})
+        poller._confirm_open("1", NOW, "run:new")
+        self.assertEqual(poller.load_state()["tasks"]["1"]["status"], "stuck")
+
+    def test_programmatic_activation_does_not_clear_pending_reply(self):
+        task = {"id": 1, "status": "attention", "reply_pending": True,
+                "update_ms": NOW, "reply_version": "run:new",
+                "url": "https://agent.example.com/chat?conversationId=1"}
+        poller.save_state({"tasks": {"1": task}})
+        poller._open_visit_until["1"] = time.monotonic() + 15
+        with self.serve() as url:
+            response = self.auth().post(url + "/active", json={"url": task["url"]}, timeout=2)
+            self.assertFalse(response.json()["ok"])
+            self.assertTrue(poller.load_state()["tasks"]["1"]["reply_pending"])
+            poller._open_visit_until.clear()
+            response = self.auth().post(url + "/active", json={"url": task["url"]}, timeout=2)
+            self.assertTrue(response.json()["ok"])
+            self.assertFalse(poller.load_state()["tasks"]["1"]["reply_pending"])
+
+    def test_browser_heartbeat_keeps_other_browser_tab_and_focus(self):
+        with patch.multiple(poller, _tab_ids={}, _tab_browser={}, _tab_groups={},
+                            _tab_sample_at={}, _active_browser=""):
+            edge_url = "https://agent.example.com/chat?conversationId=1"
+            chrome_url = "https://agent.example.com/chat?conversationId=2"
+            poller.ingest_tabs({"browser": "edge", "tabs": [{"url": edge_url, "tabId": 1}],
+                                "active": {"url": edge_url, "focused": True}})
+            poller.ingest_tabs({"browser": "chrome", "tabs": [{"url": chrome_url, "tabId": 2}],
+                                "active": {"url": chrome_url, "focused": False}})
+            self.assertEqual(poller._tab_ids, {"1": 1, "2": 2})
+            self.assertEqual(poller.load_active()["cid"], "1")
+            self.assertTrue(poller.load_active()["focused"])
+
+    def test_conversation_id_requires_exact_query_and_scope(self):
+        self.assertEqual(poller.conversation_id("https://agent.example.com/chat?conversationId=123"), "123")
+        self.assertEqual(poller.conversation_id("https://agent.example.com/share?conversationId=12"), "")
+        self.assertEqual(poller.conversation_id("https://agent.example.com/chat?conversationId=12&conversationId=123"), "")
+        self.assertEqual(poller.conversation_id("https://agent.example.com/chat?next=x#?conversationId=12"), "")
+
+    def test_claimed_focus_command_cannot_trigger_fallback(self):
+        with patch.multiple(poller, _cmd_done={"test-claim": time.time()}, open_conversation=Mock()):
+            poller._open_fallback("1", "test-claim")
+            poller.open_conversation.assert_not_called()
 
     def test_finished_task_leaves_live_counts(self):
         agent = FakeAgent([conversation(1)], busy=(1,))
