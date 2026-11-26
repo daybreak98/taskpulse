@@ -346,7 +346,7 @@ async function trial() {
     const docked = await capsule2.boundingBox();
     assert.equal(docked.width, 108); assert.equal(docked.height, 32); assert.equal(docked.y, 8);
     assert.ok((await frame2.locator(root + " .panel").boundingBox()).y >= docked.y + docked.height + 9);
-    await worker.evaluate(() => chrome.storage.local.set({ "tp-web-position": position }), position);
+    await worker.evaluate(value => chrome.storage.local.set({ "tp-web-position": value }), position);
     console.log("Global isolated capsule drag, persistence across tabs and ordinary page interaction passed");
 
     // The active collector is allowed to be hidden while the user works
