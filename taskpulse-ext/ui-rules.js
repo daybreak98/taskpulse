@@ -13,15 +13,20 @@
     y: Number.isFinite(value?.y) ? clamp(value.y, 0, 1) : null,
     ...(value?.edge === "top" ? { edge: "top" } : {})
   });
-  // Keep legacy x/y storage and the right-side default. Only a drag into
-  // the top docking band selects horizontal orientation.
+  // Identical pill geometry rotated 90 degrees: 108 x 32 or 32 x 108.
+  // Preserve the normalized x/y storage and the top docking hysteresis.
+  const pillSize = horizontal => horizontal ? { width: 108, height: 32 } : { width: 32, height: 108 };
   function move(value, dx, dy, w, h) {
-    const p = normalized(value);
-    const x = p.x * Math.max(0, w - 44) + dx;
-    const y = (p.edge === "top" ? 0 : p.y === null ? 22 : p.y * Math.max(0, h - 84)) + dy;
-    const edge = y <= (p.edge === "top" ? 64 : 42) ? "top" : "";
-    return { x: clamp(x / Math.max(1, w - 44), 0, 1),
-      y: edge ? 0 : clamp(y / Math.max(1, h - 84), 0, 1), ...(edge ? { edge } : {}) };
+    const p = normalized(value), wasTop = p.edge === "top";
+    const before = pillSize(wasTop);
+    const oldW = Math.min(w, before.width), oldH = Math.min(h, before.height);
+    const x = p.x * Math.max(0, w - oldW) + oldW / 2 + dx;
+    const y = (wasTop ? 8 : p.y === null ? 22 : p.y * Math.max(0, h - oldH)) + dy;
+    const edge = y <= (wasTop ? 64 : 42) ? "top" : "";
+    const after = pillSize(Boolean(edge));
+    const cw = Math.min(w, after.width), ch = Math.min(h, after.height);
+    return { x: clamp((x - cw / 2) / Math.max(1, w - cw), 0, 1),
+      y: edge ? 0 : clamp(y / Math.max(1, h - ch), 0, 1), ...(edge ? { edge } : {}) };
   }
   function place(value, viewportWidth, viewportHeight, width, height) {
     const p = normalized(value);
@@ -36,43 +41,21 @@
   function glassLayout(value, w, h, expanded = false, panelHeight = 0) {
     const p = normalized(value), horizontal = p.edge === "top";
     w = Math.max(1, Math.round(w)); h = Math.max(1, Math.round(h));
-    const gap = 10;
-    const cw = Math.min(w, horizontal ? 108 : 44), ch = Math.min(h, horizontal ? 32 : 84);
+    const size = pillSize(horizontal);
+    const cw = Math.min(w, size.width), ch = Math.min(h, size.height);
     const x = Math.round(p.x * (w - cw));
     const y = Math.round(clamp(horizontal ? 8 : p.y === null ? 22 : p.y * (h - ch), 0, h - ch));
-    const cap = rect(x, y, cw, ch);
-    let panel = null, bridge = null, relation = "";
-    if (expanded && panelHeight > 0) {
+    if (expanded) {
+      // Restore the original replacement interaction: the panel occupies
+      // the capsule's anchor, with a horizontal counter inside its header.
+      // Cover the previous capsule so hover expansion cannot flicker.
       const pw = Math.min(240, w);
-      const ph = Math.min(panelHeight, h);
-      const leftRoom = x >= pw + gap, rightRoom = w - x - cw >= pw + gap;
-      if (!horizontal && (leftRoom || rightRoom)) {
-        const left = leftRoom && (!rightRoom || p.x >= .5);
-        const py = clamp(y + ch / 2 - ph / 2, 0, h - ph);
-        panel = rect(left ? x - gap - pw : x + cw + gap, py, pw, ph);
-        const cy = clamp(y + ch / 2, panel.top + Math.min(8, ph / 2), panel.top + ph - Math.min(8, ph / 2));
-        bridge = rect(left ? x - gap : x + cw, cy - 5, gap, 10);
-        relation = "side";
-      } else if (h > ch + gap + 1) {
-        // Top-docked capsules open downward; on short viewports use the
-        // available side of the anchor. Do not move the capsule on expand.
-        const below = horizontal || h - y - ch >= y;
-        const available = below ? h - y - ch - gap : y - gap;
-        const height = Math.min(ph, Math.max(1, available));
-        const px = clamp(x + cw / 2 - pw / 2, 0, w - pw);
-        panel = rect(px, below ? y + ch + gap : y - gap - height, pw, height);
-        const cx = clamp(x + cw / 2, panel.left + Math.min(8,pw / 2), panel.left + pw - Math.min(8,pw / 2));
-        bridge = rect(cx - 5, below ? y + ch : y - gap, 10, gap);
-        relation = "vertical";
-      }
+      const ph = Math.min(h, Math.max(ch, Math.round(panelHeight) || 0));
+      const left = clamp(x - (pw - cw) * p.x, 0, w - pw);
+      const top = clamp(y, 0, h - ph);
+      return { ...rect(left, top, pw, ph), horizontal, capsule: null, panel: rect(0, 0, pw, ph) };
     }
-    const boxes = [cap, panel, bridge].filter(Boolean);
-    const left = Math.min(...boxes.map(b => b.left)), top = Math.min(...boxes.map(b => b.top));
-    const width = Math.max(...boxes.map(b => b.left + b.width)) - left;
-    const height = Math.max(...boxes.map(b => b.top + b.height)) - top;
-    const local = b => b && rect(b.left - left, b.top - top, b.width, b.height);
-    return { left, top, width, height, horizontal, capsule: local(cap), panel: local(panel),
-      bridge: local(bridge), relation };
+    return { ...rect(x, y, cw, ch), horizontal, capsule: rect(0, 0, cw, ch), panel: null };
   }
   // Clip to the rounded shapes, not to their bounding rectangles: a
   // rectangular iframe clip leaves visibly cut-off shadow corners on light pages.
@@ -86,9 +69,7 @@
         "V" + (bottom - k) + arc(right - k, bottom) + "H" + (x + k) +
         arc(x, bottom - k) + "V" + (y + k) + arc(x + k, y) + "Z";
     };
-    return "path('" + [rounded(layout.capsule, 999),
-      layout.panel && rounded(layout.panel, 12), layout.bridge && rounded(layout.bridge, 0)]
-      .filter(Boolean).join(" ") + "')";
+    return "path('" + (layout.panel ? rounded(layout.panel, 12) : rounded(layout.capsule, 999)) + "')";
   }
   function ordinary(value) {
     try {

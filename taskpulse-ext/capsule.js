@@ -39,10 +39,9 @@
   root.innerHTML = `
     <aside class="window" hidden aria-label="TaskPulse">
       ${counter("compact")}
-      <i class="glass-bridge" aria-hidden="true" hidden></i>
       <section class="panel" id="tp-conversations" aria-label="会话列表" hidden>
         <header class="header">
-          ${side ? counter("horizontal") : '<span class="panel-title">TaskPulse</span>'}
+          ${counter("horizontal")}
           <button type="button" class="header-blank" aria-label="拖动面板或双击切换全部分组" title="拖动 · 双击切换分组"></button>
           <div class="source group-mode" role="group" aria-label="分组方式">
             <button type="button" data-mode="dataagent" aria-label="DataAgent 分组" title="DataAgent 内部分组">DA</button>
@@ -61,7 +60,6 @@
   const box = root.querySelector(".window");
   const compact = root.querySelector(".compact");
   const panel = root.querySelector(".panel");
-  const bridge = root.querySelector(".glass-bridge");
   const header = root.querySelector(".header"), footer = root.querySelector(".footer");
   const pin = root.querySelector(".pin");
   const note = root.querySelector(".note");
@@ -357,15 +355,12 @@
     const panelHeight = expanded ? header.offsetHeight + footer.offsetHeight + note.offsetHeight + naturalListHeight : 0;
     const layout = ui.glassLayout(position, w, h, expanded, panelHeight);
     compact.classList.toggle("dock-horizontal", layout.horizontal);
-    bridge.dataset.relation = layout.relation;
-    bridge.hidden = !layout.bridge;
     const setRect = (node, r) => {
       if (r) Object.assign(node.style, { left: r.left + "px", top: r.top + "px",
         width: r.width + "px", height: r.height + "px" });
     };
     setRect(compact, layout.capsule);
     setRect(panel, layout.panel);
-    setRect(bridge, layout.bridge);
     Object.assign(box.style, { left: (frame ? 0 : layout.left) + "px", top: (frame ? 0 : layout.top) + "px",
       right: "auto", width: layout.width + "px", height: layout.height + "px" });
     if (frame) {
@@ -397,7 +392,7 @@
       button.title = names[kind] + " · " + (view.stale ? "待更新" : value);
       button.setAttribute("aria-label", button.title);
     }
-    compact.hidden = side;
+    compact.hidden = side || expanded;
     panel.hidden = !expanded;
     for (const button of groupButtons) button.setAttribute("aria-pressed", String(button.dataset.mode === groupMode));
     pin.setAttribute("aria-pressed", String(pinned));
@@ -426,7 +421,7 @@
       choices.clear();
       actionError = "";
       setExpanded(true);
-      if (event.detail === 0) button.focus({ preventScroll: true });
+      if (event.detail === 0) root.querySelector(`.horizontal [data-filter="${kind}"]`).focus({ preventScroll: true });
     });
   }
   const blank = root.querySelector(".header-blank");
@@ -462,7 +457,7 @@
   // Drag the compact capsule or the header's blank handle. Normal button
   // clicks retain their existing filter/navigation semantics.
   box.addEventListener("pointerdown", event => {
-    if (side || toastOnly || event.button !== 0 || !event.target.closest(".compact,.header-blank")) return;
+    if (side || toastOnly || event.button !== 0 || !event.target.closest(".compact,.horizontal,.header-blank")) return;
     clearTimeout(hoverTimer);
     drag = { pointer: event.pointerId, x: event.screenX, y: event.screenY,
       start: ui.normalized(position), dx: 0, dy: 0, moved: false, sent: false };

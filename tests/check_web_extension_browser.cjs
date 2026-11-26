@@ -129,19 +129,21 @@ async function trial() {
     await page.goto(home);
     const compact = page.locator(root + " .compact");
     const panel = page.locator(root + " .panel");
-    const horizontal = compact; // The same capsule remains visible when expanded.
+    const horizontal = panel.locator(".horizontal");
     await compact.locator("[data-filter='running']").filter({ hasText: /^1$/ }).waitFor({ timeout: 16_000 });
-    assert.deepEqual(await compact.boundingBox(), { x: 1356, y: 22, width: 44, height: 84 });
+    assert.deepEqual(await compact.boundingBox(), { x: 1368, y: 22, width: 32, height: 108 });
     await compact.hover();
     await panel.waitFor({ state: "visible" });
-    assert.deepEqual(await compact.boundingBox(), { x: 1356, y: 22, width: 44, height: 84 });
+    await compact.waitFor({ state: "hidden" });
+    assert.deepEqual(await horizontal.boundingBox(), { x: 1172, y: 26, width: 96, height: 28 });
+    assert.equal(await panel.locator(".panel-title, .glass-bridge").count(), 0);
     assert.equal((await panel.boundingBox()).width, 240);
     assert.equal(await panel.locator("[data-mode='dataagent']").getAttribute("aria-pressed"), "true");
     assert.equal(await panel.locator(".footer span").textContent(), "WEB");
     await page.mouse.move(600, 400);
     await panel.waitFor({ state: "hidden" });
     const initial = await compact.boundingBox();
-    await page.mouse.move(initial.x + 22, initial.y + 42);
+    await page.mouse.move(initial.x + initial.width / 2, initial.y + initial.height / 2);
     await page.mouse.down();
     await page.mouse.move(700, 7, { steps: 10 });
     await page.mouse.up();
@@ -152,7 +154,9 @@ async function trial() {
     assert.equal(top.width, 108); assert.equal(top.height, 32); assert.equal(top.y, 8);
     await compact.hover();
     await panel.waitFor({ state: "visible" });
-    assert.ok((await panel.boundingBox()).y >= top.y + top.height + 9);
+    await compact.waitFor({ state: "hidden" });
+    assert.equal((await panel.boundingBox()).y, top.y);
+    assert.equal((await horizontal.boundingBox()).height, 28);
     // Restore the legacy location for the existing behavioral checks.
     await worker.evaluate(() => chrome.storage.local.remove("tp-web-position"));
     await page.mouse.move(600, 400);
@@ -234,7 +238,7 @@ async function trial() {
     await toast.waitFor({ state: "hidden" });
     await attention.click();
     assert.equal(await attention.getAttribute("aria-pressed"), "true");
-    assert.equal(await compact.locator(".dimmed").count(), 2);
+    assert.equal(await horizontal.locator(".dimmed").count(), 2);
     await attention.click();
     if (await group.getAttribute("aria-expanded") === "false") await group.click();
     const newTab = context.waitForEvent("page", { timeout: 10_000 });
@@ -336,16 +340,26 @@ async function trial() {
     assert.equal(await frame2.evaluate(() => getComputedStyle(document.documentElement).backgroundColor), "rgba(0, 0, 0, 0)");
     assert.equal(await frame2.evaluate(() => getComputedStyle(document.documentElement).colorScheme), "light");
     const capsule2 = frame2.locator(root + " .compact");
-    const rect2 = await capsule2.boundingBox();
+    const panel2 = frame2.locator(root + " .panel");
+    const headerCapsule = panel2.locator(".horizontal");
+    await capsule2.waitFor({ state: "hidden" });
+    assert.equal((await headerCapsule.boundingBox()).height, 28);
+    const rect2 = await panel2.locator(".header-blank").boundingBox();
     await external2.mouse.move(rect2.x + rect2.width / 2, rect2.y + rect2.height / 2);
     await external2.mouse.down();
     await external2.mouse.move(700, 5, { steps: 10 });
     await external2.mouse.up();
     for (let i = 0; i < 50 && !(await capsule2.getAttribute("class")).includes("dock-horizontal"); i++)
       await new Promise(r => setTimeout(r, 50));
+    assert.equal((await panel2.boundingBox()).y, 8);
+    // Collapse at the new dock and verify the standalone rotated pill.
+    await panel2.locator(".close").click();
+    await capsule2.waitFor({ state: "visible" });
     const docked = await capsule2.boundingBox();
     assert.equal(docked.width, 108); assert.equal(docked.height, 32); assert.equal(docked.y, 8);
-    assert.ok((await frame2.locator(root + " .panel").boundingBox()).y >= docked.y + docked.height + 9);
+    await capsule2.hover();
+    await panel2.waitFor({ state: "visible" });
+    await panel2.locator(".pin").click();
     await worker.evaluate(value => chrome.storage.local.set({ "tp-web-position": value }), position);
     console.log("Global isolated capsule drag, persistence across tabs and ordinary page interaction passed");
 

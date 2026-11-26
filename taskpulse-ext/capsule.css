@@ -13,12 +13,12 @@
 button { appearance: none; border: 0; padding: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; }
 button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
 .window { position: fixed; top: 22px; right: 0; pointer-events: none; background: transparent; }
-.capsule, .panel, .glass-bridge { position: absolute; pointer-events: auto; }
+.capsule, .panel { position: absolute; pointer-events: auto; }
 .capsule {
   display: grid; overflow: hidden; isolation: isolate; background: rgb(62 112 139 / .67);
   border-radius: 999px; box-shadow: 0 4px 13px rgb(5 26 41 / .20);
 }
-.capsule.compact { width: 44px; height: 84px; grid-template-rows: repeat(3, minmax(0, 1fr)); grid-template-columns: minmax(0, 1fr); touch-action: none; cursor: grab; }
+.capsule.compact { width: 32px; height: 108px; grid-template-rows: repeat(3, minmax(0, 1fr)); grid-template-columns: minmax(0, 1fr); touch-action: none; cursor: grab; }
 .capsule.compact.dock-horizontal { width: 108px; height: 32px; grid-template-rows: minmax(0, 1fr); grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .capsule::after {
   content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; z-index: 2;
@@ -32,21 +32,13 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
   color: #122e40; font-size: 16px; font-weight: 650; line-height: 1; font-variant-numeric: tabular-nums;
   cursor: inherit; touch-action: none;
 }
-.dock-horizontal .number { font-size: 18px; }
+.compact .number { font-size: 18px; }
 .number[data-filter="attention"] { --base: 157 126 72; --light: 248 199 100; --glow: .93; }
 .number[data-filter="stuck"] { --base: 147 91 103; --light: 235 157 165; --glow: .8; }
 .number.zero { --base: 78 116 137; --light: 150 180 196; --glow: .38; }
 .number[aria-pressed="true"] { box-shadow: inset 0 0 0 1px rgb(191 230 248 / .36); }
 .number.dimmed::before { content: ""; position: absolute; inset: 0; background: rgb(12 31 43 / .19); }
 .number span { position: relative; }
-.glass-bridge { z-index: 0; background: transparent; }
-.glass-bridge::before, .glass-bridge::after { content: ""; position: absolute; border-radius: 1px; pointer-events: none; }
-.glass-bridge::before { background: #5ebbe9; box-shadow: 0 0 4px rgb(72 174 229 / .25); }
-.glass-bridge::after { background: #e8b663; box-shadow: 0 0 4px rgb(237 177 77 / .25); }
-.glass-bridge[data-relation="side"]::before { left: 0; right: 0; top: 2px; height: 1px; }
-.glass-bridge[data-relation="side"]::after { left: 0; right: 0; bottom: 2px; height: 1px; }
-.glass-bridge[data-relation="vertical"]::before { top: 0; bottom: 0; left: 2px; width: 1px; }
-.glass-bridge[data-relation="vertical"]::after { top: 0; bottom: 0; right: 2px; width: 1px; }
 .panel, .toast {
   isolation: isolate; border: 0; border-radius: var(--radius); overflow: hidden;
   background: linear-gradient(154deg, rgb(121 185 215 / .12), transparent 36%, rgb(8 39 58 / .12)), var(--glass-tint);
@@ -57,11 +49,10 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
   content: ""; position: absolute; z-index: 2; inset: 0; border-radius: inherit;
   box-shadow: inset 0 0 0 1px var(--glass-edge); pointer-events: none;
 }
-.header { flex: 0 0 31px; height: 31px; display: flex; align-items: center; padding: 0 8px 0 12px; gap: 4px; position: relative; }
+.header { flex: 0 0 36px; height: 36px; display: flex; align-items: center; padding: 0 8px 0 12px; gap: 4px; position: relative; }
 .header::after { position: absolute; content: ""; inset: auto 11px 0; height: 1px; background: var(--line); pointer-events: none; }
-.panel-title { color: var(--ink); font-size: 14px; font-weight: 500; letter-spacing: .05px; white-space: nowrap; pointer-events: none; }
 .header-blank { flex: 1; min-width: 8px; align-self: stretch; cursor: grab; touch-action: none; }
-.header-blank:active, .compact:active { cursor: grabbing; }
+.header-blank:active, .compact:active, .horizontal:active { cursor: grabbing; }
 .source.group-mode { flex: 0 0 52px; width: 52px; height: 18px; display: grid; grid-template-columns: 1fr 1fr; padding: 1px; gap: 0; border-radius: 9px; border: 1px solid var(--line); background: rgb(8 35 52 / .31); }
 .group-mode button { border-radius: 8px; font-size: 8.5px; font-weight: 500; color: var(--secondary); }
 .group-mode button[aria-pressed="true"] { font-weight: 700; color: #f3fbff; background: rgb(88 152 182 / .72); }
@@ -135,7 +126,5 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
    would be truncated at the iframe boundary and look like square fringes. */
 :host([data-surface="panel"]) .capsule, :host([data-surface="panel"]) .panel,
 :host([data-surface="toast"]) .toast { box-shadow: inset 0 0 9px rgb(125 180 208 / .11); }
-:host([data-surface="panel"]) .glass-bridge::before,
-:host([data-surface="panel"]) .glass-bridge::after { box-shadow: none; }
-.capsule.horizontal { position: relative; flex: 0 0 96px; width: 96px; height: 24px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.horizontal .number { font-size: 12px; }
+.capsule.horizontal { position: relative; flex: 0 1 96px; min-width: 60px; width: 96px; height: 28px; grid-template-columns: repeat(3, minmax(0, 1fr)); touch-action: none; cursor: grab; }
+.horizontal .number { font-size: 14px; }
