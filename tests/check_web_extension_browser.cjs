@@ -131,11 +131,15 @@ async function trial() {
     const panel = page.locator(root + " .panel");
     const horizontal = panel.locator(".horizontal");
     await compact.locator("[data-filter='running']").filter({ hasText: /^1$/ }).waitFor({ timeout: 16_000 });
-    assert.deepEqual(await compact.boundingBox(), { x: 1368, y: 22, width: 32, height: 108 });
+    const vertical = await compact.boundingBox();
+    assert.deepEqual(vertical, { x: 1372, y: 22, width: 28, height: 96 });
+    const pillFont = await compact.locator(".number").first().evaluate(el => getComputedStyle(el).fontSize);
+    assert.equal(pillFont, "16px");
     await compact.hover();
     await panel.waitFor({ state: "visible" });
     await compact.waitFor({ state: "hidden" });
-    assert.deepEqual(await horizontal.boundingBox(), { x: 1172, y: 26, width: 96, height: 28 });
+    assert.deepEqual(await horizontal.boundingBox(), { x: 1172, y: 26, width: vertical.height, height: vertical.width });
+    assert.equal(await horizontal.locator(".number").first().evaluate(el => getComputedStyle(el).fontSize), pillFont);
     assert.equal(await panel.locator(".panel-title, .glass-bridge").count(), 0);
     assert.equal((await panel.boundingBox()).width, 240);
     assert.equal(await panel.locator("[data-mode='dataagent']").getAttribute("aria-pressed"), "true");
@@ -151,12 +155,14 @@ async function trial() {
     for (let i = 0; i < 30 && !(await compact.getAttribute("class")).includes("dock-horizontal"); i++)
       await new Promise(r => setTimeout(r, 50));
     const top = await compact.boundingBox();
-    assert.equal(top.width, 108); assert.equal(top.height, 32); assert.equal(top.y, 8);
+    assert.equal(top.width, vertical.height); assert.equal(top.height, vertical.width); assert.equal(top.y, 8);
+    assert.equal(await compact.locator(".number").first().evaluate(el => getComputedStyle(el).fontSize), pillFont);
     await compact.hover();
     await panel.waitFor({ state: "visible" });
     await compact.waitFor({ state: "hidden" });
     assert.equal((await panel.boundingBox()).y, top.y);
-    assert.equal((await horizontal.boundingBox()).height, 28);
+    assert.equal((await horizontal.boundingBox()).height, top.height);
+    assert.equal((await horizontal.boundingBox()).width, top.width);
     // Restore the legacy location for the existing behavioral checks.
     await worker.evaluate(() => chrome.storage.local.remove("tp-web-position"));
     await page.mouse.move(600, 400);
@@ -345,18 +351,30 @@ async function trial() {
     await capsule2.waitFor({ state: "hidden" });
     assert.equal((await headerCapsule.boundingBox()).height, 28);
     const rect2 = await panel2.locator(".header-blank").boundingBox();
-    await external2.mouse.move(rect2.x + rect2.width / 2, rect2.y + rect2.height / 2);
+    const fromX = rect2.x + rect2.width / 2, fromY = rect2.y + rect2.height / 2;
+    await external2.mouse.move(fromX, fromY);
     await external2.mouse.down();
-    await external2.mouse.move(700, 5, { steps: 10 });
+    // Let the cross-origin start message install its drag shield. This is
+    // normal pointer input, not synthetic dispatch into the extension.
+    await new Promise(r => setTimeout(r, 50));
+    for (let step = 1; step <= 12; step++) {
+      await external2.mouse.move(fromX + (700 - fromX) * step / 12, fromY + (5 - fromY) * step / 12);
+      await new Promise(r => setTimeout(r, 17));
+    }
     await external2.mouse.up();
-    for (let i = 0; i < 50 && !(await capsule2.getAttribute("class")).includes("dock-horizontal"); i++)
+    let dockPosition;
+    for (let i = 0; i < 50; i++) {
+      dockPosition = await worker.evaluate(async () => (await chrome.storage.local.get("tp-web-position"))["tp-web-position"]);
+      if (dockPosition?.edge === "top" && (await panel2.boundingBox())?.y === 8) break;
       await new Promise(r => setTimeout(r, 50));
+    }
+    assert.equal(dockPosition?.edge, "top", JSON.stringify(dockPosition));
     assert.equal((await panel2.boundingBox()).y, 8);
     // Collapse at the new dock and verify the standalone rotated pill.
     await panel2.locator(".close").click();
     await capsule2.waitFor({ state: "visible" });
     const docked = await capsule2.boundingBox();
-    assert.equal(docked.width, 108); assert.equal(docked.height, 32); assert.equal(docked.y, 8);
+    assert.equal(docked.width, vertical.height); assert.equal(docked.height, vertical.width); assert.equal(docked.y, 8);
     await capsule2.hover();
     await panel2.waitFor({ state: "visible" });
     await panel2.locator(".pin").click();

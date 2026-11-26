@@ -8,7 +8,7 @@
   let enabled = false, position, mountGeneration = 0, registration = null, mountPromise = null;
   let host = null, shadow = null, panel = null, toast = null;
   let panelSize = { expanded: false, panelHeight: 0 }, pendingOpen = false, pendingToast = false;
-  let dragStart = null, moveFrame = 0;
+  let dragStart = null, moveFrame = 0, dragShield = null;
   let prefGeneration = 0, prefVersion = 0, listening = false;
   const visible = () => !document.hidden && enabled && alive() &&
     !globalThis.TaskPulseWeb?.conversationPage(location.href);
@@ -48,13 +48,62 @@
         height: "1px", visibility: "hidden" });
     } else signalFrame(toast, { type: "tp-host-refresh" });
   }
+  function finishDrag(notify = true) {
+    if (!dragStart) return;
+    const drag = dragStart;
+    dragStart = null;
+    dragShield?.remove();
+    dragShield = null;
+    if (moveFrame) cancelAnimationFrame(moveFrame);
+    moveFrame = 0;
+    if (drag.moved) {
+      reposition(); sendGeometry();
+      void chrome.storage.local.set({ [ui.keys.position]: position }).catch(() => {});
+    }
+    if (notify) signalFrame(panel, { type: "tp-host-drag-ended", gesture: drag.gesture, moved: drag.moved });
+  }
+  function startDrag(msg) {
+    if (!Number.isInteger(msg.gesture) || !Number.isFinite(msg.x) || !Number.isFinite(msg.y) || !shadow) return;
+    finishDrag(false);
+    dragStart = { gesture: msg.gesture, x: msg.x, y: msg.y, position: ui.normalized(position), moved: false };
+    // Transparent drag-only hit shield behind the iframe. It prevents
+    // dropped capture from turning into clicks on the underlying site.
+    dragShield = document.createElement("div");
+    Object.assign(dragShield.style, { position: "fixed", inset: "0", background: "transparent",
+      pointerEvents: "auto", touchAction: "none", cursor: "grabbing" });
+    shadow.prepend(dragShield);
+  }
+  function moveDrag(x, y) {
+    if (!dragStart || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    const dx = x - dragStart.x, dy = y - dragStart.y;
+    dragStart.moved ||= Math.hypot(dx, dy) >= 5;
+    if (!dragStart.moved) return;
+    position = ui.move(dragStart.position, dx, dy, innerWidth, innerHeight);
+    if (!moveFrame) moveFrame = requestAnimationFrame(() => { moveFrame = 0; reposition(); sendGeometry(); });
+  }
+  // Parent-side fallback only while an authenticated frame gesture exists.
+  window.addEventListener("pointermove", event => {
+    if (!dragStart || !event.isTrusted || !event.composedPath().includes(host)) return;
+    if (!(event.buttons & 1)) { finishDrag(); return; }
+    event.preventDefault(); event.stopPropagation();
+    moveDrag(event.screenX, event.screenY);
+  }, true);
+  window.addEventListener("pointerup", event => {
+    if (!dragStart || !event.isTrusted || !event.composedPath().includes(host)) return;
+    event.preventDefault(); event.stopPropagation();
+    moveDrag(event.screenX, event.screenY); finishDrag();
+  }, true);
+  window.addEventListener("pointercancel", event => {
+    if (dragStart && event.isTrusted && event.composedPath().includes(host)) finishDrag();
+  }, true);
+
   function unmount() {
     mountGeneration++;
     mountPromise = null;
+    finishDrag(false);
     host?.remove();
     host = shadow = panel = toast = registration = null;
     pendingOpen = pendingToast = false;
-    dragStart = null;
     if (moveFrame) cancelAnimationFrame(moveFrame);
     moveFrame = 0;
   }
@@ -90,15 +139,10 @@
         sendGeometry();
         if (pendingOpen) { pendingOpen = false; signalFrame(panel, { type: "tp-host-open" }); }
       } else if (msg.type === "tp-frame-size") sizePanel(msg.expanded, msg.panelHeight);
-      else if (msg.type === "tp-frame-drag" && Number.isFinite(msg.dx) && Number.isFinite(msg.dy)) {
-        if (msg.start || !dragStart) dragStart = ui.normalized(position);
-        position = ui.move(dragStart, msg.dx, msg.dy, innerWidth, innerHeight);
-        if (!moveFrame) moveFrame = requestAnimationFrame(() => { moveFrame = 0; reposition(); sendGeometry(); });
-        if (msg.done) {
-          dragStart = null;
-          reposition(); sendGeometry();
-          void chrome.storage.local.set({ [ui.keys.position]: position }).catch(() => {});
-        }
+      else if (msg.type === "tp-frame-drag-start") startDrag(msg);
+      else if (msg.type === "tp-frame-drag" && dragStart?.gesture === msg.gesture) {
+        moveDrag(msg.x, msg.y);
+        if (msg.done) finishDrag();
       }
     } else if (toast && event.source === toast.contentWindow && msg.type === "tp-frame-size") {
       const height = Math.max(0, Math.min(160, Number(msg.height) || 0));

@@ -28,6 +28,8 @@
   const host = document.createElement("div");
   host.id = hostId;
   host.dataset.surface = native ? "native" : side ? "side" : frameMode;
+  host.style.setProperty("--pill-long", ui.pill.long + "px");
+  host.style.setProperty("--pill-short", ui.pill.short + "px");
   const root = host.attachShadow({ mode: "open" });
 
   function counter(layout) {
@@ -83,7 +85,7 @@
   let panelClock = null;
   let position, groupMode = "dataagent", tabGroups = {};
   let viewport = { width: innerWidth, height: innerHeight }, frameGeometryReady = !frame;
-  let lastSize = "", drag = null, dragFrame = 0, suppressClickUntil = 0;
+  let lastSize = "", drag = null, dragFrame = 0, suppressClickUntil = 0, gestureSerial = 0;
   let styled = false, prefsChanged = new Set(), toastLoaded = !toastOnly;
   const groupButtons = [...root.querySelectorAll("[data-mode]")];
 
@@ -454,43 +456,59 @@
       hoverTimer = setTimeout(() => setExpanded(false), 150);
     }
   });
-  // Drag the compact capsule or the header's blank handle. Normal button
-  // clicks retain their existing filter/navigation semantics.
+  // The cross-origin iframe moves during a drag. Chromium may transfer
+  // pointer events to its parent when its clipped hit region changes. Start
+  // the parent gesture on pointerdown, so it can continue the same drag.
   box.addEventListener("pointerdown", event => {
-    if (side || toastOnly || event.button !== 0 || !event.target.closest(".compact,.horizontal,.header-blank")) return;
+    if (event.button !== 0) return;
+    // A new deliberate click is not the synthetic click from a prior drag.
+    suppressClickUntil = 0;
+    if (side || toastOnly || drag || !event.target.closest(".compact,.horizontal,.header-blank")) return;
     clearTimeout(hoverTimer);
-    drag = { pointer: event.pointerId, x: event.screenX, y: event.screenY,
-      start: ui.normalized(position), dx: 0, dy: 0, moved: false, sent: false };
+    drag = { pointer: event.pointerId, gesture: ++gestureSerial, x: event.screenX, y: event.screenY,
+      start: ui.normalized(position), dx: 0, dy: 0, moved: false, target: event.target };
+    if (frame) post({ type: "tp-frame-drag-start", gesture: drag.gesture, x: drag.x, y: drag.y });
     try { event.target.setPointerCapture(event.pointerId); } catch {}
   });
   function applyDrag(done = false) {
-    if (!drag?.moved) return;
+    if (!drag) return;
     if (frame) {
-      post({ type: "tp-frame-drag", dx: drag.dx, dy: drag.dy, start: !drag.sent, done });
-      drag.sent = true;
-    } else {
+      post({ type: "tp-frame-drag", gesture: drag.gesture,
+        x: drag.x + drag.dx, y: drag.y + drag.dy, done });
+    } else if (drag.moved) {
       position = ui.move(drag.start, drag.dx, drag.dy, innerWidth, innerHeight);
       layoutSurface();
       if (done) void chrome.storage.local.set({ [ui.keys.position]: position }).catch(() => {});
     }
   }
+  function measureDrag(event) {
+    drag.dx = event.screenX - drag.x; drag.dy = event.screenY - drag.y;
+    drag.moved ||= Math.hypot(drag.dx, drag.dy) >= 5;
+  }
+  function clearDrag(moved = false) {
+    if (dragFrame) cancelAnimationFrame(dragFrame);
+    dragFrame = 0;
+    if (moved || drag?.moved) suppressClickUntil = Date.now() + 350;
+    const previous = drag;
+    drag = null;
+    try {
+      if (previous?.target.hasPointerCapture(previous.pointer)) previous.target.releasePointerCapture(previous.pointer);
+    } catch {}
+  }
   box.addEventListener("pointermove", event => {
     if (!drag || event.pointerId !== drag.pointer) return;
-    drag.dx = event.screenX - drag.x; drag.dy = event.screenY - drag.y;
-    if (!drag.moved && Math.hypot(drag.dx, drag.dy) < 5) return;
-    drag.moved = true;
+    measureDrag(event);
+    if (!drag.moved) return;
     event.preventDefault();
     if (!dragFrame) dragFrame = requestAnimationFrame(() => { dragFrame = 0; applyDrag(); });
   });
   function endDrag(event) {
     if (!drag || event.pointerId !== drag.pointer) return;
+    if (event.type === "pointerup") measureDrag(event);
     if (dragFrame) cancelAnimationFrame(dragFrame);
     dragFrame = 0;
-    if (drag.moved) {
-      suppressClickUntil = Date.now() + 350;
-      applyDrag(true);
-    }
-    drag = null;
+    applyDrag(true);
+    clearDrag();
   }
   box.addEventListener("pointerup", endDrag);
   box.addEventListener("pointercancel", endDrag);
@@ -644,6 +662,8 @@
   }
   if (frame) window.addEventListener("message", event => {
     if (event.source !== parent || event.origin !== attached.origin) return;
+    if (event.data?.type === "tp-host-drag-ended" && drag?.gesture === event.data.gesture)
+      clearDrag(event.data.moved === true);
     if (event.data?.type === "tp-host-open" && !toastOnly) setExpanded(!expanded);
     if (event.data?.type === "tp-host-refresh" && toastOnly) void refreshToasts();
     if (event.data?.type === "tp-host-viewport" && !toastOnly) {

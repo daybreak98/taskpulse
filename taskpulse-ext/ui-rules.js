@@ -13,9 +13,11 @@
     y: Number.isFinite(value?.y) ? clamp(value.y, 0, 1) : null,
     ...(value?.edge === "top" ? { edge: "top" } : {})
   });
-  // Identical pill geometry rotated 90 degrees: 108 x 32 or 32 x 108.
-  // Preserve the normalized x/y storage and the top docking hysteresis.
-  const pillSize = horizontal => horizontal ? { width: 108, height: 32 } : { width: 32, height: 108 };
+  // One geometry for every presentation, including the expanded header.
+  // The vertical capsule is an exact 90-degree rotation; digits stay upright.
+  const pill = Object.freeze({ long: 96, short: 28 });
+  const pillSize = horizontal => horizontal ? { width: pill.long, height: pill.short } :
+    { width: pill.short, height: pill.long };
   function move(value, dx, dy, w, h) {
     const p = normalized(value), wasTop = p.edge === "top";
     const before = pillSize(wasTop);
@@ -106,5 +108,5 @@
     if (match && (!match.agentId || match.agentId === task.agentId)) return match;
     return { key: "closed:" + platform, name: "未打开 · " + platform, color: "" };
   }
-  globalThis.TaskPulseUI = { keys, origins, normalized, place, move, glassLayout, glassClip, ordinary, buildGroups, groupFor };
+  globalThis.TaskPulseUI = { keys, origins, normalized, place, move, pill, glassLayout, glassClip, ordinary, buildGroups, groupFor };
 })();

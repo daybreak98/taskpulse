@@ -7,6 +7,7 @@
   --stuck: #dc9098; --seen: #90adbd; --done: #77bcac;
   --line: rgb(141 192 216 / .26); --glass-edge: rgb(146 196 219 / .28);
   --glass-tint: rgb(29 65 86 / .84); --radius: 12px;
+  --pill-long: 96px; --pill-short: 28px;
 }
 [hidden], :host([hidden]) { display: none !important; }
 *, *::before, *::after { box-sizing: border-box; }
@@ -18,21 +19,20 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
   display: grid; overflow: hidden; isolation: isolate; background: rgb(62 112 139 / .67);
   border-radius: 999px; box-shadow: 0 4px 13px rgb(5 26 41 / .20);
 }
-.capsule.compact { width: 32px; height: 108px; grid-template-rows: repeat(3, minmax(0, 1fr)); grid-template-columns: minmax(0, 1fr); touch-action: none; cursor: grab; }
-.capsule.compact.dock-horizontal { width: 108px; height: 32px; grid-template-rows: minmax(0, 1fr); grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.capsule.compact { width: var(--pill-short); height: var(--pill-long); grid-template-rows: repeat(3, minmax(0, 1fr)); grid-template-columns: minmax(0, 1fr); touch-action: none; cursor: grab; }
+.capsule.compact.dock-horizontal { width: var(--pill-long); height: var(--pill-short); grid-template-rows: minmax(0, 1fr); grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .capsule::after {
   content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; z-index: 2;
-  box-shadow: inset 0 0 0 1px rgb(163 213 235 / .48), inset 0 1px 5px rgb(156 213 239 / .20);
+  box-shadow: inset 0 0 0 1px rgb(163 213 235 / .48), inset 0 0 5px rgb(156 213 239 / .20);
 }
 .capsule.alerting::after { box-shadow: inset 0 0 0 1px rgb(224 185 115 / .65); }
 .number {
   --base: 49 131 175; --light: 83 184 233; --glow: .75;
   display: grid; place-items: center; position: relative; min-width: 0;
-  background: radial-gradient(ellipse at 52% 48%, rgb(var(--light) / var(--glow)), rgb(var(--light) / 0) 88%), rgb(var(--base) / .82);
+  background: radial-gradient(ellipse at center, rgb(var(--light) / var(--glow)), rgb(var(--light) / 0) 88%), rgb(var(--base) / .82);
   color: #122e40; font-size: 16px; font-weight: 650; line-height: 1; font-variant-numeric: tabular-nums;
   cursor: inherit; touch-action: none;
 }
-.compact .number { font-size: 18px; }
 .number[data-filter="attention"] { --base: 157 126 72; --light: 248 199 100; --glow: .93; }
 .number[data-filter="stuck"] { --base: 147 91 103; --light: 235 157 165; --glow: .8; }
 .number.zero { --base: 78 116 137; --light: 150 180 196; --glow: .38; }
@@ -126,5 +126,4 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
    would be truncated at the iframe boundary and look like square fringes. */
 :host([data-surface="panel"]) .capsule, :host([data-surface="panel"]) .panel,
 :host([data-surface="toast"]) .toast { box-shadow: inset 0 0 9px rgb(125 180 208 / .11); }
-.capsule.horizontal { position: relative; flex: 0 1 96px; min-width: 60px; width: 96px; height: 28px; grid-template-columns: repeat(3, minmax(0, 1fr)); touch-action: none; cursor: grab; }
-.horizontal .number { font-size: 14px; }
+.capsule.horizontal { position: relative; flex: 0 0 var(--pill-long); min-width: 0; width: var(--pill-long); height: var(--pill-short); grid-template-columns: repeat(3, minmax(0, 1fr)); touch-action: none; cursor: grab; }
