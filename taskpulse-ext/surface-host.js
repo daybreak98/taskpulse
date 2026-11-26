@@ -9,6 +9,7 @@
   let host = null, shadow = null, panel = null, toast = null;
   let panelSize = { width: 44, height: 84 }, pendingOpen = false, pendingToast = false;
   let dragStart = null, moveFrame = 0;
+  let prefGeneration = 0, prefVersion = 0, listening = false;
   const visible = () => !document.hidden && enabled && alive() &&
     !globalThis.TaskPulseWeb?.conversationPage(location.href);
   function createFrame(mode) {
@@ -108,14 +109,38 @@
     signalFrame(panel, { type: "tp-host-viewport", width: innerWidth, height: innerHeight });
     if (toast) toast.style.width = Math.max(1, Math.min(288, innerWidth - 28)) + "px";
   }, { passive: true });
-  document.addEventListener("visibilitychange", show);
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== "local") return;
+  function onPrefs(changes, area) {
+    if (area !== "local" || !changes[ui.keys.enabled] && !changes[ui.keys.position]) return;
+    prefVersion++;
     if (changes[ui.keys.enabled]) { enabled = changes[ui.keys.enabled].newValue === true; show(); }
     if (changes[ui.keys.position] && !dragStart) { position = changes[ui.keys.position].newValue; reposition(); }
-  });
+  }
+  function followVisibility() {
+    const generation = ++prefGeneration;
+    // Hidden ordinary tabs have neither an extension iframe nor a storage
+    // change subscription, avoiding cloning the full state into every tab.
+    if (document.hidden || !alive()) {
+      if (listening) chrome.storage.onChanged.removeListener(onPrefs);
+      listening = false;
+      unmount();
+      return;
+    }
+    if (!listening) { chrome.storage.onChanged.addListener(onPrefs); listening = true; }
+    const version = prefVersion;
+    void chrome.storage.local.get([ui.keys.enabled, ui.keys.position]).then(saved => {
+      if (generation !== prefGeneration || document.hidden) return;
+      if (version !== prefVersion) { followVisibility(); return; }
+      enabled = saved[ui.keys.enabled] === true;
+      if (!dragStart) position = saved[ui.keys.position];
+      show();
+      reposition();
+    }).catch(() => {});
+  }
+  document.addEventListener("visibilitychange", followVisibility);
   chrome.runtime.onMessage.addListener((msg, sender, reply) => {
-    if (sender.id !== chrome.runtime.id || !visible()) return false;
+    if (sender.id !== chrome.runtime.id) return false;
+    if (msg?.kind === "tp.route") { followVisibility(); reply({ ok: true }); return false; }
+    if (!visible()) return false;
     if (msg?.kind === "tp.surface-probe") { reply({ ok: true }); return false; }
     if (msg?.kind === "tp.surface-open" || msg?.kind === "tp.surface-notice") {
       if (msg.kind === "tp.surface-open") pendingOpen = true;
@@ -131,7 +156,5 @@
     }
     return false;
   });
-  chrome.storage.local.get([ui.keys.enabled, ui.keys.position]).then(saved => {
-    enabled = saved[ui.keys.enabled] === true; position = saved[ui.keys.position]; show();
-  }).catch(() => {});
+  followVisibility();
 })();

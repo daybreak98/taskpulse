@@ -31,6 +31,6 @@
     await chrome.storage.local.set({ [ui.keys.grouping]: mode === "tab" ? "dataagent" : "tab" }); await refresh();
   });
   document.getElementById("dataagent").addEventListener("click", () => chrome.tabs.create({ url: web.page }));
-  chrome.storage.onChanged.addListener((_changes, area) => { if (area === "local") void refresh(); });
+  chrome.storage.onChanged.addListener((changes, area) => { if (area === "local" && (changes[ui.keys.enabled] || changes[ui.keys.grouping])) void refresh(); });
   void refresh();
 })();

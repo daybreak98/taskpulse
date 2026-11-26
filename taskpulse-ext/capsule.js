@@ -588,6 +588,11 @@
     render();
   }).catch(() => {});
   chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+    if (native && msg?.kind === "tp.route") {
+      render();
+      reply({ ok: true });
+      return false;
+    }
     if (native && msg?.kind === "tp.show") {
       if (expanded) closePanel();
       else setExpanded(true);

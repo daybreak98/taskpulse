@@ -232,7 +232,8 @@ function worker(seed = {}) {
   chrome.windows.onFocusChanged = event();
   let stamp = now;
   class Clock extends Date { static now() { return stamp; } }
-  const context = vm.createContext({ chrome, URL, console, crypto: webcrypto, setTimeout, clearTimeout, Date: Clock });
+  const context = vm.createContext({ chrome, URL, console, crypto: webcrypto,
+    setTimeout: seed.setTimeout || setTimeout, clearTimeout: seed.clearTimeout || clearTimeout, Date: Clock });
   context.importScripts = (...files) => files.forEach(file =>
     vm.runInContext(fs.readFileSync(path.join(ext, file), "utf-8"), context, { filename: file }));
   context.importScripts("background.js");
@@ -1613,4 +1614,43 @@ test("cold historical rows remain low-frequency and request bursts are bounded",
     const count = result.requests.filter(r => r.at > request.at - 2_000 && r.at <= request.at).length;
     assert.ok(count <= 12, "request budget exceeded: " + count);
   }
+});
+
+
+test("hidden active collector is nudged without a second lease and stops waking after reply", async () => {
+  let serial = 0;
+  const timers = new Map();
+  const app = worker({
+    setTimeout: (fn, delay, ...args) => {
+      if (delay !== web.timing.hot) return setTimeout(fn, delay, ...args);
+      const key = "fast-" + ++serial;
+      timers.set(key, () => fn(...args));
+      return key;
+    },
+    clearTimeout: key => {
+      if (typeof key === "string" && key.startsWith("fast-")) timers.delete(key);
+      else clearTimeout(key);
+    }
+  });
+  const packets = [];
+  app.chrome.tabs.sendMessage = async (tabId, packet) => {
+    packets.push({ tabId, ...packet });
+    if (packet.kind === "tp.nudge") return { pageId: "page" };
+    return null;
+  };
+  await app.deliver({ ...report(now, row(), { busy: true }), hidden: false });
+  assert.equal(timers.size, 0);
+  const hidden = { kind: "tp.visibility", pageId: "page", lease: "one", hidden: true };
+  assert.equal((await app.send(hidden)).ok, true);
+  assert.equal(timers.size, 1);
+  const [key, callback] = [...timers.entries()][0];
+  timers.delete(key);
+  app.setClock(now + web.timing.hot);
+  await callback();
+  assert.ok(packets.some(p => p.tabId === 7 && p.kind === "tp.nudge" && p.pageId === "page"));
+  assert.equal(app.session.data[web.keys.leader].lease, "one");
+  assert.equal(timers.size, 1);
+  await app.deliver({ ...replyReport(now + 5_000, now + 4_000, "finished"), hidden: true });
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(timers.size, 0);
 });

@@ -228,7 +228,8 @@ function armFastWake() {
 function updateFastWake(leader, state, hidden) {
   hiddenCollector = hidden === true;
   const active = !state.error && !state.sourceUnavailable && Object.values(state.tasks).some(task =>
-    !task.accessDeniedAt && (task.runAt || task.awaitingReply));
+    !task.accessDeniedAt && (task.runAt || task.awaitingReply) &&
+    (!task.settleUntil || Date.now() <= task.settleUntil));
   if (!hiddenCollector || (!active && activityUntil <= Date.now())) { stopFastWake(); return; }
   fastWakeLeader = leader;
   fastWakeUntil = active ? Math.min(Date.now() + web.timing.sourceStale,
@@ -756,6 +757,10 @@ chrome.tabs.onUpdated.addListener((id, change) => {
     const tab = await chrome.tabs.get(id).catch(() => null);
     if (!tab) return;
     const cid = web.conversationId(tab.url);
+    if (change.url && tab.active) {
+      void signal(tab.id, { kind: "tp.route" }).catch(info);
+      if (!isPage(tab)) surfaces.activate(id);
+    }
     if ((change.url || change.status === "complete") && jumpTabs.has(id) &&
         jumpTabs.get(id)?.cid !== cid && tab.status === "complete" && tab.url !== "about:blank" &&
         (!tab.pendingUrl || tab.pendingUrl === tab.url)) await forgetJump(id, true);
