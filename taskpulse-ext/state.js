@@ -158,7 +158,7 @@
     }
     // During a run, a timestamp-less ID is only useful against a known
     // pre-run assistant ID. If no predecessor was observed, wait for server time.
-    if (activeRun) return Boolean(message.messageId && task.lastAssistant &&
+    if (activeRun) return Boolean(message.messageId && task.lastAssistant && !task.messageUncertain &&
       message.messageId !== task.lastAssistant && message.at > (task.messageObservedAt || 0));
     // Outside a known run, a changed server ID plus a new list version is
     // sufficient evidence. The identity-less case was rejected above.
@@ -267,7 +267,8 @@
       task.messageUpdate = task.update;
       task.messageObservedAt = message.at;
       task.messageUncertain = message.sender === "assistant" &&
-        (!key || waiting && !time(message.atMessage) && !changed);
+        (!key || waiting && !time(message.atMessage) && !changed &&
+          message.messageId !== task.lastAssistant);
       if (message.sender === "other") {
         const stamp = time(message.atMessage);
         // A user message needs its own server timestamp, newer than both
