@@ -562,6 +562,38 @@ class PollingTests(unittest.TestCase):
         self.assertTrue(task.get("deadline"), "用户设的截止时间被采样落盘覆盖了")
         self.assertGreater(task["deadline"], self.stamp)
 
+    def test_notice_events_are_persisted_and_source_scoped(self):
+        task = {"id": 1, "name": "A", "agent_id": "agent", "status": "running",
+                "deadline": NOW - 1, "run_version": "run:1", "update_ms": NOW - 100}
+        with patch.object(poller, "source_mode", return_value="api"):
+            poller.save_state({"tasks": {"1": task}})
+            poller._check_deadlines()
+            state = poller.load_state()
+            self.assertEqual(len(state["events"]), 1)
+            self.assertEqual(state["events"][0]["agent_id"], "agent")
+            self.assertEqual(poller.view(state)["events"][0]["revision"], poller.task_revision(state["tasks"]["1"]))
+            poller._check_deadlines()
+            self.assertEqual(len(poller.load_state()["events"]), 1)
+        with patch.object(poller, "source_mode", return_value="web"):
+            self.assertEqual(poller.view(poller.load_state())["events"], [])
+
+    def test_bulk_close_uses_current_profile_not_other_browser(self):
+        path = Path(self.directory) / "webstate.json"
+        path.write_text(json.dumps({"at": NOW, "generation": poller.web_generation(),
+            "collector": "edge-owner", "browser": "edge", "conversations": []}), encoding="utf-8")
+        url = "https://agent.example.com/chat?conversationId=1"
+        with patch.multiple(poller, WEBSTATE_FILE=str(path), source_mode=lambda: "web"):
+            poller.save_state({"tasks": {"1": {"id": 1, "url": url, "status": "seen",
+                                              "update_ms": NOW - 86400000}}})
+            for collector, browser, tab in [("edge-owner", "edge", 11), ("chrome-other", "chrome", 22)]:
+                poller.ingest_tabs({"at": NOW, "collector": collector, "browser": browser,
+                    "tabs": [{"url": url, "tabId": tab}], "active": {"focused": False}})
+            self.assertEqual(poller.closeable_tabs("idle"), [("1", 11)])
+            state = poller.load_state()
+            state["tasks"]["1"]["awaiting_reply"] = True
+            poller.save_state(state)
+            self.assertEqual(poller.closeable_tabs("idle"), [])
+
     def test_web_full_reports_keep_tracking_running_tasks_outside_limit(self):
         path = Path(self.directory) / "webstate.json"
         with patch.multiple(poller, WEBSTATE_FILE=str(path), source_mode=lambda: "web", WATCH_LIMIT=1):

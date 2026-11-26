@@ -169,6 +169,8 @@ struct NoticeEvent: Decodable {
     let title: String
     let body: String
     let cid: String?
+    let agent_id: String?
+    let revision: String?
 }
 
 func rgb(_ value: UInt32, alpha: CGFloat = 1) -> NSColor {
@@ -1740,8 +1742,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var sourceChangeInFlight = false
     var wantedSource: String?
     /// 提示事件的游标：后端重启（event_run 变化）时只记基准，不补弹历史
-    var eventRun = 0
-    var lastEventSeq = 0
+    var eventCursors: [String: (run: Int, seq: Int)] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -2506,7 +2507,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     /// 同一会话的新回复也能提示，启动时已有的回复只作为基准。
-    func detectReplies(_ payload: Payload) {
+    func selectReplyScope(_ payload: Payload) {
         let scope = payload.scope ?? payload.source ?? "legacy"
         if replyScope != scope {
             if let prior = replyScope, statusSeeded { statusByScope[prior] = lastStatus }
@@ -2515,6 +2516,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             statusSeeded = statusByScope[scope] != nil
             replyScope = scope
         }
+    }
+
+    func detectReplies(_ payload: Payload) {
+        selectReplyScope(payload)
         var next = Dictionary(payload.all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         if statusSeeded {
             for item in payload.all {
@@ -2563,21 +2568,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 之前走 osascript 的系统通知会被 macOS 记在「脚本编辑器」名下，点了只会打开编辑器。
     func detectEvents(_ payload: Payload) {
         guard let events = payload.events else { return }
+        let scope = payload.scope ?? payload.source ?? "legacy"
         let run = payload.event_run ?? 0
-        if eventRun != run {
-            let firstConnection = eventRun == 0
-            eventRun = run
-            lastEventSeq = firstConnection ? (events.map { $0.seq }.max() ?? 0) : 0
-            if firstConnection { return }
+        guard let cursor = eventCursors[scope] else {
+            eventCursors[scope] = (run, events.map { $0.seq }.max() ?? 0)
+            return
         }
-        for event in events.sorted(by: { $0.seq < $1.seq }) where event.seq > lastEventSeq {
-            lastEventSeq = max(lastEventSeq, event.seq)
+        var last = cursor.run == run ? cursor.seq : 0
+        for event in events.sorted(by: { $0.seq < $1.seq }) where event.seq > last {
+            last = max(last, event.seq)
             guard let cid = event.cid, let id = Int(cid),
-                  let item = payload.all.first(where: { $0.id == id }) else { continue }
+                  let item = payload.all.first(where: { $0.id == id }),
+                  event.agent_id == nil || event.agent_id == item.agent_id,
+                  event.revision == nil || event.revision == item.action_revision else { continue }
             let accent = event.title.contains("限流") || event.title.contains("卡住")
                 ? palette["stuck"] : palette["attention"]
             showToast(item, title: event.title, body: event.body, accent: accent)
         }
+        eventCursors[scope] = (run, last)
     }
 
     func refresh() {
@@ -2608,6 +2616,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         self.view.pendingSource == payload.source { self.view.pendingSource = nil }
                     self.consecutiveReadFailures = 0
                     self.nextReadAt = 0
+                    self.selectReplyScope(payload)
                     if !self.view.countersUnavailable { self.detectReplies(payload) }
                     self.detectEvents(payload)
                 } else {
@@ -2778,7 +2787,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 批量关掉没在用的会话标签；服务端按同一套规则再筛一次。
     /// 单独实现而不用 post()：要把实际关掉的条数回显出来，用户才知道生效了。
     func closeTabs(_ mode: String) {
-        guard let url = URL(string: endpoint + "/tabs/close?mode=\(mode)") else { return }
+        guard let scope = view.payload?.action_scope else { return }
+        var components = URLComponents(string: endpoint + "/tabs/close")
+        components?.queryItems = [URLQueryItem(name: "mode", value: mode), URLQueryItem(name: "scope", value: scope)]
+        guard let url = components?.url else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 12
@@ -2788,7 +2800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
             DispatchQueue.main.async {
                 guard let self else { return }
-                if code == 200, let n = result?.closed {
+                if code == 200, result?.ok == true, let n = result?.closed {
                     self.view.actionMessage = n > 0 ? "已关闭 \(n) 个标签页" : "没有可关闭的标签页"
                 } else {
                     self.view.actionMessage = "清理未完成，请重试"

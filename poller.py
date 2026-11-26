@@ -375,6 +375,24 @@ def notify(title: str, body: str, cid: str | None = None) -> None:
         del _events[:-20]
 
 
+def append_notice_events(state: dict, notifications: list[tuple[str, str, str]]) -> None:
+    """Persist notifications with their originating task revision in the same state commit."""
+    if not notifications:
+        return
+    state.setdefault("event_run", secrets.randbits(52) or 1)
+    events = state.setdefault("events", [])
+    seq = int(state.get("event_seq") or 0)
+    for title, body, cid in notifications:
+        task = (state.get("tasks") or {}).get(str(cid))
+        if not task or task.get("archived"):
+            continue
+        seq += 1
+        events.append({"seq": seq, "title": title, "body": body, "cid": cid,
+                       "agent_id": str(task.get("agent_id") or ""), "revision": task_revision(task)})
+    state["event_seq"] = seq
+    del events[:-100]
+
+
 # ── 存储 ────────────────────────────────────────────────────────────
 
 _lock = threading.Lock()
@@ -1661,6 +1679,7 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False,
         # 采样是在锁外做的，可能已经跑了几秒。期间来源被切走的话，这批样本
         # 属于旧来源，落盘会把新来源的数据盖掉——直接丢弃，下一轮按新来源重来。
         if (source_mode(), _source_epoch) == gen:
+            append_notice_events(state, notifications)
             save_state(state)
         else:
             log("来源已切换，丢弃这轮 %s 的采样结果" % (gen,))
@@ -1733,7 +1752,8 @@ def view(state: dict) -> dict:
     stamp = now_ms()
     # 整份响应共用这一份快照：来源、标签组，动手前各取一次
     mode = source_mode()
-    tabs = dict(_tab_groups)
+    profiles = current_profiles()
+    tabs = dict(_tab_groups) if not profiles and mode == "api" else {}
     source, source_age = _view_source(mode)
     stale_after_seconds = max(POLL_SECONDS * 2, 45)
 
@@ -1761,6 +1781,10 @@ def view(state: dict) -> dict:
         elapsed = max(0, ((observed if stale else stamp) - started) // 1000) if started else 0
         waited = max(0, ((observed if stale else stamp) - phase) // 1000) if phase else 0
         progress = 1.0 if task.get("status") == "done" else min(waited / stuck, 1.0)
+        route = route_for_task(task) if profiles or mode == "web" else None
+        if route and route.get("tabId") is not None:
+            tab = profiles.get(route["key"], {}).get("tabs", {}).get(str(task["id"]), {})
+            tabs[str(task["id"])] = tab.get("group") or ""
         rows.append({
             "id": task["id"],
             "name": task.get("name"),
@@ -1786,7 +1810,8 @@ def view(state: dict) -> dict:
             "deadline": task.get("deadline"),
             "important": bool(task.get("important")),
             # 浏览器里是否有这个会话的标签页：菜单要用它算「能关多少个」
-            "has_tab": str(task["id"]) in _tab_ids,
+            "has_tab": (route is not None and route.get("tabId") is not None)
+                       if profiles or mode == "web" else str(task["id"]) in _tab_ids,
             "deadline_left": (int((task["deadline"] - stamp) / 1000)
                               if task.get("deadline") else None),
             "overdue": bool(task.get("deadline") and stamp >= task["deadline"]),
@@ -1807,6 +1832,9 @@ def view(state: dict) -> dict:
         live |= cache.get("live") or set()
         live_ts = max(live_ts, cache.get("ts") or 0)
     live_fresh = bool(live_ts) and stamp - live_ts < 300_000
+    if profiles or mode == "web":
+        live = {str(r["id"]) for r in rows if r["has_tab"]}
+        live_fresh = bool(profiles) and (mode != "web" or current_web_snapshot().get("collector") in profiles)
 
     def visible(r):
         if r["status"] == "done":
@@ -1832,8 +1860,8 @@ def view(state: dict) -> dict:
         "stale_after_seconds": stale_after_seconds,
         "stale_count": sum(1 for r in rows if r["stale"]),
         # 提示事件（卡住/限流/超时）：App 拿着自己弹提示条，点了就能直接跳转
-        "event_run": _STARTED_AT,
-        "events": list(_events),
+        "event_run": state.get("event_run") or 0,
+        "events": list(state.get("events") or []),
         "stuck_seconds": stuck,
         "window_limit": limit,
         "extension": {"at": _tab_report_at,
@@ -1986,7 +2014,7 @@ def save_active(act: dict) -> None:
     act.setdefault("scope", action_scope())
     _active_tab.update(act)
     try:
-        tmp = ACTIVE_FILE + ".tmp"
+        tmp = ACTIVE_FILE + f".{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(act, f)
         os.replace(tmp, ACTIVE_FILE)
@@ -2776,6 +2804,8 @@ class Handler(BaseHTTPRequestHandler):
                         command_id = candidate.get("id")
                         if command_id in _cmd_done or _cmd_expired(candidate):
                             continue
+                        if candidate.get("scope") and candidate["scope"] != action_scope():
+                            continue
                         if candidate.get("scope") and candidate.get("cmd") == "focus":
                             attempt = _focus_attempts.get(command_id)
                             if (not attempt or attempt["route"] != route_key or
@@ -3057,7 +3087,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/tabs/close":
             mode = (query.get("mode") or ["24h"])[0]
-            closed = close_conversation_tabs(mode)
+            scope = (query.get("scope") or [""])[0]
+            closed = close_conversation_tabs(mode, scope)
             self._json({"ok": closed is not None, "closed": closed or 0, "mode": mode})
             return
 
@@ -3115,52 +3146,51 @@ CLOSE_TAB_MODES = {"idle": 0, "1h": 1, "6h": 6, "24h": 24}
 
 
 def closeable_tabs(mode: str) -> list[tuple[str, int]]:
-    """挑出可以关标签的会话，返回 [(cid, tabId)]。
-
-    只关「浏览器里有标签」且「没在跑」的会话：正在跑的任务把标签关掉，
-    用户就看不到中间过程了。空闲时长按 update_ms 算——那是会话最后一次
-    有更新的时刻，比我们自己记录的采样时间更贴近真实。
-    """
+    """Only a verified route in the current source can be selected for closure."""
     hours = CLOSE_TAB_MODES.get(mode, CLOSE_TAB_MODES["24h"])
     stamp = now_ms()
-    tasks = load_state().get("tasks") or {}
-    out: list[tuple[str, int]] = []
-    for cid, tab in list(_tab_ids.items()):
-        task = tasks.get(cid) or {}
-        if not task:
-            continue
-        if task.get("status") in ("running", "stuck"):
+    out = []
+    for cid, task in (load_state().get("tasks") or {}).items():
+        if task.get("archived") or task.get("status") in ("running", "stuck") or task.get("awaiting_reply") or task.get("queue_error"):
             continue
         last = max(task.get("update_ms") or 0, task.get("acked_at") or 0)
         if hours and last and stamp - last < hours * 3600_000:
             continue
-        out.append((cid, tab))
+        route = route_for_task(task)
+        if route and route.get("tabId") is not None and route.get("collector"):
+            out.append((cid, route["tabId"]))
     return out
 
 
-def close_conversation_tabs(mode: str) -> int | None:
-    """把要关的标签交给扩展执行；返回实际关闭数，扩展不在线返回 None。"""
-    targets = closeable_tabs(mode)
-    if not targets:
+def close_conversation_tabs(mode: str, expected_scope: str = "") -> int | None:
+    with _lock:
+        scope = action_scope()
+        if not expected_scope or expected_scope != scope:
+            return None
+        tasks = load_state().get("tasks") or {}
+        groups = {}
+        for cid, tab in closeable_tabs(mode):
+            task = tasks.get(cid) or {}
+            route = route_for_task(task)
+            if route and route.get("collector") and route.get("tabId") == tab:
+                groups.setdefault(route["key"], {})[cid] = {"tabId": tab, "url": task.get("url"),
+                                                            "revision": task_revision(task)}
+    if not groups:
         return 0
     if (time.time() - _ext_seen) >= 20 or _cmd_waiters <= 0:
         return None
-    groups = {}
-    for cid, tab in targets:
-        owner = _tab_browser.get(cid)
-        if owner:
-            groups.setdefault(owner, {})[cid] = tab
-    if not groups:
-        return None
     pending = set()
-    for owner, tabs in groups.items():
+    for owner, targets in groups.items():
         cmd_id = "close-" + secrets.token_hex(8)
         pending.add(cmd_id)
-        _cmd_queue(owner).put({"cmd": "closeTabs", "tabIds": tabs, "id": cmd_id,
+        _cmd_queue(owner).put({"cmd": "closeTabs", "targets": targets, "id": cmd_id,
+                               "scope": scope, "collector": owner,
                                "expires": int(time.time() * 1000) + 5000})
     closed = 0
     deadline = time.time() + 5
     while pending and time.time() < deadline:
+        if action_scope() != scope:
+            return None
         for cmd_id in list(pending):
             got = _cmd_results.pop(cmd_id, None)
             if got is not None:
@@ -3168,7 +3198,7 @@ def close_conversation_tabs(mode: str) -> int | None:
                 closed += int(got.get("n") or 0)
         if pending:
             time.sleep(0.05)
-    return closed
+    return closed if not pending else None
 
 
 # ── 主循环 ──────────────────────────────────────────────────────────
@@ -3250,6 +3280,7 @@ def _check_deadlines() -> None:
             changed = True
             fired.append((task.get("name") or "", str(task.get("id"))))
         if changed:
+            append_notice_events(state, [("任务已超时", f"{name} 超过你设定的时间", cid) for name, cid in fired])
             save_state(state)
     for name, cid in fired:
         notify("任务已超时", f"{name} 超过你设定的时间", cid)

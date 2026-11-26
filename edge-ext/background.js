@@ -152,28 +152,24 @@ function isConversationTab(url) {
   return rest === "" || rest[0] === "?" || rest[0] === "#" || rest[0] === "/";
 }
 
-async function closeTabsFor(map, expires) {
-  if (!!expires && Date.now() > expires) return 0;
+async function closeTabsFor(targets, expires, scope, collector) {
+  if (!scope || !collector || (expires && Date.now() > expires)) return 0;
   let closed = 0;
-  for (const cid of Object.keys(map || {})) {
-    const wanted = map[cid];
-    let hit = null;
-    const re = new RegExp("[?&]conversationId=" + cid + "(?:[&#]|$)");
-    if (typeof wanted === "number") {
-      try {
-        const t = await chrome.tabs.get(wanted);
-        if (t && isConversationTab(t.url) && re.test(t.url)) hit = t;
-      } catch (_) {}
-    }
-    if (!hit && SCOPE) {
-      try {
-        const tabs = await chrome.tabs.query({ url: SCOPE });
-        hit = tabs.find((t) => isConversationTab(t.url) && re.test(t.url));
-      } catch (_) {}
-    }
-    if (!hit) continue;
+  for (const [cid, wanted] of Object.entries(targets || {})) {
+    if (expires && Date.now() > expires) break;
+    if (typeof wanted.tabId !== "number" || !wanted.url || !wanted.revision) continue;
     try {
-      await chrome.tabs.remove(hit.id);
+      const r = await fetch(BASE + "/state", { cache: "no-store", headers: authHeaders(), signal: AbortSignal.timeout(2000) });
+      if (!r.ok) continue;
+      const state = await r.json();
+      if (state.action_scope !== scope || state.poller_error) break;
+      const row = (state.all || []).find(t => String(t.id) === cid);
+      if (!row || row.action_revision !== wanted.revision || row.stale || row.awaiting_reply ||
+          row.status === "running" || row.status === "stuck" || !row.has_tab) continue;
+      const tab = await chrome.tabs.get(wanted.tabId);
+      if (!tab || !matchesConversation(tab.url, cid, wanted.url) || tab.pendingUrl && tab.pendingUrl !== tab.url) continue;
+      if (expires && Date.now() > expires) break;
+      await chrome.tabs.remove(tab.id);
       closed += 1;
     } catch (_) {}
   }
@@ -259,7 +255,8 @@ async function listen() {
         if (cmd && cmd.cmd === "closeTabs") {
           let n = 0;
           try {
-            n = await closeTabsFor(cmd.tabIds || {}, cmd.expires);
+            if (cmd.collector === collector)
+              n = await closeTabsFor(cmd.targets || {}, cmd.expires, cmd.scope, collector);
           } catch (_) {}
           if (cmd.id) {
             try {
