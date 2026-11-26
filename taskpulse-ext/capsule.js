@@ -173,7 +173,8 @@
   }
 
   const checkedTask = task => !!task.checkedRevision && rules.canAcknowledge(task) && task.checkedRevision === rules.revision(task);
-  const isLive = (task, kind) => !checkedTask(task) && task.status === kind && !task.uncertain;
+  // 采集不确定不代表未读不存在：它只影响「能否确认已读」，不影响归属与筛选
+  const isLive = (task, kind) => !checkedTask(task) && task.status === kind;
 
   function taskStatus(task) {
     return checkedTask(task) ? "done" : task.status;
@@ -230,7 +231,7 @@
 
   function taskRow(task) {
     const done = checkedTask(task);
-    const tint = done ? "done" : task.uncertain || (filter && !isLive(task, filter)) ? "seen" : task.status;
+    const tint = done ? "done" : (filter && !isLive(task, filter)) ? "seen" : task.status;
     const row = element("div", "row " + tint);
     const plate = element("i", "row-plate");
     const link = element("button", "task-open");
@@ -283,7 +284,8 @@
       if (!buckets.has(identity.key)) buckets.set(identity.key, { ...identity, tasks: [], active: 0, worst: "seen", matched: [] });
       const group = buckets.get(identity.key);
       group.tasks.push(task);
-      if (task.uncertain || !severity[taskStatus(task)]) continue;
+      // 只在状态无法归类时跳过；uncertain 仍参与组号与自动展开
+      if (!severity[taskStatus(task)]) continue;
       group.active++;
       if (severity[task.status] > severity[group.worst]) group.worst = task.status;
       if (filter && isLive(task, filter)) group.matched.push(task);

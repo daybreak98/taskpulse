@@ -423,7 +423,14 @@
       if (task.listedAt !== state.listAt || !taskAccessible(state, task) ||
           !recentActivity(task, now) || isDismissed(task) || !include(task)) continue;
       const uncertain = !taskFresh(state, task, now) || task.messageUncertain;
-      if (!uncertain && Object.hasOwn(counts, task.status)) counts[task.status]++;
+      // 已确认的未读是既成事实：采集抖动（队列失败/消息未同步/采样超时）
+      // 只说明「这条数据还不新鲜」，不该让它从黄色计数里消失。
+      // 只放过「采集不新鲜」（队列失败/消息未同步/采样超时）；
+      // 登出、账号切换、列表回退会把证据代际作废，那种未读不能立刻认。
+      const unread = task.pending === true &&
+        (task.status === "attention" || task.status === "stuck") && verifiedReply(task) &&
+        (task.replyAt || task.replyUpdate || 0) >= evidenceFloor(state, task);
+      if ((unread || !uncertain) && Object.hasOwn(counts, task.status)) counts[task.status]++;
       tasks.push({ ...task, uncertain });
     }
     tasks.sort((a, b) => order[a.status] - order[b.status] || b.update - a.update);
