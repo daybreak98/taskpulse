@@ -156,14 +156,16 @@
       return Boolean(message.messageId && task.lastAssistant && at === task.replyAt &&
         at >= (task.acked || 0) && at > (task.historyAt || 0));
     }
-    // A changed server ID remains usable when creation time is omitted.
-    // The identity-less case is rejected above, before any list-time fallback.
+    // During a run, a timestamp-less ID is only useful against a known
+    // pre-run assistant ID. If no predecessor was observed, wait for server time.
+    if (activeRun) return Boolean(message.messageId && task.lastAssistant &&
+      message.messageId !== task.lastAssistant && message.at > (task.messageObservedAt || 0));
+    // Outside a known run, a changed server ID plus a new list version is
+    // sufficient evidence. The identity-less case was rejected above.
     if (message.messageId && (task.lastAssistant || task.lastUserMessage) &&
         message.at > (task.messageObservedAt || 0) &&
-        (task.replyKey || task.awaitingReply || task.update > Math.max(task.historyAt || 0, task.created || 0) ||
+        (task.replyKey || task.update > Math.max(task.historyAt || 0, task.created || 0) ||
          task.lastUserMessage && task.messageUpdate > (task.historyAt || 0))) return true;
-    // The list watermark may support a probe only when the latest assistant
-    // message has its own server ID; it cannot manufacture an identity.
     return Boolean(message.messageId &&
       task.update > Math.max(task.acked || 0, task.created || 0, task.replyUpdate || 0, task.historyAt || 0));
   }

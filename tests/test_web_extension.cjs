@@ -306,7 +306,7 @@ test("标记已处理只影响当前版本，新回复照常显示和通知", as
   assert.equal((await app.send({ kind: "tp.check", id, revision: version, checked: true })).ok, false);
 
   await app.deliver(report(now + 5_000, row(now + 1_000), {
-    message: message(now + 1_000, now + 5_000, "first")
+    message: message(now + 1_000, now + 5_000, "first", { atMessage: now + 3_000 })
   }));
   version = rules.revision(task());
   assert.equal(task().status, "attention");
@@ -318,7 +318,7 @@ test("标记已处理只影响当前版本，新回复照常显示和通知", as
   await app.send({ kind: "tp.check", id, revision: version, checked: true });
 
   await app.deliver(report(now + 15_000, row(now + 10_000), {
-    message: message(now + 10_000, now + 15_000, "second")
+    message: message(now + 10_000, now + 15_000, "second", { atMessage: now + 14_000 })
   }));
   assert.equal(task().status, "attention");
   assert.notEqual(rules.revision(task()), task().checkedRevision);
@@ -977,21 +977,27 @@ test("P1 server timestamp rejects a pre-run assistant even when sampled after BU
   assert.equal(fresh.replies.length, 1);
 });
 
-test("P1 a server message ID remains usable without creation time; a missing identity does not", () => {
+test("P1 an unknown pre-run assistant baseline needs server time before an ID-only reply can finish", () => {
   const tracker = timeline();
   tracker.next(report(now, row(), {
-    message: message(old, now, "A")
+    message: message(old, now, "", { atMessage: 0 })
   }));
   tracker.next(report(now + 5_000, row(), { busy: true }));
   const update = now + 9_000;
-  const result = tracker.next(report(now + 10_000, row(update), {
+  const idOnly = tracker.next(report(now + 10_000, row(update), {
     message: message(update, now + 10_000, "B")
   }));
-  assert.equal(result.task.awaitingReply, false);
-  assert.equal(result.task.pending, true);
-  assert.equal(result.task.messageUncertain, false);
-  assert.equal(result.task.replyKey, "message.B");
-  assert.equal(result.replies.length, 1);
+  assert.equal(idOnly.task.awaitingReply, true);
+  assert.equal(Boolean(idOnly.task.pending), false);
+  assert.equal(idOnly.task.messageUncertain, true);
+  assert.equal(idOnly.replies.length, 0);
+  const verified = tracker.next(report(now + 15_000, row(update), {
+    message: message(update, now + 15_000, "B", { atMessage: now + 11_000 })
+  }));
+  assert.equal(verified.task.awaitingReply, false);
+  assert.equal(verified.task.pending, true);
+  assert.equal(verified.task.replyKey, "message.B");
+  assert.equal(verified.replies.length, 1);
 });
 
 
