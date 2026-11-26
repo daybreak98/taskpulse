@@ -17,6 +17,8 @@ const leaderKey = "tp-web-leader-v1";
 async function startFixture() {
   const requests = [];
   let updated = seed;
+  let account = "a";
+  const alternate = { id: 21, agentId: 515, name: "合成账号 B 的会话" };
 
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
@@ -33,8 +35,17 @@ async function startFixture() {
       return;
     }
     requests.push({ path: url.pathname, from: request.headers.referer || "" });
+    if (account === "logout" ||
+        account === "b" && !url.pathname.endsWith("/list") && !url.pathname.includes("/21/")) {
+      response.writeHead(account === "logout" ? 401 : 403).end();
+      return;
+    }
     let data;
-    if (url.pathname.endsWith("/list")) {
+    if (url.pathname.endsWith("/list") && account === "b") {
+      data = { groups: [{ name: "账号 B", conversations: [
+        { ...alternate, updateTime: seed, createTime: seed }
+      ] }], ungrouped: { conversations: [] } };
+    } else if (url.pathname.endsWith("/list")) {
       data = { groups: [{ name: "数据质量", conversations: [
         { ...task, updateTime: updated, createTime: seed },
         { ...unopened, updateTime: seed, createTime: seed }
@@ -57,7 +68,8 @@ async function startFixture() {
   });
   return {
     server, requests, origin: "http://127.0.0.1:" + server.address().port,
-    releaseReply: () => { updated = Date.now() + 1; return updated; }
+    releaseReply: () => { updated = Date.now() + 1; return updated; },
+    setAccount: value => { account = value; }
   };
 }
 
@@ -207,6 +219,44 @@ async function trial() {
     assert.ok(listReads() > beforeClosing);
     assert.deepEqual(pageErrors, []);
     console.log("New-tab jump and handoff to a remaining collector passed");
+
+    // Exercise the actual installed content scripts and service worker
+    // against a synthetic account change, without a real DataAgent login.
+    const readState = () => worker.evaluate(async key => (await chrome.storage.local.get(key))[key], stateKey);
+    async function waitState(predicate, label) {
+      let state;
+      for (let i = 0; i < 176; i++) {
+        state = await readState();
+        if (predicate(state)) return state;
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      assert.fail(label + ": " + JSON.stringify(state));
+    }
+    await created.bringToFront();
+    const thirdStamp = fixture.releaseReply();
+    await waitState(s => s?.tasks["11"]?.replyKey === "message.m" + thirdStamp &&
+      s.tasks["11"].pending, "third background reply");
+    for (let i = 0; i < 20 && !(await notifications()).length; i++) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    assert.equal((await notifications()).length, 1);
+    fixture.setAccount("logout");
+    await waitState(s => s?.authBlocked && s.tasks["11"]?.pending, "logout authorization fence");
+    for (let i = 0; i < 20 && (await notifications()).length; i++) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    assert.equal((await notifications()).length, 0);
+    await created.locator(root + " [data-cid='11']").waitFor({ state: "hidden" });
+    console.log("Synthetic logout withdraws prior-account notices and rows without acknowledging the reply");
+
+    fixture.setAccount("b");
+    const switched = await waitState(s => !s?.authBlocked && s?.tasks["21"]?.listedAt === s.listAt &&
+      s?.tasks["11"]?.accessDeniedAt, "new account and denied retained row");
+    assert.equal(switched.tasks["11"].pending, true);
+    assert.equal((await notifications()).length, 0);
+    await created.locator(root + " [data-cid='11']").waitFor({ state: "hidden" });
+    assert.deepEqual(pageErrors, []);
+    console.log("Synthetic account switch hides and stops retaining inaccessible prior-account tasks");
   } catch (error) {
     console.error("Fixture pages:", context?.pages().map(page => page.url()));
     const worker = context?.serviceWorkers()[0];

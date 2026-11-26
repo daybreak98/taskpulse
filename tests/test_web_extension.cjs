@@ -28,6 +28,7 @@ const report = (at, conversation, options = {}) => ({
   queueAt: options.busy === null ? {} : { [id]: options.queueAt ?? at },
   queueErrors: options.queueError ? { [id]: at } : {},
   messageErrors: options.messageError ? { [id]: at } : {},
+  accessErrors: options.accessError ? { [id]: at } : {},
   lastMessages: options.message ? { [id]: options.message } : {}
 });
 
@@ -224,7 +225,7 @@ function worker(seed = {}) {
         return structuredClone(tabs.find(tab => tab.id === tabId));
       }
     },
-    alarms: { onAlarm: event() }
+    alarms: { onAlarm: event(), get: async () => ({}), create: async () => {}, clear: async () => {} }
   };
   chrome.windows.onFocusChanged = event();
   let stamp = now;
@@ -244,7 +245,7 @@ function worker(seed = {}) {
     stamp = payload.at;
     return send({ kind: "tp.webstate", pageId: "page", lease, payload });
   }
-  return { tabs, sender, send, deliver, notices, local, session, chrome };
+  return { tabs, sender, send, deliver, notices, local, session, chrome, setClock: value => { stamp = value; } };
 }
 
 test("worker rejects the old page lease and reuses a correctly verified conversation", async () => {
@@ -972,7 +973,8 @@ test("P1 invalid or cached list cannot clear a prior source failure or auto-read
   assert.equal(currentTask(app).pending, true);
   await app.deliver(report(now + 20_000, row(update), { listAt: now + 5_000, busy: null }));
   assert.equal(currentTask(app).pending, true);
-  assert.equal(app.notices.size, 1);
+  assert.equal(app.notices.size, 0); // explicit authorization loss hides the old title
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 20_000).tasks.length, 0);
   await app.deliver(report(now + 25_000, row(update)));
   assert.equal(currentTask(app).pending, false);
   assert.equal(app.notices.size, 0);
@@ -1284,4 +1286,183 @@ test("P2 webpage toast may dismiss only after the worker authorizes clearing tha
   assert.equal(rules.mayDismissNotice({ ok: false, clearNotice: true }), false);
   assert.equal(rules.mayDismissNotice({ ok: true, clearNotice: true }), true);
   assert.equal(rules.mayDismissNotice(null), false);
+});
+
+
+/* Post-integration review: account access, source availability and stale handoff. */
+test("logout hides prior titles and notices; relogin needs post-failure queue evidence", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  assert.equal(app.notices.size, 1);
+  const rev = exactRevision(app);
+  await app.deliver(report(now + 10_000, row(update), {
+    error: "HTTP 401", listAt: now + 5_000, busy: null
+  }));
+  let saved = app.local.data[web.keys.state];
+  assert.equal(rules.view(saved, now + 10_000).tasks.length, 0);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(app.notices.size, 0);
+  const count = app.tabs.length;
+  assert.equal((await app.send({ kind: "tp.open", id, revision: rev, intent: "notice" })).ok, false);
+  assert.equal(app.tabs.length, count);
+  // The old queue timestamp must not confirm a reply in the recovered list.
+  app.tabs[0].url = web.conversationUrl(id, agent);
+  await app.deliver(report(now + 15_000, row(update), { queueAt: now + 5_000 }));
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 15_000).counts.attention, 0);
+  await app.deliver(report(now + 20_000, row(update)));
+  assert.equal(currentTask(app).pending, false);
+  assert.equal(app.notices.size, 0);
+});
+
+test("account switch: absent old task is hidden until freshly authorized, denied ID stops retention", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  const oldRevision = exactRevision(app), newId = "43";
+  const oldRow = { ...row(update), retained: true };
+  const accountB = (at, opts = {}) => {
+    const p = report(at, oldRow, opts);
+    p.conversations.unshift({ ...row(at - 1_000), id: newId, name: "second account" });
+    p.queues[newId] = { sessionState: "IDLE", pending: [] };
+    p.queueAt[newId] = at;
+    return p;
+  };
+  await app.deliver(accountB(now + 10_000, { queueAt: now + 5_000 }));
+  let state = app.local.data[web.keys.state];
+  assert.ok(!rules.view(state, now + 10_000).tasks.some(t => t.id === id));
+  assert.equal(app.notices.size, 0);
+  await app.deliver(accountB(now + 15_000, { busy: null, queueError: true, accessError: true }));
+  state = app.local.data[web.keys.state];
+  assert.ok(!rules.view(state, now + 15_000).tasks.some(t => t.id === id));
+  assert.ok(!rules.reportRows([{ ...row(), id: newId }], state.tasks, now + 15_000).some(t => t.id === id));
+  assert.equal((await app.send({ kind: "tp.open", id, revision: oldRevision, intent: "notice" })).ok, false);
+  // Switching back to a real list and obtaining a new queue sample is safe.
+  await app.deliver(report(now + 20_000, row(update)));
+  state = app.local.data[web.keys.state];
+  assert.equal(rules.view(state, now + 20_000).counts.attention, 1);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(app.notices.size, 0); // already delivered before the switch
+});
+
+test("a late report from a collector that left DataAgent cannot update state", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  app.tabs[0].url = "https://example.com/";
+  const answer = await app.deliver(replyReport(now + 5_000, now + 1_000, "late"));
+  assert.equal(answer.ok, false);
+  assert.equal(currentTask(app).pending, undefined);
+  assert.equal(app.notices.size, 0);
+});
+
+test("closing the last ready collector pauses delayed delivery before the stale timeout", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.getPermissionLevel = async () => "denied";
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  assert.equal(Object.keys(app.local.data[web.keys.state].outbox).length, 1);
+  app.chrome.notifications.getPermissionLevel = async () => "granted";
+  app.tabs.splice(0, app.tabs.length);
+  app.setClock(now + 6_000);
+  app.chrome.alarms.onAlarm.listeners[0]({ name: "tp-web-sync" });
+  await until(() => !app.session.data[web.keys.leader]);
+  await new Promise(r => setTimeout(r, 25));
+  const state = app.local.data[web.keys.state];
+  assert.equal(rules.view(state, now + 6_000).stale, true);
+  assert.equal(state.tasks[id].pending, true);
+  assert.equal(app.notices.size, 0);
+  assert.equal(Object.keys(state.outbox).length, 1);
+});
+
+test("a responsive but stale hidden leader yields to a ready foreground DataAgent tab", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  app.tabs[0].active = false;
+  const other = { id: 9, windowId: 1, url: web.page, active: true, status: "complete" };
+  app.tabs.push(other);
+  const rolePackets = [];
+  app.chrome.tabs.sendMessage = async (tabId, packet) => {
+    if (packet.kind === "tp.probe") return { pageId: tabId === 7 ? "page" : "other-page", lease: tabId === 7 ? "one" : "" };
+    if (packet.kind === "tp.role") {
+      rolePackets.push({ tabId, lease: packet.lease });
+      return { pageId: packet.pageId };
+    }
+    return { pageId: packet.pageId };
+  };
+  app.setClock(now + web.timing.sourceStale + 1);
+  app.chrome.alarms.onAlarm.listeners[0]({ name: "tp-web-sync" });
+  await until(() => app.session.data[web.keys.leader]?.tabId === 9, "stalled collector was kept");
+  await until(() => rolePackets.some(p => p.tabId === 9 && p.lease));
+  assert.ok(rolePackets.some(p => p.tabId === 7 && p.lease === ""));
+  assert.equal((await app.deliver(report(now + web.timing.sourceStale + 2, row()), "one")).ok, false);
+});
+
+
+test("collector propagates actual HTTP denial for an absent retained row and stops polling it", async () => {
+  const tracker = timeline();
+  const active = tracker.next(report(now, row(), { busy: true }));
+  let durable = active.state, stamp = now + 10_000, interval;
+  const requests = [], reports = [], listeners = [];
+  const currentId = "100";
+  const reply = data => ({ ok: true, json: async () => ({ success: true, data }) });
+  const chrome = {
+    storage: { local: { get: async key => ({ [key]: durable }) } },
+    runtime: { id: "collector-test", onMessage: { addListener: fn => listeners.push(fn) },
+      sendMessage: async packet => {
+        if (packet.kind === "tp.webstate") {
+          reports.push(packet.payload);
+          durable = rules.absorb(durable, packet.payload, stamp).state;
+        }
+        return { ok: true };
+      }
+    }
+  };
+  class Clock extends Date { static now() { return stamp; } }
+  const context = vm.createContext({
+    chrome, URL, console, crypto: webcrypto, AbortController, Date: Clock,
+    location: new URL(web.page), document: { hidden: false, addEventListener() {} },
+    setTimeout, clearTimeout, setInterval: fn => { interval = fn; return 1; }, clearInterval() {},
+    fetch: async url => {
+      requests.push(url.pathname);
+      if (url.pathname.endsWith("/list")) return reply({ groups: [], ungrouped: {
+        conversations: [{ ...row(old), id: currentId }]
+      } });
+      const cid = url.pathname.split("/").at(-2);
+      if (cid === id) return { ok: false, status: 403 };
+      if (url.pathname.endsWith("/queue")) return reply({ sessionState: "IDLE", pending: [] });
+      return reply({ list: [{ sender: "other", id: "u", createTime: old }] });
+    }
+  });
+  for (const file of ["config.js", "state.js", "web-bridge.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(ext, file), "utf-8"), context, { filename: file });
+  }
+  let page;
+  listeners[0]({ kind: "tp.probe" }, {}, answer => { page = answer; });
+  const role = lease => listeners[0]({ kind: "tp.role", pageId: page.pageId, lease }, {}, () => {});
+  const oldReads = () => requests.filter(p => p.includes("/" + id + "/")).length;
+  role("account-b");
+  await until(() => reports.length === 1);
+  assert.equal(reports[0].accessErrors[id], stamp);
+  assert.ok(durable.tasks[id].accessDeniedAt);
+  assert.equal(oldReads(), 1);
+  await new Promise(r => setTimeout(r, 5));
+  stamp += web.timing.idle + web.timing.list;
+  interval();
+  await until(() => reports.length >= 2);
+  assert.equal(oldReads(), 1, "denied absent task was repeatedly queried");
+  assert.ok(!reports.at(-1).conversations.some(item => item.id === id));
+  role("");
+});
+
+test("idle report does not perform foreground-only browser queries when no reply is eligible", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  let windowReads = 0, tabQueries = 0, tabReads = 0;
+  const w = app.chrome.windows.getLastFocused, q = app.chrome.tabs.query, g = app.chrome.tabs.get;
+  app.chrome.windows.getLastFocused = async (...args) => { windowReads++; return w(...args); };
+  app.chrome.tabs.query = async (...args) => { tabQueries++; return q(...args); };
+  app.chrome.tabs.get = async (...args) => { tabReads++; return g(...args); };
+  await app.deliver(report(now + 5_000, row()));
+  assert.deepEqual({ windowReads, tabQueries, tabReads }, { windowReads: 0, tabQueries: 0, tabReads: 1 });
 });

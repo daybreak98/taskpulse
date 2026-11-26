@@ -33,6 +33,28 @@
     return result?.ok === true && result.clearNotice !== false;
   }
 
+  function authError(error) {
+    return /^HTTP (401|403)(?:\b|$)/.test(error || "");
+  }
+
+  // A bounded list can omit an old task. Its prior title and queue state
+  // are not proof that the current login still has access to that task.
+  function evidenceFloor(state, task) {
+    return Math.max(state.revalidateAfter || 0, task?.retained ? task.retainedSince || 0 : 0);
+  }
+
+  function taskAccessible(state, task) {
+    return !!task && !state.authBlocked && !authError(state.error) && !task.accessDeniedAt &&
+      (!task.retained || task.observedAt >= evidenceFloor(state, task));
+  }
+
+  function taskFresh(state, task, now) {
+    return taskAccessible(state, task) && !state.sourceUnavailable && !state.error && state.at &&
+      now - state.at <= timing.sourceStale && state.listAt && now - state.listAt <= timing.sourceStale &&
+      task.listedAt === state.listAt && !task.listUncertain && !task.queueError && task.observedAt &&
+      task.observedAt >= evidenceFloor(state, task) && now - task.observedAt <= timing.queueStale;
+  }
+
   function latestMessage(report, task, stamp) {
     const message = report.lastMessages?.[task.id];
     if (!message || time(message.updateTime) !== task.update ||
@@ -87,7 +109,7 @@
 
   function canAcknowledge(task) {
     return !!task && !task.runAt && !task.awaitingReply && !task.messageUncertain &&
-      !task.queueError && !task.listUncertain &&
+      !task.queueError && !task.listUncertain && !task.accessDeniedAt &&
       task.status !== "running" && (!task.pending || verifiedReply(task));
   }
 
@@ -101,7 +123,7 @@
   function reportRows(rows, tasks, now) {
     const known = new Set(rows.map(row => row.id));
     const retained = Object.values(tasks || {}).filter(task =>
-      id(task.id) && id(task.agentId) && !known.has(task.id) && activeTask(task) &&
+      id(task.id) && id(task.agentId) && !known.has(task.id) && activeTask(task) && !task.accessDeniedAt &&
       time(task.realListedAt || task.listedAt) && now - (task.realListedAt || task.listedAt) <= HISTORY
     ).map(task => ({
       id: task.id, agentId: task.agentId, name: task.name, groupName: task.group,
@@ -208,10 +230,18 @@
     const reportError = text(report.error, 150);
     if (!listAt || listAt > at || listAt < previous.listAt || !Array.isArray(report.conversations)) {
       state.error = reportError || previous.error || "会话列表状态待确认";
+      state.authBlocked = Boolean(previous.authBlocked || authError(state.error));
+      state.revalidateAfter = Math.max(previous.revalidateAfter || 0, at);
       return { state, replies: [] };
     }
-    // A cached successful list cannot prove recovery from a later failure.
-    state.error = reportError || (listAt === previous.listAt ? previous.error : "") || "";
+    // A cached list cannot prove recovery from a later failure or a retired
+    // collector. Keep its evidence fence even after a fresh list arrives.
+    const recoveredList = !reportError && listAt > previous.listAt &&
+      listAt >= (previous.revalidateAfter || 0);
+    state.error = reportError || (!recoveredList ? previous.error : "") || "";
+    state.authBlocked = Boolean(authError(state.error) || previous.authBlocked && !recoveredList);
+    state.sourceUnavailable = Boolean(previous.sourceUnavailable && !recoveredList);
+    if (state.error) state.revalidateAfter = Math.max(previous.revalidateAfter || 0, at);
     const baseline = state.baselineAt ||= listAt;
     state.listAt = listAt;
     const replies = [];
@@ -226,7 +256,8 @@
       const created = time(row.createTime);
       const old = state.tasks[cid]?.agentId === agentId ? state.tasks[cid] : null;
       const retained = row.retained === true;
-      if (retained && (!old || !activeTask(old) || now - (old.realListedAt || old.listedAt) > HISTORY)) continue;
+      if (retained && (!old || !activeTask(old) || old.accessDeniedAt ||
+          now - (old.realListedAt || old.listedAt) > HISTORY)) continue;
       if (old && update < old.update) {
         // Keep the previous version visible but unconfirmable on a regressed row.
         state.tasks[cid] = { ...old, listedAt: listAt, listUncertain: true };
@@ -236,21 +267,31 @@
         ...(old || { status: "seen", historyAt: baseline, acked: update > baseline ? Math.max(created, baseline) : update, observedAt: 0 }),
         id: cid, agentId, update, created, listedAt: listAt,
         realListedAt: retained ? (old.realListedAt || old.listedAt) : listAt,
-        retained, listUncertain: false,
+        retained, retainedSince: retained ? (old.retained ? old.retainedSince || old.listedAt : listAt) : 0,
+        listUncertain: false,
         name: text(row.name, 180) || "会话 " + cid, group: text(row.groupName, 80)
       };
 
       const sampleAt = time(report.queueAt?.[cid]);
       const busy = queueBusy(report.queues?.[cid]);
-      const message = latestMessage(report, task, at);
+      const floor = evidenceFloor(state, task);
+      const rawMessage = latestMessage(report, task, at);
+      const message = rawMessage && rawMessage.at >= floor ? rawMessage : null;
       const errorAt = time(report.queueErrors?.[cid]);
+      const accessErrorAt = time(report.accessErrors?.[cid]);
+      if (accessErrorAt && accessErrorAt >= Math.max(sampleAt, message?.at || 0, task.accessDeniedAt || 0)) {
+        task.accessDeniedAt = accessErrorAt;
+      }
       const messageErrorAt = time(report.messageErrors?.[cid]);
       const messageError = !!messageErrorAt && messageErrorAt >= (task.messageObservedAt || 0) &&
         (!message || messageErrorAt >= message.at);
-      const freshQueue = busy !== null && sampleAt > task.observedAt && sampleAt <= at;
-      const freshMessage = busy === false && sampleAt === task.observedAt && !task.queueError &&
+      const freshQueue = !state.error && !state.sourceUnavailable && busy !== null &&
+        sampleAt >= floor && sampleAt > task.observedAt && sampleAt <= at && sampleAt > (task.accessDeniedAt || 0);
+      if (freshQueue && !retained) delete task.accessDeniedAt;
+      const freshMessage = !state.error && !state.sourceUnavailable && !task.accessDeniedAt &&
+        busy === false && sampleAt >= floor && sampleAt === task.observedAt && !task.queueError &&
         message && message.at >= sampleAt && message.at > (task.messageObservedAt || 0);
-      if (freshQueue || freshMessage) {
+      if (!task.accessDeniedAt && (freshQueue || freshMessage)) {
         applyQueue(task, sampleAt, busy, message, messageError);
         if (freshQueue) task.queueError = false;
       } else if (busy !== true && (messageError ||
@@ -258,8 +299,7 @@
         task.messageUncertain = true;
       }
       if (errorAt > task.observedAt) task.queueError = true;
-      const confirmed = !state.error && !task.queueError && task.observedAt &&
-        now - listAt <= timing.sourceStale && now - task.observedAt <= timing.queueStale;
+      const confirmed = taskFresh(state, task, now);
       if (task.pending && verifiedReply(task) && confirmed && canAcknowledge(task)) {
         if (cid === activeId && task.status === "attention") {
           // Auto-read must also apply to a reply that has already been notified.
@@ -281,12 +321,13 @@
   function view(state, now) {
     const offline = !state.at || now - state.at > timing.sourceStale;
     const error = state.error || "";
-    const stale = offline || !!error || !state.listAt || now - state.listAt > timing.sourceStale;
+    const stale = offline || !!error || !!state.sourceUnavailable || !!state.authBlocked ||
+      !state.listAt || now - state.listAt > timing.sourceStale;
     const counts = { running: 0, attention: 0, stuck: 0 };
     const tasks = [];
     for (const task of Object.values(state.tasks)) {
-      if (task.listedAt !== state.listAt) continue;
-      const uncertain = stale || task.listUncertain || task.queueError || task.messageUncertain || !task.observedAt || now - task.observedAt > timing.queueStale;
+      if (task.listedAt !== state.listAt || !taskAccessible(state, task)) continue;
+      const uncertain = !taskFresh(state, task, now) || task.messageUncertain;
       if (!uncertain && Object.hasOwn(counts, task.status)) counts[task.status]++;
       tasks.push({ ...task, uncertain });
     }
@@ -294,5 +335,5 @@
     return { counts, tasks, stale, offline, error };
   }
 
-  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, mayDismissNotice, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
+  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, mayDismissNotice, authError, taskAccessible, taskFresh, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
 })();

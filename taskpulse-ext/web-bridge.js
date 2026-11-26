@@ -38,7 +38,7 @@
         ...init, credentials: "same-origin", cache: "no-store",
         redirect: "error", signal: controller.signal
       });
-      if (!response.ok) throw new Error("HTTP " + response.status);
+      if (!response.ok) throw Object.assign(new Error("HTTP " + response.status), { httpStatus: response.status });
       const data = await response.json();
       if (token !== lease || generation !== leaseGeneration) throw new Error("采集租约已变更");
       if (!data?.data || typeof data.data !== "object" || data.success === false || data.error_msg) {
@@ -82,6 +82,11 @@
     }
   }
 
+  function accessDenied(failure, row) {
+    return failure?.httpStatus === 401 || failure?.httpStatus === 403 ||
+      row.retained && failure?.httpStatus === 404;
+  }
+
   async function pullQueue(row, sample, deadline) {
     sample.checked = Date.now();
     try {
@@ -95,8 +100,10 @@
       };
       sample.at = Date.now();
       sample.errorAt = 0;
-    } catch {
+      sample.deniedAt = 0;
+    } catch (failure) {
       sample.errorAt = Date.now();
+      if (accessDenied(failure, row)) sample.deniedAt = sample.errorAt;
       return false;
     } finally {
       dirty = true;
@@ -111,7 +118,7 @@
     const sameVersion = previous?.updateTime === updateTime;
     if (sameVersion && Date.now() < previous.nextAt) return;
     const failures = sameVersion ? previous.failures : 0;
-    const probe = { updateTime, failures: failures + 1,
+    const probe = { updateTime, failures: failures + 1, deniedAt: previous?.deniedAt || 0,
       nextAt: Date.now() + Math.min(60_000, 10_000 * (2 ** Math.min(failures, 3))) };
     probes.set(row.id, probe);
     try {
@@ -133,12 +140,14 @@
       messages.set(row.id, message);
       probe.failures = 0;
       probe.errorAt = 0;
+      probe.deniedAt = 0;
       probe.nextAt = Date.now() + (sender === "assistant" ? 30_000 : 10_000);
       dirty = true;
-    } catch {
+    } catch (failure) {
       // Never reuse an older success as confirmation after a failed probe.
       messages.delete(row.id);
       probe.errorAt = Date.now();
+      if (accessDenied(failure, row)) probe.deniedAt = probe.errorAt;
       dirty = true;
       // Keep retrying this version with the existing bounded backoff.
     }
@@ -149,19 +158,23 @@
     if (token !== lease || generation !== leaseGeneration || !alive() || at - reportAt < timing.report ||
         (!dirty && at - reportAt < timing.list)) return;
     reportAt = at;
-    const queues = {}, queueAt = {}, queueErrors = {};
+    const queues = {}, queueAt = {}, queueErrors = {}, accessErrors = {};
     for (const [id, sample] of samples) {
       if (sample.at) {
         queues[id] = sample.queue;
         queueAt[id] = sample.at;
       }
       if (sample.errorAt) queueErrors[id] = sample.errorAt;
+      if (sample.deniedAt) accessErrors[id] = sample.deniedAt;
+    }
+    for (const [id, probe] of probes) {
+      if (probe.deniedAt) accessErrors[id] = Math.max(accessErrors[id] || 0, probe.deniedAt);
     }
     const accepted = await chrome.runtime.sendMessage({
       kind: "tp.webstate", pageId, lease: token,
       payload: { at, listAt, error,
         conversations: TaskPulseState.reportRows(conversations, trackedTasks, at),
-        queues, queueAt, queueErrors,
+        queues, queueAt, queueErrors, accessErrors,
         lastMessages: Object.fromEntries(messages),
         messageErrors: Object.fromEntries([...probes].filter(([, probe]) => probe.errorAt).map(([id, probe]) => [id, probe.errorAt])) }
     });
@@ -235,6 +248,11 @@
     } catch (failure) {
       if (error !== failure.message) dirty = true;
       error = failure.name === "AbortError" ? "会话列表请求超时" : String(failure.message).slice(0, 150);
+      // Do not carry old authenticated queue/message observations across a
+      // failed list request. Recovery still uses the same normal poll budget.
+      samples.clear();
+      messages.clear();
+      probes.clear();
     } finally {
       try { await report(token, generation); } catch { /* An extension reload can invalidate this page. */ }
       collecting = false;

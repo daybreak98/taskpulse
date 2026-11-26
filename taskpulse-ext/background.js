@@ -102,6 +102,16 @@ async function probe(tab) {
   }
 }
 
+async function markSourceUnavailable() {
+  const state = await getState();
+  if (!state.sourceUnavailable) {
+    state.sourceUnavailable = true;
+    state.revalidateAfter = Math.max(state.revalidateAfter || 0, Date.now());
+    await saveState(state);
+    await updateBadge(state);
+  }
+}
+
 async function syncLeader({ install = false, nudge = false } = {}) {
   const old = await getLeader();
   const candidates = (await pages()).filter(isReady);
@@ -112,7 +122,14 @@ async function syncLeader({ install = false, nudge = false } = {}) {
   }
 
   const current = candidates.find(tab => tab.id === old?.tabId);
-  if (current) {
+  const state = await getState();
+  const lastProgress = Math.max(old?.since || 0, Math.min(state.at || 0, state.listAt || 0));
+  // A content script can answer a probe while its background timers have
+  // stopped producing usable data. Prefer another ready page only once the
+  // existing source-stale window is exceeded; healthy sources never churn.
+  const stalled = Boolean(current && candidates.some(tab => tab.id !== current.id) &&
+    Date.now() - lastProgress > web.timing.sourceStale);
+  if (current && !stalled) {
     const answer = await probe(current);
     if (answer?.pageId === old.pageId) {
       if (answer.lease !== old.lease) {
@@ -125,17 +142,24 @@ async function syncLeader({ install = false, nudge = false } = {}) {
     }
   }
 
-  candidates.sort((a, b) => Number(b.active) - Number(a.active));
+  candidates.sort((a, b) =>
+    (stalled ? Number(a.id === current.id) - Number(b.id === current.id) : 0) ||
+    Number(b.active) - Number(a.active));
+  // Fence cached evidence before granting any replacement lease.
+  await markSourceUnavailable();
   for (const tab of candidates) {
     const answer = await probe(tab);
     if (!answer?.pageId) continue;
-    const next = { tabId: tab.id, pageId: answer.pageId, lease: crypto.randomUUID() };
+    const next = { tabId: tab.id, pageId: answer.pageId, lease: crypto.randomUUID(), since: Date.now() };
     await chrome.storage.session.set({ [web.keys.leader]: next });
     if (old) await signal(old.tabId, { kind: "tp.role", pageId: old.pageId, lease: "" });
     const accepted = await signal(tab.id, { kind: "tp.role", pageId: next.pageId, lease: next.lease });
     if (accepted?.pageId === next.pageId) return;
+    // A timed-out role response may still have started a collector.
+    await signal(tab.id, { kind: "tp.role", pageId: next.pageId, lease: "" });
   }
   await chrome.storage.session.remove(web.keys.leader);
+  if (old) await signal(old.tabId, { kind: "tp.role", pageId: old.pageId, lease: "" });
 }
 
 let refreshTimer = null;
@@ -186,10 +210,7 @@ function activeConversation(state, tab) {
 }
 
 function freshTask(state, task, now = Date.now()) {
-  return !state.error && state.at && now - state.at <= web.timing.sourceStale &&
-    state.listAt && now - state.listAt <= web.timing.sourceStale &&
-    task && task.listedAt === state.listAt && !task.listUncertain && !task.queueError && task.observedAt &&
-    now - task.observedAt <= web.timing.queueStale;
+  return rules.taskFresh(state, task, now);
 }
 
 function canAutoRead(state, task, manual = false) {
@@ -232,6 +253,11 @@ async function clearReadNotices(state) {
     const revision = key.slice(REPLY_NOTICE.length);
     const [id, agentId, update, replyKey] = revision.split("/");
     const task = state.tasks[id];
+    // Explicit login loss and unverified retained rows must not expose
+    // prior account titles through system notifications. Preserve the
+    // pending watermark/outbox; do not mark the task read.
+    if (state.authBlocked || rules.authError(state.error)) return true;
+    if (task && !rules.taskAccessible(state, task)) return true;
     if (!task || task.agentId !== agentId ||
         task.pending && rules.revision(task) === revision) return false;
     // Existing 2.1.1 storage may have a confirmed read watermark but no
@@ -334,6 +360,13 @@ async function acceptReport(msg, sender) {
   if (!leader || leader.tabId !== sender.tab.id || leader.pageId !== msg.pageId || leader.lease !== msg.lease) {
     return { ok: false };
   }
+  // The sender snapshot may predate a navigation or removal of its tab.
+  const actual = await chrome.tabs.get(sender.tab.id).catch(() => null);
+  if (!isReady(actual)) {
+    await markSourceUnavailable();
+    refreshLeader();
+    return { ok: false };
+  }
   const state = await getState();
   await jumpReady;
   // First absorb observations without guessing which page will remain focused.
@@ -347,8 +380,11 @@ async function acceptReport(msg, sender) {
     pruneOutbox(next);
     await saveState(next);
     await syncNotices(next);
-    const currentPage = await foregroundPage();
-    const pendingReplies = replies.filter(task => noticeTask(next, rules.revision(task)));
+    const pendingReplies = replies.filter(task => {
+      const current = noticeTask(next, rules.revision(task));
+      return freshTask(next, current) && rules.canAcknowledge(current);
+    });
+    const currentPage = pendingReplies.length ? await foregroundPage() : null;
     if (currentPage && pendingReplies.length) await signal(currentPage.id, {
       kind: "tp.replies",
       tasks: pendingReplies.slice(0, 3).reverse().map(task => ({
@@ -361,6 +397,11 @@ async function acceptReport(msg, sender) {
 
 async function markVisited(tabId, windowId) {
   const state = await getState();
+  if (tabId !== undefined && (state.sourceUnavailable || !state.at ||
+      Date.now() - Math.min(state.at || 0, state.listAt || 0) > web.timing.sourceStale)) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (isReady(tab)) refreshLeader();
+  }
   if (!await readForeground(state, tabId, windowId, true)) return;
   pruneOutbox(state);
   await saveState(state);
@@ -453,7 +494,8 @@ async function openTask(id, revision, allowSavedId = false, intent = "row") {
     await jumpReady;
     const state = await getState();
     const task = state.tasks[id];
-    if (!task && !allowSavedId) return { ok: false };
+    if (state.authBlocked || rules.authError(state.error) ||
+        task && !rules.taskAccessible(state, task) || !task && !allowSavedId) return { ok: false };
     const agentId = web.id(revision.split("/")[1]) || task?.agentId;
     const landing = await focusConversation(id, agentId, revision);
     if (!landing) return { ok: false };
@@ -465,7 +507,8 @@ async function openTask(id, revision, allowSavedId = false, intent = "row") {
       // before committing a read; focus or route may have changed meanwhile.
       const actual = await foregroundPage();
       if (actual?.id !== tabId || !matchesConversation(actual, id, agentId) ||
-          jumpTabs.get(tabId)?.token !== guard.token || /HTTP (401|403)/.test(fresh.error)) {
+          jumpTabs.get(tabId)?.token !== guard.token || fresh.authBlocked || rules.authError(fresh.error) ||
+          current && !rules.taskAccessible(fresh, current)) {
         await abandonJump(tabId, guard, previous);
         return { ok: false, clearNotice: false };
       }

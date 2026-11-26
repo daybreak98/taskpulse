@@ -117,7 +117,7 @@
   function explain(view) {
     if (actionError) return actionError;
     if (!state.at) return "等待首次采样…";
-    if (/HTTP (401|403)/.test(view.error)) return "请登录 DataAgent 后继续";
+    if (state.authBlocked || rules.authError(view.error)) return "请登录 DataAgent 后继续";
     if (view.error) return "取数暂时失败，显示上次快照";
     if (view.stale) return "取数暂未更新，显示上次快照";
     const uncertain = view.tasks.filter(task => task.uncertain).length;
@@ -428,7 +428,7 @@
       state = changes[web.keys.state].newValue ?? rules.blank();
       for (const toast of [...toasts]) {
         const task = state.tasks[toast.id];
-        if (!task?.pending || rules.revision(task) !== toast.revision) removeToast(toast.revision);
+        if (!task?.pending || !rules.taskAccessible(state, task) || rules.revision(task) !== toast.revision) removeToast(toast.revision);
       }
     }
     if (changes[pinKey]) {
@@ -460,7 +460,8 @@
         const saved = items[web.keys.state] ?? rules.blank();
         for (const task of msg.tasks ?? []) {
           const current = saved.tasks[task.id];
-          if (current?.pending && rules.revision(current) === task.revision) showToast(task);
+          if (current?.pending && rules.taskFresh(saved, current, Date.now()) && rules.canAcknowledge(current) &&
+              rules.revision(current) === task.revision) showToast(task);
         }
         reply({ ok: true });
       }).catch(() => reply({ ok: false }));
