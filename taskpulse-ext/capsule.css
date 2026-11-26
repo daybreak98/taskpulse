@@ -27,17 +27,32 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
 }
 .capsule.alerting::after { box-shadow: inset 0 0 0 1px rgb(224 185 115 / .65); }
 .number {
-  --base: 49 131 175; --light: 83 184 233; --glow: .75;
+  /* Keep the reference palette even at zero. Task count and selection
+     change the light level, never the identity of a segment. */
+  --rest-base: 59 119 156; --rest-light: 80 157 202;
+  --live-base: 63 140 187; --live-light: 79 165 216;
+  --base: var(--rest-base); --light: var(--rest-light); --glow: .72;
+  --selection: 0;
   display: grid; place-items: center; position: relative; min-width: 0;
-  background: radial-gradient(ellipse at center, rgb(var(--light) / var(--glow)), rgb(var(--light) / 0) 88%), rgb(var(--base) / .82);
+  background: linear-gradient(rgb(202 230 246 / var(--selection)), rgb(202 230 246 / var(--selection))),
+    radial-gradient(ellipse at center, rgb(var(--light) / var(--glow)), rgb(var(--light) / 0) 93%), rgb(var(--base) / .96);
   color: #122e40; font-size: 16px; font-weight: 650; line-height: 1; font-variant-numeric: tabular-nums;
   cursor: inherit; touch-action: none;
 }
-.number[data-filter="attention"] { --base: 157 126 72; --light: 248 199 100; --glow: .93; }
-.number[data-filter="stuck"] { --base: 147 91 103; --light: 235 157 165; --glow: .8; }
-.number.zero { --base: 78 116 137; --light: 150 180 196; --glow: .38; }
-.number[aria-pressed="true"] { box-shadow: inset 0 0 0 1px rgb(191 230 248 / .36); }
-.number.dimmed::before { content: ""; position: absolute; inset: 0; background: rgb(12 31 43 / .19); }
+.number[data-filter="attention"] {
+  --rest-base: 148 126 83; --rest-light: 200 157 86;
+  --live-base: 167 150 102; --live-light: 239 185 91;
+}
+.number[data-filter="stuck"] {
+  --rest-base: 86 117 137; --rest-light: 114 145 162;
+  --live-base: 105 145 165; --live-light: 156 189 207;
+}
+.number:not(.zero) { --base: var(--live-base); --light: var(--live-light); --glow: .92; }
+.number[aria-pressed="true"] {
+  --selection: .16;
+  box-shadow: inset 0 0 0 1px rgb(188 223 240 / .60), inset 0 0 5px rgb(var(--light) / .22);
+}
+.number.dimmed::before { content: ""; position: absolute; inset: 0; background: rgb(12 31 43 / .09); }
 .number span { position: relative; }
 .panel, .toast {
   isolation: isolate; border: 0; border-radius: var(--radius); overflow: hidden;

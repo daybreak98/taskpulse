@@ -131,6 +131,62 @@ async function trial() {
     const panel = page.locator(root + " .panel");
     const horizontal = panel.locator(".horizontal");
     await compact.locator("[data-filter='running']").filter({ hasText: /^1$/ }).waitFor({ timeout: 16_000 });
+    // Assert the production shadow stylesheet, including every count and
+    // selection combination, without changing live task state.
+    const readPalette = counter => counter.locator(".number").evaluateAll(nodes => nodes.map(node => {
+      const style = getComputedStyle(node);
+      return {
+        base: style.getPropertyValue("--base").trim(),
+        light: style.getPropertyValue("--light").trim(),
+        selection: style.getPropertyValue("--selection").trim()
+      };
+    }));
+    const palette = await compact.evaluate(el => {
+      const clone = el.cloneNode(true);
+      clone.hidden = false;
+      clone.style.visibility = "hidden";
+      el.getRootNode().append(clone);
+      const nodes = [...clone.querySelectorAll(".number")];
+      const sample = () => nodes.map(node => {
+        const style = getComputedStyle(node);
+        return {
+          base: style.getPropertyValue("--base").trim(),
+          light: style.getPropertyValue("--light").trim(),
+          selection: style.getPropertyValue("--selection").trim()
+        };
+      });
+      try {
+        nodes.forEach(node => { node.classList.add("zero"); node.classList.remove("dimmed"); node.setAttribute("aria-pressed", "false"); });
+        const zero = sample();
+        nodes.forEach(node => node.classList.remove("zero"));
+        const active = sample();
+        const selected = nodes.map((node, index) => {
+          nodes.forEach((other, i) => {
+            other.classList.toggle("dimmed", i !== index);
+            other.setAttribute("aria-pressed", String(i === index));
+          });
+          return sample();
+        });
+        nodes.forEach(node => node.classList.add("zero"));
+        const selectedZero = sample();
+        return { zero, active, selected, selectedZero };
+      } finally { clone.remove(); }
+    });
+    assert.deepEqual(palette.zero.map(p => p.base), ["59 119 156", "148 126 83", "86 117 137"]);
+    assert.deepEqual(palette.active.map(p => p.base), ["63 140 187", "167 150 102", "105 145 165"]);
+    assert.equal(new Set(palette.zero.map(p => p.base)).size, 3);
+    const brightness = color => color.split(" ").map(Number).reduce((sum, channel, i) => sum + channel * [0.2126, 0.7152, 0.0722][i], 0);
+    for (let i = 0; i < 3; i++) {
+      assert.ok(brightness(palette.active[i].light) > brightness(palette.zero[i].light));
+      assert.deepEqual(palette.selected[i].map(p => p.base), palette.active.map(p => p.base));
+      assert.deepEqual(palette.selected[i].map(p => p.selection), [0, 1, 2].map(j => j === i ? ".16" : "0"));
+    }
+    assert.deepEqual(palette.selectedZero.map(p => p.base), palette.zero.map(p => p.base));
+    assert.equal(palette.selectedZero[2].selection, ".16");
+    assert.deepEqual((await readPalette(compact)).map(p => p.base),
+      [palette.active[0].base, palette.zero[1].base, palette.zero[2].base]);
+    console.log("Reference capsule palette: zero, active and selected states retain all three segment hues");
+
     const vertical = await compact.boundingBox();
     assert.deepEqual(vertical, { x: 1372, y: 22, width: 28, height: 96 });
     const pillFont = await compact.locator(".number").first().evaluate(el => getComputedStyle(el).fontSize);
@@ -140,6 +196,7 @@ async function trial() {
     await compact.waitFor({ state: "hidden" });
     assert.deepEqual(await horizontal.boundingBox(), { x: 1172, y: 26, width: vertical.height, height: vertical.width });
     assert.equal(await horizontal.locator(".number").first().evaluate(el => getComputedStyle(el).fontSize), pillFont);
+    assert.deepEqual(await readPalette(horizontal), await readPalette(compact));
     assert.equal(await panel.locator(".panel-title, .glass-bridge").count(), 0);
     assert.equal((await panel.boundingBox()).width, 240);
     assert.equal(await panel.locator("[data-mode='dataagent']").getAttribute("aria-pressed"), "true");
@@ -198,6 +255,8 @@ async function trial() {
     const firstRelease = fixture.releaseReply(900);
     const attention = horizontal.locator("[data-filter='attention']");
     await attention.filter({ hasText: /^1$/ }).waitFor({ timeout: 8_000 });
+    assert.deepEqual((await readPalette(horizontal)).map(p => p.base),
+      [palette.zero[0].base, palette.active[1].base, palette.zero[2].base]);
     console.log("Active reply end-to-end latency ms:", Date.now() - firstRelease);
     const toast = page.locator(root + " .toast").filter({ hasText: task.name });
     await toast.waitFor();
@@ -242,8 +301,13 @@ async function trial() {
 
     await page.bringToFront();
     await toast.waitFor({ state: "hidden" });
+    await horizontal.locator(".number.zero").nth(2).waitFor();
+    assert.deepEqual((await readPalette(horizontal)).map(p => p.base), palette.zero.map(p => p.base));
     await attention.click();
     assert.equal(await attention.getAttribute("aria-pressed"), "true");
+    const selectedPalette = await readPalette(horizontal);
+    assert.deepEqual(selectedPalette.map(p => p.base), palette.zero.map(p => p.base));
+    assert.deepEqual(selectedPalette.map(p => p.selection), ["0", ".16", "0"]);
     assert.equal(await horizontal.locator(".dimmed").count(), 2);
     await attention.click();
     if (await group.getAttribute("aria-expanded") === "false") await group.click();
