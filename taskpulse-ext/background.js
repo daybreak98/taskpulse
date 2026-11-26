@@ -339,8 +339,9 @@ async function readForeground(state, tabId, windowId, manual = false) {
 function noticeTask(state, revision) {
   const [id, agentId] = revision.split("/");
   const task = state.tasks[id];
-  return task?.agentId === agentId && task.pending && rules.revision(task) === revision &&
-    !rules.isDismissed(task) && rules.recentNoticeActivity(task, Date.now()) ? task : null;
+  return task?.agentId === agentId && task.pending && rules.verifiedReply(task) &&
+    rules.revision(task) === revision && !rules.isDismissed(task) &&
+    rules.recentNoticeActivity(task, Date.now()) ? task : null;
 }
 
 function pruneOutbox(state) {
@@ -369,6 +370,9 @@ async function clearReadNotices(state) {
     if (!task || task.agentId !== agentId) return false;
     if (rules.isDismissed(task) && rules.revision(task) === revision ||
         !rules.recentNoticeActivity(task, Date.now())) return true;
+    // Old update-only revisions were never verified replies. Withdraw their
+    // legacy OS notifications rather than preserving a false pending notice.
+    if (task.pending && !rules.verifiedReply(task)) return true;
     // Do not clear the newly pending version of a previously dismissed row.
     if (task.pending && rules.revision(task) === revision) return false;
     if (task.dismissedNoticeRevision === revision) return true;
