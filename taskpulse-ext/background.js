@@ -291,7 +291,7 @@ function canAutoRead(state, task, manual = false) {
     rules.verifiedReply(task) && rules.canAcknowledge(task);
 }
 
-// Only an exact notice that successfully landed may defer its read.
+// Only an exact notice or completed red reply row that successfully landed may defer its read.
 function canResumeNoticeRead(state, task, guard) {
   return Boolean(guard?.deferredRead && guard.token && task &&
     task.jumpCommit !== guard.token && guard.revision === rules.revision(task) &&
@@ -618,6 +618,15 @@ async function openTask(id, revision, allowSavedId = false, intent = "row") {
           await forgetJump(tabId, false, guard.token);
           return { ok: true, clearNotice: true };
         }
+        if (current.pending && (fromNotice ||
+            current.status === "stuck" && rules.verifiedReply(current) &&
+              !current.runAt && !current.awaitingReply)) {
+          // An exact notice or completed red reply row has successfully
+          // landed but is temporarily unconfirmable. Preserve the existing
+          // version/foreground fence until this reply can be acknowledged.
+          await rememberJump(tabId, { ...guard, deferredRead: true });
+          return { ok: true, clearNotice: false };
+        }
         if (!fromNotice) {
           // A direct row visit is intentional even while a run is incomplete.
           // Permit later verified foreground replies without acknowledging
@@ -626,11 +635,6 @@ async function openTask(id, revision, allowSavedId = false, intent = "row") {
           await saveState(fresh);
           await forgetJump(tabId, false, guard.token);
           return { ok: true, clearNotice: !current.pending };
-        }
-        if (current.pending) {
-          // Exact current notice landed, but evidence is temporarily uncertain.
-          // Resume this version only when a later sample confirms it.
-          await rememberJump(tabId, { ...guard, deferredRead: true });
         }
         // A replayed notice for an already read revision remains protected.
         return { ok: true, clearNotice: !current.pending };

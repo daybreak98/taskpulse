@@ -104,9 +104,9 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
 .group-line::after { content: ""; position: absolute; bottom: 0; width: var(--progress, 0%); height: 1px; background: var(--accent); opacity: .55; }
 .group-head.tab-group .group-name { border-left: 2px solid var(--group-color); padding-left: 5px; }
 .row { --row-tint: rgb(112 154 177 / .17); --row-glow: 145 194 219; --content-alpha: .8; position: relative; height: 28px; }
-.row.running { --row-tint: rgb(97 159 190 / .23); --row-glow: 144 209 237; --content-alpha: 1; }
+.row.running { --row-tint: rgb(97 159 190 / .38); --row-glow: 144 209 237; --content-alpha: 1; }
 .row.attention { --row-tint: rgb(200 164 96 / .31); --row-glow: 235 202 141; --content-alpha: 1; }
-.row.stuck { --row-tint: rgb(206 112 100 / .29); --row-glow: 247 170 155; --content-alpha: 1; }
+.row.stuck { --row-tint: rgb(206 112 100 / .40); --row-glow: 247 170 155; --content-alpha: 1; }
 .row.done { --row-tint: rgb(90 159 148 / .18); }
 .row-plate { position: absolute; inset: 1px 0 2px; border-radius: 6px; pointer-events: none; overflow: hidden; background: var(--row-tint); }
 .row-plate::before { position: absolute; content: ""; inset: 0 auto 0 0; width: var(--progress, 0%); background: linear-gradient(90deg, rgb(var(--row-glow) / .06), rgb(var(--row-glow) / .13) 80%, transparent); }
