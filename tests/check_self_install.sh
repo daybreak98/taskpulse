@@ -204,3 +204,6 @@ if [[ -z "$(bundle_pids "$bad_bundle" TaskPulseInstaller)" ]]; then
   exit 1
 fi
 echo "Self-install failure keeps the installer running."
+
+# Exercise the installed runtime's actual launch path with an isolated local fixture.
+bash "$repo_dir/tests/check_bootstrap_startup.sh" "$1"

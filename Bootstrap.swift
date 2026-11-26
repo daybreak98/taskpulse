@@ -62,23 +62,35 @@ final class Bootstrap {
         return true
     }
 
-    /// 已初始化时，对齐当前 App 的后台路径和配套脚本。
+    static func configuredPort(_ cfg: [String: Any]) -> Int {
+        let ui = cfg["ui"] as? [String: Any] ?? [:]
+        return (ui["port"] as? Int) ?? Int(ui["port"] as? String ?? "") ?? 8899
+    }
+
+    /// 已初始化时也必须同步新版浏览器协议和生成的配置，不能只换后台。
     static func refreshPaths() -> Bool {
         let fm = FileManager.default
         guard let data = fm.contents(atPath: runtimePath),
               var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let uv = obj["uv"] as? String, fm.isExecutableFile(atPath: uv) else { return false }
+              let uv = obj["uv"] as? String, fm.isExecutableFile(atPath: uv),
+              let raw = fm.contents(atPath: configPath),
+              let cfg = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else { return false }
         let poller = resources + "/poller.py"
         guard fm.fileExists(atPath: poller) else { return false }
         do {
-            if obj["poller"] as? String != poller {
+            let port = configuredPort(cfg)
+            let token = try ensureToken()
+            try syncScripts()
+            try syncExtension(cfg: cfg, port: port, token: token)
+            if obj["poller"] as? String != poller || obj["port"] as? Int != port {
                 obj["poller"] = poller
+                obj["port"] = port
                 let updated = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
                 try updated.write(to: URL(fileURLWithPath: runtimePath), options: .atomic)
             }
-            try syncScripts()
             return true
         } catch {
+            dbg("刷新安装文件失败：\(error)")
             return false
         }
     }
@@ -130,8 +142,7 @@ final class Bootstrap {
         report("准备 Python")
         try ensurePython(uv)
 
-        let port = ((cfg["ui"] as? [String: Any])?["port"] as? Int)
-            ?? Int((cfg["ui"] as? [String: Any])?["port"] as? String ?? "") ?? 8899
+        let port = configuredPort(cfg)
         let args = readUVArgs()
 
         report("检查取数依赖（首次要下载，约 10-40 秒）")
@@ -343,22 +354,35 @@ final class Bootstrap {
         guard fm.fileExists(atPath: src) else {
             throw BootstrapError.step("准备浏览器扩展", "App 里没有 edge-ext 目录")
         }
-        // 连扩展目录本身一起建：首次运行时它还不存在，只建父目录会让后面写
-        // config.js 报 "folder doesn't exist"
-        try? fm.createDirectory(atPath: extDir, withIntermediateDirectories: true)
-
-        // 脚本与模板每次都刷新（升级后代码要跟着变），config.js / manifest.json 重新生成
+        // Read and validate the complete bundled bridge before replacing any installed file.
+        var files: [(String, Data)] = []
         for name in ["background.js", "web-bridge.js", "manifest.template.json"] {
-            let from = src + "/" + name
-            let to = extDir + "/" + name
-            guard fm.fileExists(atPath: from) else { continue }
-            if fm.fileExists(atPath: to) { try? fm.removeItem(atPath: to) }
-            try? fm.copyItem(atPath: from, toPath: to)
+            guard let data = fm.contents(atPath: src + "/" + name), !data.isEmpty else {
+                throw BootstrapError.step("准备浏览器扩展", "App 里缺少 \(name)")
+            }
+            files.append((name, data))
         }
-        try writeExtensionConfig(cfg: cfg, port: port, token: token)
+        guard let raw = files.first(where: { $0.0 == "manifest.template.json" })?.1,
+              let manifest = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
+            throw BootstrapError.step("准备浏览器扩展", "manifest.template.json 读不出来")
+        }
+        files += try extensionConfigFiles(cfg: cfg, port: port, token: token, manifest: manifest)
+        try fm.createDirectory(atPath: extDir, withIntermediateDirectories: true)
+        // Atomic per-file replacement keeps existing scripts intact if a write fails.
+        // The stable directory is retained for the browser's unpacked-extension registration.
+        for (name, data) in files {
+            let to = extDir + "/" + name
+            if fm.contents(atPath: to) == data { continue }
+            do {
+                try data.write(to: URL(fileURLWithPath: to), options: .atomic)
+            } catch {
+                throw BootstrapError.step("准备浏览器扩展", "\(name)：\(error.localizedDescription)")
+            }
+        }
     }
 
-    private static func writeExtensionConfig(cfg: [String: Any], port: Int, token: String) throws {
+    private static func extensionConfigFiles(cfg: [String: Any], port: Int, token: String,
+                                             manifest template: [String: Any]) throws -> [(String, Data)] {
         let plat = (cfg["platform"] as? [String: Any]) ?? [:]
         let scope = ((cfg["extension"] as? [String: Any])?["scope"] as? String) ?? ""
         let base = (plat["base_url"] as? String) ?? ""
@@ -409,16 +433,14 @@ final class Bootstrap {
             "token": token,
             "api": scope.isEmpty ? NSNull() : api
         ]
+        guard let encodedConfig = jsonString(configJS) else {
+            throw BootstrapError.step("准备浏览器扩展", "config.js 生成失败")
+        }
         let js = "// 由 TaskPulse.app 按配置生成，重新打开 App 会覆盖\n"
-            + "self.TP_CONFIG = " + (jsonString(configJS) ?? "{}") + ";\n"
-        try writeFile(js, to: extDir + "/config.js")
+            + "self.TP_CONFIG = " + encodedConfig + ";\n"
 
         // manifest：模板 + 端口/域名
-        let templatePath = extDir + "/manifest.template.json"
-        guard let raw = FileManager.default.contents(atPath: templatePath),
-              var manifest = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
-            throw BootstrapError.step("准备浏览器扩展", "manifest.template.json 读不出来")
-        }
+        var manifest = template
         var hosts = ["http://127.0.0.1:\(port)/*"]
         if !scope.isEmpty { hosts.append(scope) }
         manifest["host_permissions"] = hosts
@@ -427,7 +449,7 @@ final class Bootstrap {
                                                                 .withoutEscapingSlashes]) else {
             throw BootstrapError.step("准备浏览器扩展", "manifest 生成失败")
         }
-        try writeFile(String(data: mData, encoding: .utf8) ?? "{}", to: extDir + "/manifest.json")
+        return [("config.js", Data(js.utf8)), ("manifest.json", mData)]
     }
 
     // MARK: 运行参数
@@ -459,7 +481,7 @@ final class Bootstrap {
 
     private static func jsonString(_ obj: Any) -> String? {
         guard let data = try? JSONSerialization.data(withJSONObject: obj,
-                                                     options: [.withoutEscapingSlashes]),
+                                                     options: [.sortedKeys, .withoutEscapingSlashes]),
               let s = String(data: data, encoding: .utf8) else { return nil }
         return s
     }
