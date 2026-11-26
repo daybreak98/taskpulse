@@ -203,8 +203,10 @@
     }
     void mount();
   }
-  function repair() {
-    if (document.hidden || !alive() || mountPromise || retryTimer !== null || watchdog !== null || healthy()) return;
+  function repair(invalidToken = null) {
+    if (invalidToken && registration?.token !== invalidToken) return;
+    if (document.hidden || !alive() || mountPromise || retryTimer !== null ||
+        !invalidToken && (watchdog !== null || healthy())) return;
     // A new navigation, activation or explicit probe grants a new bounded
     // recovery budget. No always-on watchdog or recurring polling.
     retryCount = 0;
@@ -214,6 +216,11 @@
   window.addEventListener("message", event => {
     if (event.origin !== extOrigin || !registration || !event.data || typeof event.data !== "object") return;
     const msg = event.data;
+    if (msg.type === "tp-frame-invalid" && registration.token === msg.token &&
+        (event.source === panel?.contentWindow || event.source === toast?.contentWindow)) {
+      repair(msg.token);
+      return;
+    }
     if (panel && event.source === panel.contentWindow) {
       if (msg.type === "tp-frame-ready") {
         sendGeometry();
@@ -278,7 +285,12 @@
     if (msg?.kind === "tp.surface-probe") {
       const ready = Boolean(healthy());
       if (!ready) repair();
-      reply({ ok: ready, installed: true });
+      reply({ ok: ready, installed: true, ...(ready ? { token: registration.token } : {}) });
+      return false;
+    }
+    if (msg?.kind === "tp.surface-repair") {
+      repair(msg.token);
+      reply({ ok: true });
       return false;
     }
     if (!visible()) return false;

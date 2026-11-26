@@ -19,7 +19,11 @@
     if (!attached?.ok) return;
   }
   const post = message => { if (frame) parent.postMessage(message, attached.origin); };
-  const request = (kind, fields = {}) => chrome.runtime.sendMessage({ kind, ...fields, ...(frame ? { token } : {}) });
+  const request = async (kind, fields = {}) => {
+    const result = await chrome.runtime.sendMessage({ kind, ...fields, ...(frame ? { token } : {}) });
+    if (frame && result?.surfaceInvalid) post({ type: "tp-frame-invalid", token });
+    return result;
+  };
 
   const names = { running: "运行中", attention: "待处理", stuck: "疑似卡住", seen: "已查看", done: "已处理" };
   const kinds = ["running", "attention", "stuck"];

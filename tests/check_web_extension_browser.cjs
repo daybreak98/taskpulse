@@ -624,6 +624,28 @@ async function trial() {
     }
     assert.equal((await probeSurface()).ok, true);
     assert.equal(await recovering.locator("#taskpulse-global-host").count(), 1);
+    // A healthy-looking frame whose session token was lost must not stay
+    // silently unusable. Real activation exercises background health repair.
+    const staleCredential = (await probeSurface()).token;
+    assert.ok(staleCredential);
+    await worker.evaluate(async url => {
+      const tab = (await chrome.tabs.query({})).find(t => t.url === url);
+      await chrome.storage.session.remove("tp-web-surface:" + tab.id);
+    }, recovering.url());
+    // Probe via an actual activation, without manually requesting repair.
+    await options.bringToFront();
+    await recovering.bringToFront();
+    let renewed;
+    for (let i = 0; i < 80; i++) {
+      const result = await probeSurface().catch(() => null);
+      if (result?.ok && result.token && result.token !== staleCredential) {
+        renewed = result;
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(renewed, "lost surface credential was not renewed");
+    assert.equal(await recovering.locator("#taskpulse-global-host").count(), 1);
     const frameAfter = await waitFrame(recovering, "panel");
     await recovering.evaluate(() => document.documentElement.classList.add("fixture-scroll"));
     await worker.evaluate(() => chrome.storage.local.set({ "tp-web-position": { x: 1, y: 1 } }));

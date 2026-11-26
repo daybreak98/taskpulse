@@ -22,10 +22,17 @@
     return [task.id, task.agentId, task.replyUpdate || task.update, task.replyKey || "-"].join("/");
   }
 
+  // A reply may arrive before the list endpoint catches up. Its own
+  // timestamp (or observation time for an undated verified reply) already
+  // covers that activity. The later list watermark is not a second event.
+  function displayUpdate(task) {
+    return Math.max(task.update || 0, task.userActivityAt || 0,
+      task.replyKey ? (task.replyAt || task.replyActivityAt || 0) : 0);
+  }
+
   // Raw lastUserMessage is a collector watermark, not proof of new activity.
-  // Hydrating an old/undated user message must not invalidate a dismissal.
   function displayVersion(task) {
-    return JSON.stringify([task.id, task.agentId, task.created || 0, task.update || 0,
+    return JSON.stringify([task.id, task.agentId, task.created || 0, displayUpdate(task),
       task.replyKey || "", task.runCycleAt || task.runAt || 0, task.userActivityAt || 0]);
   }
 
@@ -33,17 +40,25 @@
     if (task.dismissedVersion) {
       const current = displayVersion(task);
       if (task.dismissedVersion === current) return true;
-      // Candidate builds used the raw user ID in slot 7. Preserve those
-      // dismissals when only historical evidence has been hydrated.
+      // Upgrade old display tickets without reopening an already covered
+      // list watermark or changing any reply, run or user-activity identity.
       try {
         const old = JSON.parse(task.dismissedVersion);
-        return Array.isArray(old) && old.length === 7 && typeof old[6] === "string" &&
-          !task.userActivityAt && JSON.stringify([...old.slice(0, 6), 0]) === current;
+        if (!Array.isArray(old) || old.length !== 7) return false;
+        if (typeof old[6] === "string") {
+          if (task.userActivityAt) return false;
+          old[6] = 0;
+        }
+        const covered = Math.max(task.userActivityAt || 0,
+          task.replyKey ? (task.replyAt || task.replyActivityAt || 0) : 0);
+        if (old[3] <= covered && task.update <= covered) old[3] = covered;
+        return JSON.stringify(old) === current;
       } catch { return false; }
     }
     // Migrate the old checkbox's persistent marker without hiding a new run.
     return Boolean(task.checkedRevision && task.checkedRevision === revision(task) &&
-      !task.runAt && !task.awaitingReply && (!task.replyUpdate || task.update <= task.replyUpdate));
+      !task.runAt && !task.awaitingReply && (!task.replyUpdate ||
+        task.update <= Math.max(task.replyUpdate, task.replyAt || 0, task.replyActivityAt || 0)));
   }
 
   function lastActivity(task) {
@@ -191,13 +206,20 @@
     return [...rows, ...retained];
   }
 
-  function watchRows(rows, samples, tasks, now) {
+  function watchRows(rows, samples, tasks, now, opened = new Set(), hints = new Map()) {
     return reportRows(rows, tasks, now).filter((row, index) => {
       const sample = samples.get(row.id);
-      const task = tasks?.[row.id];
-      return row.retained || index < timing.watch || queueBusy(sample?.queue) === true ||
-        sample?.hotUntil > now || Boolean(task && task.agentId === (id(row.agentId) ||
-          String(globalThis.TaskPulseWeb.api.body.agentIdList[0])) && activeTask(task));
+      const known = tasks?.[row.id];
+      const task = known?.agentId === (id(row.agentId) ||
+        String(globalThis.TaskPulseWeb.api.body.agentIdList[0])) ? known : null;
+      const recent = recentActivity({ created: time(row.createTime), update: time(row.updateTime) }, now) ||
+        Boolean(task && recentActivity(task, now));
+      // The old 24-row discovery floor is retained, but it is no longer
+      // a ceiling. All recent rows and explicit browser activity enter
+      // the existing bounded scheduler; no extra list/API pagination.
+      return row.retained || index < timing.watch || recent || opened.has(row.id) ||
+        (hints.get(row.id) || 0) > now || queueBusy(sample?.queue) === true ||
+        sample?.hotUntil > now || activeTask(task);
     });
   }
 

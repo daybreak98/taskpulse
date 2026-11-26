@@ -521,8 +521,9 @@ test("a late historical message newer than an old list timestamp is quiet at fir
   assert.equal(first.task.lastAssistant, "historical");
 });
 
-test("known active and unconfirmed tasks survive the 24-row discovery window", () => {
-  const rows = Array.from({ length: 30 }, (_, i) => ({ ...row(old - i), id: String(100 + i) }));
+test("known active and unconfirmed historical tasks survive the 24-row discovery floor", () => {
+  const cold = now - 25 * 60 * 60_000;
+  const rows = Array.from({ length: 30 }, (_, i) => ({ ...row(cold - i, cold - i), id: String(100 + i) }));
   const localBusy = rows[25].id;
   const durableBusy = rows[27].id;
   const uncertain = rows[28].id;
@@ -590,7 +591,7 @@ test("collector actually polls a durable old running task after leader handoff; 
     await until(() => reports.length >= round + 1, "collector round " + round);
   }
   assert.ok(queueReads.includes(trackedId), "old running task was evicted");
-  assert.ok(!queueReads.includes(rows.at(-2).id), "cold task exceeded discovery budget");
+  assert.ok(queueReads.includes(rows.at(-2).id), "recent task outside the first 24 never got a queue sample");
   assert.ok(reports.some(report => report.lastMessages[probeId] && !report.messageErrors[probeId]));
   assert.ok(listRequests >= 2, "list refresh was not exercised");
   assert.ok(reports.at(-1).queueAt[trackedId], "old task was lost after list refresh");
@@ -991,7 +992,7 @@ test("P1 durable old active task remains pollable when absent from a bounded ser
   const retained = watched.find(item => item.id === id);
   assert.ok(retained, "missing retained task");
   assert.equal(retained.retained, true);
-  assert.equal(watched.length, 25);
+  assert.equal(watched.length, 28);
   const result = tracker.next({ ...report(now + 10_000, retained, {
     message: message(old, now + 10_000, "completion", { atMessage: now + 8_000 })
   }), conversations: [retained] });
@@ -1555,14 +1556,14 @@ test("cross-page toast routing sends no task titles to the webpage host and reva
   assert.equal((await app.send({ kind: "tp.surface.toasts", token: registered.token }, frame)).tasks.length, 0);
 });
 
-async function latencyScenario({ idle = false, many = false } = {}) {
+async function latencyScenario({ idle = false, many = false, openedId = "" } = {}) {
   let durable = rules.blank(), stamp = now, interval, queue = idle ? "IDLE" : "BUSY";
   const reports = [], requests = [], listeners = [], replies = [];
-  const rows = Array.from({ length: many ? 24 : 1 }, (_, index) => ({ ...row(old - index - 1), id: String(42 + index) }));
+  const rows = Array.from({ length: many ? 36 : 1 }, (_, index) => ({ ...row(old - index - 1), id: String(42 + index) }));
   const first = rows[0], readyAt = now + 6_000;
   const success = data => ({ ok: true, json: async () => ({ success: true, data }) });
   const chrome = {
-    storage: { local: { get: async key => ({ [key]: durable }) } },
+    storage: { local: { get: async key => ({ [key]: key === web.keys.opened ? (openedId ? [openedId] : []) : durable }) } },
     runtime: { id: "collector-clock", onMessage: { addListener: fn => listeners.push(fn) },
       sendMessage: async packet => {
         if (packet.kind === "tp.webstate") {
@@ -1614,8 +1615,15 @@ test("fast completion retries a stale assistant without waiting 30 seconds", asy
 });
 
 test("cold historical rows remain low-frequency and request bursts are bounded", async () => {
-  const result = await latencyScenario({ idle: true, many: true });
+  const result = await latencyScenario({ idle: true, many: true, openedId: "77" });
   const list = result.requests.filter(r => r.path.endsWith("/list"));
+  const queue = result.requests.filter(r => r.path.endsWith("/queue"));
+  assert.ok(queue[0].path.includes("/77/"), "opened conversation did not get priority");
+  assert.equal(new Set(queue.map(r => r.path)).size, 36, "all recent conversations must receive a queue sample");
+  assert.ok(Object.values(result.durable.tasks).every(task => task.observedAt > 0));
+  for (const at of new Set(queue.map(r => r.at))) {
+    assert.ok(queue.filter(r => r.at === at).length <= web.timing.queueBudget, "per-round queue budget exceeded");
+  }
   assert.ok(list.length <= 3, "idle list request count: " + list.length);
   const checks = result.requests.filter(r => r.path.endsWith("/queue") && r.path.includes("/42/"));
   assert.ok(checks.length <= 2, "cold queue request count: " + checks.length);
@@ -1958,4 +1966,117 @@ test("TAB display counts and rows use the same opened-tab membership", () => {
   const closed = ui.buildGroups(tabs.slice(0, 1), [{ id: 8, title: "浏览器分组", color: "blue" }], web);
   assert.deepEqual(rules.view(state, now, task => Boolean(ui.groupFor(task, "tab", closed))).counts,
     { running: 1, attention: 0, stuck: 0 });
+});
+
+
+test("dismissed reply stays hidden when the list catches up to an independently observed reply", async () => {
+  for (const dated of [true, false]) {
+    const app = worker(), firstUpdate = now + 1_000, replyAt = now + 4_000;
+    await app.deliver(report(now, row()));
+    await app.deliver(replyReport(now + 5_000, firstUpdate, "A", { atMessage: dated ? replyAt : 0 }));
+    const version = rules.displayVersion(currentTask(app));
+    assert.equal((await app.send({ kind: "tp.dismiss", id, version })).ok, true);
+    const restarted = worker({ local: app.local.data, session: app.session.data });
+    await restarted.deliver(replyReport(now + 8_000, replyAt, "A", { atMessage: dated ? replyAt : 0 }));
+    assert.equal(rules.displayVersion(currentTask(restarted)), version);
+    assert.equal(rules.view(restarted.local.data[web.keys.state], now + 8_000).tasks.length, 0);
+    assert.equal(restarted.notices.size, 0);
+    await restarted.deliver(report(now + 10_000, row(replyAt), { busy: true }));
+    assert.equal(rules.view(restarted.local.data[web.keys.state], now + 10_000).counts.running, 1);
+    assert.equal((await restarted.send({ kind: "tp.dismiss", id, version })).ok, false);
+    await restarted.deliver(replyReport(now + 14_000, replyAt, "B", { atMessage: now + 12_000 }));
+    assert.equal(rules.view(restarted.local.data[web.keys.state], now + 14_000).counts.attention, 1);
+    assert.equal(restarted.notices.size, 1);
+  }
+});
+
+test("pre-upgrade dismissal survives an equivalent delayed list watermark but not newer evidence", () => {
+  const task = {
+    id, agentId: agent, created: old, update: now + 4_000, replyKey: "message.A",
+    replyAt: now + 4_000, replyActivityAt: now + 4_000, runCycleAt: 0,
+    dismissedVersion: JSON.stringify([id, agent, old, now + 1_000, "message.A", 0, 0])
+  };
+  assert.equal(rules.isDismissed(task), true);
+  assert.equal(rules.isDismissed({ ...task, update: now + 6_000 }), false);
+  assert.equal(rules.isDismissed({ ...task, replyKey: "message.B" }), false);
+  assert.equal(rules.isDismissed({ ...task, runCycleAt: now + 5_000 }), false);
+});
+
+test("all recent rows and explicitly opened or hinted old rows enter the bounded collector", () => {
+  const recent = Array.from({ length: 60 }, (_, i) => ({ ...row(old - i), id: String(100 + i) }));
+  const cold = now - 25 * 60 * 60_000;
+  const history = Array.from({ length: 4 }, (_, i) => ({ ...row(cold - i, cold - i), id: String(200 + i) }));
+  const watched = rules.watchRows(recent.concat(history), new Map(), {}, now,
+    new Set(["200"]), new Map([["201", now + 1000], ["202", now - 1]])).map(row => row.id);
+  assert.equal(watched.length, 62);
+  assert.ok(recent.every(row => watched.includes(row.id)));
+  assert.ok(watched.includes("200"));
+  assert.ok(watched.includes("201"));
+  assert.ok(!watched.includes("202") && !watched.includes("203"));
+});
+
+test("overlapping surface authorization cannot overwrite the newest credential", async () => {
+  const app = worker();
+  app.local.data[ui.keys.enabled] = true;
+  const ordinary = { id: 9, windowId: 1, active: true, status: "complete", url: "https://example.com/work" };
+  app.tabs.push(ordinary);
+  const sender = { id: "unit", tab: ordinary, frameId: 0, url: ordinary.url };
+  const frame = { id: "unit", tab: ordinary, frameId: 4, url: "surface.html" };
+  let release, entered = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  app.chrome.permissions = { contains: async () => {
+    if (!entered) { entered = true; await gate; }
+    return true;
+  } };
+  const older = app.send({ kind: "tp.surface.register" }, sender);
+  await until(() => entered);
+  const newer = await app.send({ kind: "tp.surface.register" }, sender);
+  assert.equal(newer.ok, true);
+  release();
+  assert.equal((await older).ok, false);
+  assert.equal(app.session.data[ui.keys.surface(ordinary.id)].token, newer.token);
+  assert.equal((await app.send({ kind: "tp.surface.attach", token: newer.token }, frame)).ok, true);
+  assert.equal((await app.send({ kind: "tp.surface.register" }, { ...sender, documentLifecycle: "cached" })).ok, false);
+});
+
+test("in-flight surface storage writes serialize and a revoked credential triggers recovery", async () => {
+  const app = worker();
+  app.local.data[ui.keys.enabled] = true;
+  const ordinary = { id: 9, windowId: 1, active: true, status: "complete", url: "https://example.com/work" };
+  app.tabs[0].active = false;
+  app.tabs.push(ordinary);
+  let authorizations = 0;
+  app.chrome.permissions = { contains: async () => { authorizations++; return true; } };
+  const sender = { id: "unit", tab: ordinary, frameId: 0, url: ordinary.url };
+  const frame = { id: "unit", tab: ordinary, frameId: 4, url: "surface.html" };
+  const key = ui.keys.surface(ordinary.id);
+  const save = app.session.set;
+  let release, entered = false, firstToken;
+  const gate = new Promise(resolve => { release = resolve; });
+  app.session.set = async values => {
+    if (values[key] && !entered) { entered = true; firstToken = values[key].token; await gate; }
+    await save(values);
+  };
+  const first = app.send({ kind: "tp.surface.register" }, sender);
+  await until(() => entered);
+  const second = app.send({ kind: "tp.surface.register" }, sender);
+  await until(() => authorizations >= 2);
+  release();
+  assert.equal((await first).ok, false);
+  const current = await second;
+  assert.equal(current.ok, true);
+  assert.equal(app.session.data[key].token, current.token);
+  const rejected = await app.send({ kind: "tp.dismiss", id, version: "old", token: firstToken }, frame);
+  assert.equal(rejected.surfaceInvalid, true);
+  assert.equal((await app.send({ kind: "tp.surface.attach", token: current.token }, frame)).ok, true);
+  const messages = [];
+  app.chrome.tabs.sendMessage = async (tabId, packet) => {
+    if (tabId !== ordinary.id) return null;
+    messages.push(packet);
+    if (packet.kind === "tp.surface-probe") return { ok: true, installed: true, token: firstToken };
+    return { ok: true };
+  };
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: ordinary.id, windowId: ordinary.windowId });
+  await until(() => messages.some(packet => packet.kind === "tp.surface-repair"));
+  assert.equal(messages.find(packet => packet.kind === "tp.surface-repair").token, firstToken);
 });

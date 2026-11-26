@@ -712,7 +712,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     else if (msg.kind === "tp.surface.toasts") reply = surfaces.toastData(sender, msg.token);
     else if (["tp.open", "tp.check", "tp.dismiss", "tp.settings"].includes(msg.kind)) {
       reply = surfaces.validate(sender, msg.token).then(allowed => {
-        if (!allowed) return { ok: false };
+        if (!allowed) return { ok: false, surfaceInvalid: true };
         if (msg.kind === "tp.open") return openTask(msg.id, msg.revision, false, msg.intent);
         if (msg.kind === "tp.check") return serialize(() => markChecked(msg.id, msg.revision, msg.checked));
         if (msg.kind === "tp.dismiss") return serialize(() => dismissTask(msg.id, msg.version));

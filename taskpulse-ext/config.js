@@ -58,6 +58,6 @@
       budgetWindow: 2_000, requestBurst: 12, round: 10_000, request: 4_000,
       queueStale: 120_000, sourceStale: 180_000
     },
-    keys: { state: "tp-web-state-v1", leader: "tp-web-leader-v1" }
+    keys: { state: "tp-web-state-v1", leader: "tp-web-leader-v1", opened: "tp-web-opened-conversations-v1" }
   };
 })();
