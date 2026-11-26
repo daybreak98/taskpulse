@@ -298,6 +298,25 @@ function canResumeNoticeRead(state, task, guard) {
     canAutoRead(state, task, true));
 }
 
+async function rebindDeferredRead(tabId, guard, state, at = Date.now()) {
+  const task = state.tasks[guard?.cid];
+  if (!task || state.authBlocked || rules.authError(state.error) ||
+      !rules.taskAccessible(state, task) || !task.pending) {
+    await forgetJump(tabId, false, guard?.token);
+    return null;
+  }
+  if (rules.revision(task) === guard.revision) return guard;
+  // A prior visit cannot cross an intervening run or be inherited by an
+  // unverified future reply. Keep the barrier until a completed reply exists.
+  if (task.runAt || task.awaitingReply || task.status === "running" || !rules.verifiedReply(task))
+    return guard;
+  // This is a genuinely newer pending reply. A fresh user interaction or
+  // tab activation may rebind the visit to this exact version.
+  const next = { ...guard, revision: rules.revision(task), visited: true, visitedAt: at };
+  await rememberJump(tabId, next);
+  return next;
+}
+
 async function readForeground(state, tabId, windowId, manual = false) {
   await jumpReady;
   const tab = await foregroundPage();
@@ -385,8 +404,14 @@ async function persistForegroundRead(state) {
     if (!guard?.deferredRead || !guard.visited) continue;
     const task = state.tasks[guard.cid];
     if (!task || state.authBlocked || rules.authError(state.error) ||
-        !rules.taskAccessible(state, task) || rules.revision(task) !== guard.revision ||
-        !task.pending || task.readRevision === guard.revision) {
+        !rules.taskAccessible(state, task) || !task.pending) {
+      release.push([tabId, guard.token]);
+      continue;
+    }
+    // A superseded visit is a barrier, not permission to read the successor.
+    // Retain it until the user visits the newer reply or reactivates the tab.
+    if (rules.revision(task) !== guard.revision) continue;
+    if (task.readRevision === guard.revision) {
       release.push([tabId, guard.token]);
       continue;
     }
@@ -720,13 +745,10 @@ async function userVisit(id, sender, visitAt) {
   if (tab?.id !== sender.tab.id || !matchesConversation(tab, id) || opening.has(id) ||
       jumpTabs.get(tab.id) !== guard) return { ok: false };
   if (guard.deferredRead) {
-    const state = await getState(), task = state.tasks[id];
-    if (state.authBlocked || rules.authError(state.error) || !rules.taskAccessible(state, task) ||
-        rules.revision(task) !== guard.revision) {
-      await forgetJump(tab.id, false, guard.token);
-      return { ok: false };
-    }
-    await rememberJump(tab.id, { ...guard, visited: true, visitedAt: visitAt });
+    const state = await getState();
+    const current = await rebindDeferredRead(tab.id, guard, state, visitAt);
+    if (!current) return { ok: false };
+    await rememberJump(tab.id, { ...current, visited: true, visitedAt: visitAt });
     const read = await markVisited(tab.id, tab.windowId);
     if (read) await forgetJump(tab.id, false, guard.token);
     return { ok: true, deferred: !read };
@@ -875,6 +897,10 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   surfaces.activate(tabId);
   void (async () => {
     await jumpReady;
+    const activeGuard = jumpTabs.get(tabId);
+    if (activeGuard?.deferredRead) {
+      await rebindDeferredRead(tabId, activeGuard, await getState(), Date.now());
+    }
     // A genuine switch away releases the previous tab's versioned protection.
     for (const id of [...jumpTabs.keys()]) {
       if (id === tabId) continue;
@@ -897,6 +923,11 @@ chrome.windows.onFocusChanged.addListener(windowId => {
       // reported window still matches the real foreground before releasing.
       const eventStillCurrent = win && (windowId >= 0 ? win.focused && win.id === windowId : !win.focused);
       if (eventStillCurrent) {
+        const active = await foregroundTab();
+        const activeGuard = active && jumpTabs.get(active.id);
+        if (activeGuard?.deferredRead) {
+          await rebindDeferredRead(active.id, activeGuard, await getState(), Date.now());
+        }
         for (const id of [...jumpTabs.keys()]) {
           const tab = await chrome.tabs.get(id).catch(() => null);
           const guard = jumpTabs.get(id);

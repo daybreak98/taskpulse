@@ -2333,9 +2333,16 @@ test("P1 visited red reply intent cannot clear a later reply or an active run", 
       assert.equal(currentTask(app).replyKey, "message.B");
       assert.notEqual(exactRevision(app), revision);
       assert.equal(currentTask(app).readRevision, undefined);
-      assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"], undefined,
-        "the stale A intent must be discarded, not applied to B");
+      assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"]?.revision, revision,
+        "the stale A intent must remain a barrier, not be applied to B");
       assert.ok([...app.notices.keys()].some(key => key.endsWith("message.B")));
+      app.tabs.forEach(tab => { tab.active = tab.id === 9; });
+      app.chrome.tabs.onActivated.listeners[0]({ tabId: 9, windowId: 1 });
+      await new Promise(resolve => setTimeout(resolve, 15));
+      assert.equal(currentTask(app).pending, false,
+        "reactivating the page after B arrives is a fresh visit to B");
+      assert.equal(currentTask(app).readRevision, exactRevision(app));
+      assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"], undefined);
     }
   }
 });
@@ -2383,8 +2390,8 @@ test("P1 a visited red reply cannot auto-read a later foreground reply", async (
     assert.notEqual(currentTask(app).readRevision, nextRevision);
     assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"]?.revision, oldRevision,
       "the superseded visit remains a read barrier until a fresh visit to B");
-    assert.ok(Object.keys(app.local.data[web.keys.state].outbox)
-      .some(key => key.endsWith("message.B")), "B must retain its own pending notice");
+    assert.ok([...app.notices.keys()].some(key => key.endsWith("message.B")),
+      "B must retain its own pending notice");
 
     const secondVisit = await app.send({ kind: "tp.visit", id, at: now + 21_000 }, sender);
     assert.equal(secondVisit.ok, true);
