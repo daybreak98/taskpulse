@@ -261,7 +261,7 @@ async function listen() {
           if (cmd.id) {
             try {
               await fetch(ACK_ENDPOINT + "?id=" + encodeURIComponent(cmd.id)
-                          + "&result=closed&n=" + n,
+                          + "&result=closed&n=" + n + "&collector=" + encodeURIComponent(collector),
                 { method: "POST", headers: authHeaders() });
             } catch (_) {}
           }

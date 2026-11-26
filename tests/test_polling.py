@@ -1,6 +1,8 @@
 import json
 import os
 import tempfile
+import shutil
+import subprocess
 import threading
 import time
 import unittest
@@ -561,6 +563,13 @@ class PollingTests(unittest.TestCase):
         task = poller.load_state()["tasks"]["1"]
         self.assertTrue(task.get("deadline"), "用户设的截止时间被采样落盘覆盖了")
         self.assertGreater(task["deadline"], self.stamp)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required for desktop bridge runtime regression")
+    def test_desktop_bridge_runtime_regression(self):
+        script = Path(__file__).with_name("test_desktop_bridge.cjs")
+        result = subprocess.run(["node", "--test", str(script)], capture_output=True,
+                                text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_notice_events_are_persisted_and_source_scoped(self):
         task = {"id": 1, "name": "A", "agent_id": "agent", "status": "running",

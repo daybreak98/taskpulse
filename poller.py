@@ -1608,10 +1608,12 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False,
                 continue
             # 同一份队列样本只落一次：web 模式下页面没刷新时上报的还是旧值，
             # 重复提交会把「上次成功观测」一路往后推，等于给旧数据续期
-            if (sample.from_source and task.get("queue_checked_at")
-                    and sample.at <= task["queue_checked_at"]
-                    and not (sample.messages is not None and sample.message_at > (task.get("message_checked_at") or 0))):
-                continue
+            if sample.from_source and task.get("queue_checked_at"):
+                if sample.at < task["queue_checked_at"]:
+                    continue
+                if (sample.at == task["queue_checked_at"] and
+                        not (sample.messages is not None and sample.message_at > (task.get("message_checked_at") or 0))):
+                    continue
             # An idle sample from before the list's new version is not evidence that it finished.
             if sample.from_source and sample.busy is False and sample.at < update:
                 continue
