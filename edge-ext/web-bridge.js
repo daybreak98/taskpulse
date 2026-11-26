@@ -170,19 +170,20 @@
     if (lastMessages[cid]?.updateTime !== updateTime) delete lastMessages[cid];
     try {
       const path = (CFG.api.messages || "/conversations/{cid}/messages?pageNo=1&pageSize=1")
-        .replace("{cid}", cid);
+        .replace("{cid}", cid).replace(/([?&]pageSize=)\d+/, (_, prefix) => prefix + "20");
       const data = await jfetch(CFG.api.prefix + path, {}, lease);
-      const list = ((data && data.data) || {}).list || [];
-      const m = list[0];
-      if (!m) return;
-      // 关键词匹配就在页面里做完，只把布尔传回本机：消息原文不出浏览器
+      const list = data.data.list;
+      if (!Array.isArray(list)) throw new Error("消息列表结构无效");
       const marks = CFG.api.marks || [];
-      const content = typeof m.content === "string" ? m.content : "";
-      const failed = m.sender === "assistant" && content !== ""
-        && marks.some((k) => content.indexOf(k) >= 0);
-      if (typeof m.sender !== "string") return;
-      lastMessages[cid] = { sender: m.sender, failed, updateTime, sampledAt: now() };
-      lastMsgAt[cid].nextAt = now() + (m.sender === "assistant" ? 30000 : 10000);
+      const messages = list.filter(m => m && (m.sender === "assistant" || m.sender === "user")).map(m => ({
+        sender: m.sender,
+        id: m.messageId ?? m.id,
+        createTime: m.createTime ?? m.createdAt,
+        failed: m.sender === "assistant" && typeof m.content === "string" &&
+          marks.some(k => m.content.includes(k))
+      }));
+      lastMessages[cid] = { messages, updateTime, sampledAt: now() };
+      lastMsgAt[cid].nextAt = now() + (messages[0]?.sender === "assistant" ? 30000 : 10000);
     } catch (_) {}
   }
 
@@ -231,7 +232,7 @@
       if (!lastListAt || now() - lastListAt > 30000) await pullList(lease);
       if (!owns(lease)) return;
 
-      const watch = convs.filter((c, index) => index < 24 || isBusy(String(c.id)) === true);
+      const watch = convs.filter((c, index) => index < 24 || isBusy(String(c.id)) === true || (hotUntil[String(c.id)] || 0) > now());
       const due = [];
       for (const c of watch) {
         const cid = String(c.id);
@@ -253,8 +254,14 @@
       for (const c of due.slice(0, 6)) {
         if (!owns(lease) || now() >= deadline) break;
         const cid = String(c.id);
-        if (await pullQueue(cid, lease) && owns(lease) && isBusy(cid) === false && c.updateTime && now() < deadline) {
-          await pullLastMessage(cid, c.updateTime, lease);
+        const wasBusy = isBusy(cid) === true;
+        if (await pullQueue(cid, lease) && owns(lease)) {
+          const stillBusy = isBusy(cid) === true;
+          if (wasBusy || stillBusy) hotUntil[cid] = now() + 120000;
+          if (wasBusy && !stillBusy) delete lastMsgAt[cid];
+          if ((!stillBusy || !lastMessages[cid]) && c.updateTime && now() < deadline) {
+            await pullLastMessage(cid, c.updateTime, lease);
+          }
         }
       }
       report(lease);

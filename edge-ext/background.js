@@ -337,6 +337,46 @@ function scheduleNudge() {
   }, NUDGE_MS);
 }
 
+// 只在上报「切到」这个标签时记已读。
+// 曾经这里还会补记「被切走的那个标签」，但它会把用户没看的会话误标已读：
+// 从 TaskPulse 点任务跳转时，扩展切走的上一个标签会被当成「看过了」，
+// 于是另一个待处理任务的计数凭空消失。切到某标签的那次上报已经覆盖了
+// 「看了再切走」的场景（进入即已读），补记是冗余且有害的。
+chrome.tabs.onActivated.addListener((info) => {
+  notifyActive(info.tabId);
+  push();
+});
+
+// 窗口失焦/回焦时同步「是否正在看」，避免在别的 App 里时把回复误判为已读
+chrome.windows.onFocusChanged.addListener(() => push());
+
+for (const ev of [
+  chrome.tabs.onUpdated,
+  chrome.tabs.onCreated,
+  chrome.tabs.onRemoved,
+  chrome.tabs.onMoved,
+  chrome.tabs.onAttached,
+  chrome.tabs.onDetached,
+  chrome.tabGroups.onUpdated,
+  chrome.tabGroups.onCreated,
+  chrome.tabGroups.onRemoved
+]) {
+  if (ev && ev.addListener) ev.addListener(() => push());
+}
+
+// 采集页只在「这一页不能干活了」时换人：关掉、被浏览器丢弃、页面刚加载完。
+// 用户切标签不算——粘性换主会让每切一次都重新拉一遍会话列表。
+chrome.tabs.onRemoved.addListener(() => ensureLeader());
+chrome.tabs.onCreated.addListener(() => ensureLeader());
+chrome.tabs.onUpdated.addListener((_tabId, info) => {
+  if (!info) return;
+  if (info.discarded !== undefined || info.frozen !== undefined || info.status === "complete" || info.url) ensureLeader();
+});
+
+chrome.alarms.create("tp-sync", { periodInMinutes: 0.5 });
+push();
+listen();
+
 // ── 数据来源二：在开着的 DataAgent 页面里用 cookie 取数 ──────────────
 // 由 config.js 的 scope 决定注入哪些页面，manifest 里不写死域名。
 const API_CFG = CFG.api || null;

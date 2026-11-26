@@ -771,6 +771,56 @@ class PollingTests(unittest.TestCase):
         self.assertEqual(task["queue_checked_at"], NOW - 10000)
         self.assertEqual(task["queue_observed_at"], NOW - 10000)
 
+    def test_evidence_preserves_unread_during_next_run_and_deduplicates_two_replies(self):
+        task = {"id": 1, "name": "task", "update_ms": NOW, "reply_floor": NOW,
+                "created_ms": NOW - 100000, "status": "seen"}
+        def sample(at, busy, messages=None):
+            batch = None if messages is None else poller.normalise_messages(messages)
+            poller.apply_queue_sample(task, poller.QueueSample(at, busy, "RUNNING" if busy else "IDLE",
+                evidence_required=True, messages=batch, message_at=at if batch is not None else 0), {}, [])
+        def msg(mid, at, sender="assistant"):
+            return {"id": mid, "createTime": at, "sender": sender, "content": "ok"}
+        sample(NOW, False, [msg("old", NOW - 1000)])
+        self.assertFalse(task["reply_pending"])
+        sample(NOW + 1000, True)
+        first_run = task["run_version"]
+        sample(NOW + 2000, False, [msg("a", NOW + 1900), msg("old", NOW - 1000)])
+        first = task["reply_version"]
+        self.assertEqual(len(task["pending_replies"]), 1)
+        sample(NOW + 3000, True)
+        self.assertNotEqual(task["run_version"], first_run)
+        self.assertTrue(task["reply_pending"])
+        self.assertEqual(task["pending_replies"][0]["version"], first)
+        sample(NOW + 4000, False, None)   # message fetch failed
+        self.assertTrue(task["awaiting_reply"])
+        self.assertTrue(task["reply_pending"])
+        sample(NOW + 5000, False, [msg("c", NOW + 4800), msg("b", NOW + 3900), msg("a", NOW + 1900)])
+        self.assertEqual(len(task["pending_replies"]), 3)
+        self.assertNotEqual(task["reply_version"], first)
+        sample(NOW + 6000, False, [msg("c", NOW + 4800), msg("b", NOW + 3900), msg("a", NOW + 1900)])
+        self.assertEqual(len(task["pending_replies"]), 3)
+
+    def test_user_only_and_message_failure_do_not_confirm_idle_run(self):
+        task = {"id": 1, "name": "task", "update_ms": NOW, "reply_floor": NOW, "status": "seen"}
+        def apply(at, busy, batch):
+            poller.apply_queue_sample(task, poller.QueueSample(at, busy, "IDLE",
+                evidence_required=True, messages=batch, message_at=at if batch is not None else 0), {}, [])
+        apply(NOW, False, [])
+        apply(NOW + 1000, True, None)
+        apply(NOW + 2000, False, None)
+        self.assertTrue(task["awaiting_reply"])
+        self.assertFalse(task["reply_pending"])
+        apply(NOW + 100000, False, poller.normalise_messages([
+            {"id": "user", "sender": "user", "createTime": NOW + 1000}]))
+        self.assertTrue(task["awaiting_reply"])
+        self.assertFalse(task["reply_pending"])
+        self.assertNotEqual(task["status"], "seen")
+        apply(NOW + 110000, False, poller.normalise_messages([
+            {"id": "reply", "sender": "assistant", "createTime": NOW + 109000},
+            {"id": "user", "sender": "user", "createTime": NOW + 1000}]))
+        self.assertTrue(task["reply_pending"])
+        self.assertFalse(task["awaiting_reply"])
+
     def test_new_run_resets_old_failure_and_settle_state(self):
         task = {"id": 1, "name": "test", "status": "stuck", "failed": True,
                 "update_ms": NOW, "running_since": 0, "settle_until": NOW + 1000}

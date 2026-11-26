@@ -609,6 +609,40 @@ def conv_url(agent_id, cid) -> str:
 
 # ── 取数 ────────────────────────────────────────────────────────────
 
+REPLY_PAGE_SIZE = 20
+MESSAGE_HISTORY_LIMIT = 512
+
+
+def normalise_messages(rows: list) -> list[dict]:
+    out, seen = [], set()
+    for row in rows:
+        if not isinstance(row, dict) or row.get("sender") not in ("assistant", "user"):
+            continue
+        raw_id = row.get("messageId")
+        if raw_id is None:
+            raw_id = row.get("id")
+        try:
+            stamp = int(row.get("createTime") or row.get("createdAt") or row.get("atMessage") or 0)
+            if 0 < stamp < 10**12:
+                stamp *= 1000
+        except (TypeError, ValueError, OverflowError):
+            stamp = 0
+        if isinstance(raw_id, (str, int)) and not isinstance(raw_id, bool) and str(raw_id):
+            version = "msg:" + hashlib.sha256(str(raw_id).encode()).hexdigest()[:32]
+        elif stamp > 0:
+            version = "time:" + row["sender"] + ":" + str(stamp)
+        else:
+            continue
+        if version in seen:
+            continue
+        seen.add(version)
+        content = row.get("content")
+        failed = (row["sender"] == "assistant" and
+                  (row.get("failed") is True or isinstance(content, str) and any(mark in content for mark in FAIL_MARKS)))
+        out.append({"version": version, "sender": row["sender"], "at": stamp, "failed": bool(failed)})
+    return out
+
+
 class AgentClient:
     def __init__(self) -> None:
         self.session = make_session()
@@ -687,6 +721,19 @@ class AgentClient:
         data = self._request_data("GET", self.ep_messages.format(cid=cid), timeout)
         messages = data.get(self.list_key)
         return messages[0] if isinstance(messages, list) and messages and isinstance(messages[0], dict) else {}
+
+    def recent_messages(self, cid: int, timeout: float) -> tuple[list[dict], int]:
+        path = re.sub(r"([?&]pageSize=)\d+", lambda m: m[1] + str(REPLY_PAGE_SIZE),
+                      self.ep_messages.format(cid=cid))
+        data = self._request_data("GET", path, timeout)
+        rows = data.get(self.list_key)
+        if not isinstance(rows, list):
+            raise ValueError("消息列表结构无效")
+        messages = normalise_messages(rows)
+        if any(isinstance(row, dict) and row.get("sender") == "assistant" for row in rows) and not any(
+                row["sender"] == "assistant" for row in messages):
+            raise ValueError("回复缺少稳定身份")
+        return messages, now_ms()
 
 
 class NoSample(Exception):
@@ -795,6 +842,20 @@ class WebProvider:
         row = next((c for c in snap.get("conversations", []) if str(c.get("id")) == str(cid)), None)
         return msg if row and int(row.get("updateTime") or 0) == int(msg["updateTime"]) else {}
 
+    def recent_messages(self, cid: int, timeout: float) -> tuple[list[dict], int]:
+        packet = (self._snap().get("lastMessages") or {}).get(str(cid))
+        if not isinstance(packet, dict) or not isinstance(packet.get("messages"), list):
+            raise NoSample(str(cid))
+        at = int(packet.get("sampledAt") or 0)
+        if not at or at > int(self._snap().get("at") or 0):
+            raise NoSample(str(cid))
+        rows = packet["messages"]
+        messages = normalise_messages(rows)
+        if any(isinstance(row, dict) and row.get("sender") == "assistant" for row in rows) and not any(
+                row["sender"] == "assistant" for row in messages):
+            raise NoSample(str(cid))
+        return messages, at
+
 
 def make_agent():
     """按当前数据来源建取数对象。web 模式完全不碰 auth 配置。"""
@@ -815,6 +876,9 @@ class QueueSample(NamedTuple):
     # at 是否来自数据源自己的取到时刻（web 模式的 queueAt）。是的话，同一份
     # 缓存重复上报时 at 不变，可以据此判重；api 模式 at 是本轮时刻，无需判重
     from_source: bool = False
+    evidence_required: bool = False
+    messages: list[dict] | None = None
+    message_at: int = 0
 
 
 def running(task: dict) -> bool:
@@ -831,7 +895,10 @@ def fast_candidates(tasks: dict, stamp: int) -> list[dict]:
         # 用户标了「完成后提醒我」的会话即使没在跑也要盯：否则它一旦掉出
         # 监控窗口，下一次回话根本取不到，高亮和弹窗都不会发生
         important = bool(task.get("important")) and task.get("status") != "done"
-        if not running(task) and not important:
+        followup = bool(task.get("awaiting_reply") or task.get("pending_replies"))
+        if not running(task) and not important and not followup:
+            continue
+        if followup and not running(task) and stamp - (task.get("queue_checked_at") or 0) < ACTIVE_POLL_SECONDS * 1000:
             continue
         checked = task.get("queue_checked_at") or 0
         # 已经判定卡住的，没必要每 5 秒再看一次；按 stuck_interval_seconds 放慢。
@@ -968,6 +1035,40 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
             log(f"queue {cid} failed: {exc}")
             samples[cid] = QueueSample(now_ms(), None, error=True)
 
+    modern = getattr(agent, "recent_messages", None)
+    if callable(modern):
+        for conv in convs:
+            cid = str(conv["id"])
+            sample = samples.get(cid)
+            if sample is None or sample.busy is None:
+                continue
+            task = tasks.get(cid, {})
+            samples[cid] = sample._replace(evidence_required=True)
+            last = task.get("message_checked_at") or 0
+            need = (isinstance(agent, WebProvider) or not task.get("message_seeded")
+                    or not sample.busy and (task.get("running_since") or task.get("awaiting_reply")
+                        or conv["updateTime"] > (task.get("message_observed_update") or 0)
+                        or task.get("reply_pending") and sample.at - last >= REPROBE_GAP_SECONDS * 1000)
+                    or sample.busy and bool(FAIL_MARKS) and
+                       sample.at - (task.get("running_since") or sample.at) >= RATE_LIMIT_PROBE_SECONDS * 1000
+                       and sample.at - last >= RATE_LIMIT_PROBE_GAP_SECONDS * 1000)
+            if not need:
+                continue
+            timeout = request_timeout(deadline)
+            if timeout < 0.25:
+                continue
+            try:
+                messages, message_at = modern(conv["id"], timeout)
+                samples[cid] = samples[cid]._replace(messages=messages, message_at=message_at)
+            except NoSample:
+                pass
+            except Exception as exc:
+                if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code in (401, 403, 429):
+                    raise
+                log(f"recent_messages {cid} failed: {exc}")
+        return samples
+
+    # Compatibility for adapters which implement only the old queue/last_message interface.
     if not FAIL_MARKS:
         return samples
     for conv in convs:
@@ -1025,8 +1126,140 @@ def sample_queues(agent: AgentClient, convs: list[dict], tasks: dict,
     return samples
 
 
+def consume_message_batch(task: dict, messages: list[dict], at: int, *, busy: bool) -> tuple[int, bool]:
+    """Input is newest-first. Only observed assistant identities create unread replies."""
+    known = list(task.get("message_seen") or [])
+    known_set = set(known)
+    pending = task.setdefault("pending_replies", [])
+    seeded = bool(task.get("message_seeded"))
+    floor = int(task.get("reply_floor") or 0)
+    highwater = int(task.get("message_highwater") or floor)
+    first_known = next((i for i, row in enumerate(messages) if row["version"] in known_set), None)
+    if not seeded:
+        new_conversation = bool(task.get("created_ms") and task["created_ms"] >= floor)
+        candidates = [row for row in messages if new_conversation or row["at"] > floor]
+        # A running first observation seeds only earlier evidence; do not consume a streaming reply.
+        historical = [row for row in messages if row not in candidates]
+    elif first_known is not None:
+        candidates, historical = messages[:first_known], messages[first_known:]
+    elif not known:
+        candidates, historical = messages, []
+    else:
+        candidates = [row for row in messages if row["at"] > highwater]
+        historical = [row for row in messages if row not in candidates]
+        if messages and not candidates and any(not row["at"] for row in messages):
+            task["message_gap"] = True
+            return 0, False
+    if busy:
+        # Keep the anchor intact until an idle snapshot confirms completion.
+        if not seeded:
+            task["message_seen"] = [row["version"] for row in historical][:MESSAGE_HISTORY_LIMIT]
+            task["message_highwater"] = max([floor] + [row["at"] for row in historical])
+            task["message_seeded"] = True
+        return 0, True
+
+    by_version = {row["version"]: row for row in messages}
+    for reply in pending:
+        observed = by_version.get(reply["version"])
+        if observed and observed["failed"]:
+            reply["failed"] = True
+    new_count = 0
+    for row in reversed(candidates):
+        if row["sender"] != "assistant" or row["version"] in known_set or any(
+                reply["version"] == row["version"] for reply in pending):
+            continue
+        pending.append({"version": row["version"], "failed": row["failed"],
+                        "message_at": row["at"], "observed_at": at})
+        task["reply_version"] = row["version"]
+        task["reply_completed_at"] = at
+        new_count += 1
+    task["message_seen"] = list(dict.fromkeys([row["version"] for row in messages] + known))[:MESSAGE_HISTORY_LIMIT]
+    task["message_highwater"] = max([highwater] + [row["at"] for row in messages])
+    task["message_seeded"] = True
+    task.pop("message_gap", None)
+    return new_count, True
+
+
+def apply_evidence_sample(task: dict, sample: QueueSample, act: dict,
+                          notifications: list[tuple[str, str, str]]) -> None:
+    previous = task.get("queue_observed_at") or 0
+    task["queue_checked_at"] = max(task.get("queue_checked_at") or 0, sample.at)
+    task["queue_observed_at"] = max(previous, sample.at)
+    task["queue_error"] = False
+    task["raw_state"] = sample.raw
+    pending = task.setdefault("pending_replies", [])
+    task["reply_pending"] = bool(pending)
+    started = task.get("running_since") or 0
+    new_batch = (sample.messages is not None and sample.message_at > (task.get("message_checked_at") or 0))
+    if sample.busy:
+        if not started or previous and sample.at - previous > RUN_GAP_RESET_SECONDS * 1000:
+            started = sample.at
+            task["running_since"] = started
+            task["run_seq"] = int(task.get("run_seq") or 0) + 1
+            task["run_version"] = f"run:{task['run_seq']}:{started}"
+            task["countdown_since"] = started
+            task["failed"] = False
+            task["stuck_notified"] = 0
+        task["awaiting_reply"] = False
+        task.pop("settle_until", None)
+        if new_batch:
+            consume_message_batch(task, sample.messages, sample.message_at, busy=True)
+            task["message_checked_at"] = sample.message_at
+            # Only a failed assistant with identity and a time in the observed run is classified.
+            if any(row["sender"] == "assistant" and row["failed"] and row["at"] >= started
+                   and row["version"] not in set(task.get("message_seen") or []) for row in sample.messages):
+                task["failed"] = True
+        elapsed = max(0, (sample.at - started) // 1000)
+        task["status"] = "stuck" if task.get("failed") or elapsed >= DEFAULT_STUCK_SECONDS else "running"
+        if task["status"] == "stuck" and task.get("stuck_notified") != task["run_version"]:
+            task["stuck_notified"] = task["run_version"]
+            title = "疑似被限流" if task.get("failed") else "任务疑似卡住"
+            notifications.append((title, f"{task['name']} 已运行 {max(1, elapsed // 60)} 分钟，去看看", str(task["id"])))
+        return
+
+    # An idle queue is not proof of a reply. Keep retrying while its message evidence is absent.
+    expected = bool(started or task.get("awaiting_reply")
+                    or task.get("update_ms", 0) > (task.get("message_observed_update") or task.get("reply_floor") or 0))
+    task["running_since"] = 0
+    task.pop("settle_until", None)
+    new_count, valid = 0, False
+    if new_batch:
+        new_count, valid = consume_message_batch(task, sample.messages, sample.message_at, busy=False)
+        task["message_checked_at"] = sample.message_at
+        if valid:
+            task["message_observed_update"] = task.get("update_ms") or 0
+    # A fresh idle sample without a new assistant does not erase the prior unread or the expected reply.
+    task["awaiting_reply"] = expected and not new_count
+    if new_count:
+        task["awaiting_reply"] = False
+    if not task.get("message_seeded") and not valid:
+        task["awaiting_reply"] = True
+    task["reply_pending"] = bool(pending)
+    if pending:
+        latest = pending[-1]
+        task["reply_version"] = latest["version"]
+        task["failed"] = bool(latest["failed"])
+        task["countdown_since"] = latest["observed_at"]
+        elapsed = max(0, (sample.at - latest["observed_at"]) // 1000)
+        task["status"] = "stuck" if task["failed"] or elapsed >= DEFAULT_STUCK_SECONDS else "attention"
+        if task["status"] == "stuck" and not task["failed"] and task.get("stuck_notified") != latest["version"]:
+            task["stuck_notified"] = latest["version"]
+            notifications.append(("任务疑似卡住", f"{task['name']} 等你处理已超过 {max(1, elapsed // 60)} 分钟", str(task["id"])))
+    elif task["awaiting_reply"]:
+        task["status"] = "running"   # view marks this phase unconfirmed, not an actual busy queue
+        task["failed"] = False
+        task["countdown_since"] = 0
+    else:
+        task["status"] = "seen"
+        task["failed"] = False
+        task["countdown_since"] = 0
+
+
 def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
                        notifications: list[tuple[str, str, str]]) -> None:
+    if sample.evidence_required and sample.busy is not None:
+        apply_evidence_sample(task, sample, act, notifications)
+        return
     # 先把「上一次真正观测到状态」的时刻抓出来：下面几行会把它覆盖成本次，
     # 事后再读就永远读到新值，间隔判断会退化成死代码
     previous = task.get("queue_observed_at") or 0
@@ -1072,7 +1305,7 @@ def apply_queue_sample(task: dict, sample: QueueSample, act: dict,
         # 抹成 False，状态从卡住退回运行中
         if checked and sample.failed is not None:
             task["failed"] = sample.failed
-        task["reply_pending"] = False
+        task["reply_pending"] = bool(task.get("reply_pending"))
         elapsed = (sample.at - started) // 1000
         # 卡住判定看的是「这一阶段」的倒计时：运行中从起跑算，转入待回复后重新起算
         phase = task.get("countdown_since") or started
@@ -1247,6 +1480,8 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False,
                 else:
                     task = tasks[cid] = {"status": "seen", "prev": "running", "acked_update": min(update, baseline)}
             task.setdefault("queue_observed_at", task.get("seen_ms") or 0)
+            task.setdefault("reply_floor", baseline)
+            task["created_ms"] = created
             task.update(id=conv["id"], name=clean_name(conv.get("name")) or f"会话 {cid}",
                         agent_id=agent_id,
                         update_ms=update, seen_ms=stamp,
@@ -1290,7 +1525,8 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False,
             # 同一份队列样本只落一次：web 模式下页面没刷新时上报的还是旧值，
             # 重复提交会把「上次成功观测」一路往后推，等于给旧数据续期
             if (sample.from_source and task.get("queue_checked_at")
-                    and sample.at <= task["queue_checked_at"]):
+                    and sample.at <= task["queue_checked_at"]
+                    and not (sample.messages is not None and sample.message_at > (task.get("message_checked_at") or 0))):
                 continue
             # An idle sample from before the list's new version is not evidence that it finished.
             if sample.from_source and sample.busy is False and sample.at < update:
@@ -1450,7 +1686,8 @@ def view(state: dict) -> dict:
         # 落选监控窗口后拿不到样本是正常的，不能一直挂着「待确认」。
         tracked = task.get("status") in ("running", "attention", "stuck")
         stale = task.get("status") != "done" and (
-            not observed
+            bool(task.get("awaiting_reply") and not task.get("reply_pending") and not task.get("running_since"))
+            or not observed
             or (tracked and (bool(task.get("queue_error"))
                              or stamp - observed > stale_after_seconds * 1000)))
         started = task.get("running_since") or 0
@@ -1466,6 +1703,9 @@ def view(state: dict) -> dict:
             "prev": task.get("prev"),
             "reply_version": task.get("reply_version"),
             "reply_pending": task.get("reply_pending"),
+            "pending_replies": task.get("pending_replies"),
+            "run_version": task.get("run_version"),
+            "awaiting_reply": bool(task.get("awaiting_reply")),
             "stale": stale,
             "covered": covered,
             "progress": round(progress, 3),
@@ -2766,7 +3006,7 @@ def _poll_forever() -> None:
                     next_discovery = started + DISCOVERY_POLL_SECONDS
             next_fast = float("inf")
             if ACTIVE_POLL_SECONDS and ACTIVE_WATCH_LIMIT and any(
-                    running(task) or task.get("important")
+                    running(task) or task.get("important") or task.get("awaiting_reply") or task.get("pending_replies")
                     for task in (state.get("tasks") or {}).values()):
                 # 标了「完成后提醒我」的空闲会话也要走快循环，
                 # 否则 fast_candidates 根本没机会被调用
