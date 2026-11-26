@@ -300,5 +300,13 @@
     if (before === roleChange) acceptRole(r);
     sync();
     document.addEventListener("visibilitychange", () => { if (!document.hidden && timer) tick(); });
+    let lastVisit = 0;
+    const userVisit = event => {
+      if (!event.isTrusted || document.hidden || !document.hasFocus() || now() - lastVisit < 1000) return;
+      lastVisit = now();
+      try { chrome.runtime.sendMessage({ kind: "tp-user-visit", at: lastVisit }, () => void 0); } catch (_) {}
+    };
+    document.addEventListener("pointerdown", userVisit, true);
+    document.addEventListener("keydown", userVisit, true);
   })();
 })();
