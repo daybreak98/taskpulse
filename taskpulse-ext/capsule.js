@@ -171,7 +171,7 @@
     const revision = task.revision || rules.revision(task);
     try {
       const result = await chrome.runtime.sendMessage({ kind, id, revision, ...fields });
-      if (result?.ok) return true;
+      if (result?.ok) return result;
     } catch { /* A worker restart or tab navigation can invalidate a pending action. */ }
     actionError = kind === "tp.open" ? "暂时无法打开此会话，请重试" : "任务状态已变化，请重试";
     if (kind === "tp.open" && !expanded) setExpanded(true);
@@ -195,7 +195,7 @@
     time.setAttribute("aria-hidden", "true");
     link.append(element("i", "task-dot"), name, time);
     link.addEventListener("click", async () => {
-      if (await command("tp.open", task) && !pinned) setExpanded(false);
+      if (await command("tp.open", task, { intent: "row" }) && !pinned) setExpanded(false);
     });
 
     const check = element("button", "task-check");
@@ -205,7 +205,7 @@
     const checkLabel = done ? "取消本轮处理标记" : "标记本轮已处理";
     check.setAttribute("aria-label", checkLabel + " · " + title);
     check.title = checkLabel;
-    check.disabled = !done && !rules.canAcknowledge(task);
+    check.disabled = !done && (task.uncertain || !rules.canAcknowledge(task));
     check.addEventListener("click", async () => {
       await command("tp.check", task, { checked: !done });
     });
@@ -406,7 +406,8 @@
     const body = element("span", "toast-body", title);
     button.append(element("span", "toast-title", "Agent 回话了"), body);
     button.addEventListener("click", async () => {
-      if (await command("tp.open", task)) {
+      const result = await command("tp.open", task, { intent: "notice" });
+      if (result && result.clearNotice !== false) {
         button.setAttribute("data-dismissing", "");
         setTimeout(() => removeToast(task.revision), 110);
       }
@@ -475,7 +476,7 @@
     const id = web.conversationId(location.href);
     if (!id) return;
     lastVisitAt = Date.now();
-    void chrome.runtime.sendMessage({ kind: "tp.visit", id }).catch(() => {});
+    void chrome.runtime.sendMessage({ kind: "tp.visit", id, at: Date.now() }).catch(() => {});
   }
   document.addEventListener("pointerdown", userVisit, true);
   document.addEventListener("keydown", userVisit, true);
