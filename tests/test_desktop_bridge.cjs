@@ -92,3 +92,93 @@ test("a late WEB list response from a revoked lease cannot publish", async () =>
   assert.equal(reports[0].generation,"new-gen");
   assert.equal(reports[0].conversations[0].id,2);
 });
+
+test("an explicit visit cannot acknowledge a different SPA conversation", async () => {
+  const source = read("background.js");
+  const start = source.indexOf("async function notifyActive(");
+  const end = source.indexOf("// 按 conversationId", start);
+  assert.ok(start >= 0 && end > start);
+  const current = origin + "?agentId=a&conversationId=456";
+  const posts = [];
+  const tab = {id: 5, windowId: 1, active: true, status: "complete", url: current};
+  const ctx = {
+    Date, JSON, AbortSignal, modeActionScope: "scope", ACTIVE_ENDPOINT: "/active",
+    collectorId: async () => "chrome-profile", authHeaders: h => h,
+    isConversationTab: u => typeof u === "string" && u.startsWith(origin + "?"),
+    chrome: {tabs: {get: async () => tab}, windows: {get: async () => ({focused: true})}},
+    fetch: async (_url, opts) => {posts.push(JSON.parse(opts.body)); return {ok: true};}
+  };
+  vm.createContext(ctx);
+  vm.runInContext(source.slice(start, end), ctx);
+  await ctx.notifyActive(5, true, Date.now(), target);
+  assert.equal(posts.length, 0, "the event belonged to the old conversation");
+  await ctx.notifyActive(5, true, Date.now(), current);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, current);
+});
+
+test("a failed command acknowledgement is bounded and does not stop listening", async () => {
+  const source = read("background.js");
+  const start = source.indexOf("// 长轮询：");
+  const end = source.indexOf("chrome.runtime.onInstalled.addListener", start);
+  assert.ok(start >= 0 && end > start);
+  const requests = [], acks = [];
+  let resolveFinished;
+  const finished = new Promise(resolve => {resolveFinished = resolve;});
+  const commands = [
+    {id:"close-1", cmd:"closeTabs", collector:"chrome-profile", targets:{}},
+    {id:"open-1", cmd:"focus", cid:"123", url:target}
+  ];
+  const ctx = {
+    Date, JSON, encodeURIComponent, AbortSignal: {timeout: ms => ({ms})},
+    CMD_ENDPOINT: "/cmd", ACK_ENDPOINT: "/ack", BASE: "",
+    collectorId: async () => "chrome-profile", authHeaders: h => h, sleep: async () => {},
+    closeTabsFor: async () => 0, focusConversation: async () => "focused",
+    fetch: async (url, options) => {
+      requests.push(url);
+      if (url.startsWith("/ack?")) {
+        acks.push(options.signal?.ms);
+        throw new Error("fixture: network failure");
+      }
+      if (commands.length) return {status:200, json:async () => commands.shift()};
+      resolveFinished();
+      return new Promise(() => {});
+    }
+  };
+  vm.createContext(ctx);
+  vm.runInContext(source.slice(start, end), ctx);
+  void ctx.listen();
+  await finished;
+  assert.deepEqual(acks, [4000, 4000]);
+  assert.equal(requests.filter(u => u.startsWith("/cmd?")).length, 3);
+});
+
+test("leader without a receiving content script is reinjected and acknowledged", async () => {
+  const source = read("background.js");
+  const start = source.indexOf("async function postRole(");
+  const end = source.indexOf("function persistLeader(", start);
+  assert.ok(start >= 0 && end > start);
+  let sends = 0, injections = 0;
+  const ctx = {
+    roleLease:"lease", modeGeneration:"generation", leaderId:7, leaderPageId:"",
+    roleSent:null, roleKey:()=>"lease:generation:true",
+    chrome:{
+      tabs:{sendMessage:async () => {
+        if (++sends === 1) throw new Error("Receiving end does not exist");
+        return {pageId:"recovered-page"};
+      }},
+      scripting:{executeScript:async options => {
+        assert.equal(options.target.tabId, 7);
+        assert.equal(options.files[0], "web-bridge.js");
+        injections++;
+      }}
+    }
+  };
+  vm.createContext(ctx);
+  vm.runInContext(source.slice(start,end),ctx);
+  await ctx.postRole(7, true);
+  assert.equal(injections, 1);
+  assert.equal(sends, 2);
+  assert.equal(ctx.leaderPageId, "recovered-page");
+  assert.equal(ctx.roleSent, "lease:generation:true");
+});

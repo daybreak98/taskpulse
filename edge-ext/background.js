@@ -115,13 +115,14 @@ async function push() {
 }
 
 // 用户切到某个目标站点标签页 → 通知 TaskPulse 把对应任务标记为已查看
-async function notifyActive(tabId, explicit = false, observedAt = Date.now()) {
+async function notifyActive(tabId, explicit = false, observedAt = Date.now(), observedUrl = "") {
   const actionScope = modeActionScope;
   try {
     const collector = await collectorId();
     const t = await chrome.tabs.get(tabId);
     if (!collector || !t || !t.active || t.status !== "complete" ||
-        t.pendingUrl && t.pendingUrl !== t.url || !isConversationTab(t.url)) return;
+        t.pendingUrl && t.pendingUrl !== t.url || !isConversationTab(t.url) ||
+        explicit && (!observedUrl || t.url !== observedUrl)) return;
     const w = await chrome.windows.get(t.windowId);
     const actual = await chrome.tabs.get(tabId);
     if (!w?.focused || !actual?.active || actual.url !== t.url || actual.status !== "complete" ||
@@ -130,7 +131,8 @@ async function notifyActive(tabId, explicit = false, observedAt = Date.now()) {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ url: t.url, focused: true, at: observedAt, collector,
-        action_scope: actionScope, explicit })
+        action_scope: actionScope, explicit }),
+      signal: AbortSignal.timeout(4000)
     });
   } catch (_) {}
 }
@@ -262,7 +264,7 @@ async function listen() {
             try {
               await fetch(ACK_ENDPOINT + "?id=" + encodeURIComponent(cmd.id)
                           + "&result=closed&n=" + n + "&collector=" + encodeURIComponent(collector),
-                { method: "POST", headers: authHeaders() });
+                { method: "POST", headers: authHeaders(), signal: AbortSignal.timeout(4000) });
             } catch (_) {}
           }
         }
@@ -282,7 +284,7 @@ async function listen() {
             try {
               await fetch(ACK_ENDPOINT + "?id=" + encodeURIComponent(cmd.id)
                           + "&result=" + encodeURIComponent(how) + "&collector=" + encodeURIComponent(collector),
-                { method: "POST", headers: authHeaders() });
+                { method: "POST", headers: authHeaders(), signal: AbortSignal.timeout(4000) });
             } catch (_) {}
           }
         }
@@ -429,7 +431,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     return;
   }
   if (msg.kind === "tp-user-visit" && sender?.frameId === 0 && Number.isInteger(sender?.tab?.id)) {
-    void notifyActive(sender.tab.id, true, Number(msg.at) || 0);
+    void notifyActive(sender.tab.id, true, Number(msg.at) || 0, sender.url || "");
     respond({ ok: true });
     return;
   }
@@ -492,7 +494,18 @@ async function postRole(tabId, leader) {
   const lease = roleLease;
   const generation = modeGeneration;
   try {
-    const result = await chrome.tabs.sendMessage(tabId, { kind: "tp-role", leader, generation, lease }, { frameId: 0 });
+    const message = { kind: "tp-role", leader, generation, lease };
+    let result;
+    try {
+      result = await chrome.tabs.sendMessage(tabId, message, { frameId: 0 });
+    } catch (_) {}
+    if (leader && tabId === leaderId && key === roleKey() && typeof result?.pageId !== "string") {
+      // A loaded tab can have no receiver after reload or a failed initial injection.
+      // Reuse the existing scripting permission; the bridge itself rejects duplicate injection.
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["web-bridge.js"] });
+      if (tabId !== leaderId || key !== roleKey()) return;
+      result = await chrome.tabs.sendMessage(tabId, message, { frameId: 0 });
+    }
     if (tabId === leaderId && key === roleKey() && typeof result?.pageId === "string") {
       leaderPageId = result.pageId;
       roleSent = key;
