@@ -133,7 +133,14 @@
     out.sort((a, b) => (b.updateTime || 0) - (a.updateTime || 0));
     const unique = new Map();
     for (const c of out) if (c.id != null && !unique.has(String(c.id))) unique.set(String(c.id), c);
-    convs = [...unique.values()];
+    // A paginated list can drop a running conversation. Keep sampling known hot
+    // work until it settles; never keep an indefinitely stale failed queue alive.
+    for (const c of convs) {
+      const cid = String(c.id);
+      if (!unique.has(cid) && ((hotUntil[cid] || 0) > now() ||
+          (isBusy(cid) === true && now() - (queueAt[cid] || 0) < 180000))) unique.set(cid, c);
+    }
+    convs = [...unique.values()].sort((a, b) => (b.updateTime || 0) - (a.updateTime || 0));
     lastListAt = now();
     lastError = "";
     const present = new Set(convs.map(c => String(c.id)));
@@ -204,8 +211,10 @@
     // 分好组的会话往往不活跃、updateTime 靠后，按时间截断会把它们整批丢掉；
     // 所以先把所有带分组的挑出来，再补上最近的未分组会话。
     const grouped = convs.filter((c) => c.groupName);
-    const rest = convs.filter((c) => !c.groupName).slice(0, 60);
-    const pick = grouped.concat(rest).map((c) => ({
+    const rest = convs.filter((c) => !c.groupName);
+    const keep = rest.filter((c, index) => index < 60 || isBusy(String(c.id)) === true ||
+        (hotUntil[String(c.id)] || 0) > now());
+    const pick = grouped.concat(keep).map((c) => ({
       id: c.id, name: c.name, agentId: c.agentId,
       updateTime: c.updateTime, createTime: c.createTime, groupName: c.groupName
     }));

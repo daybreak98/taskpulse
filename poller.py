@@ -1221,7 +1221,9 @@ def apply_evidence_sample(task: dict, sample: QueueSample, act: dict,
     pending = task.setdefault("pending_replies", [])
     task["reply_pending"] = bool(pending)
     started = task.get("running_since") or 0
-    new_batch = (sample.messages is not None and sample.message_at > (task.get("message_checked_at") or 0))
+    new_batch = (sample.messages is not None and sample.message_at > (task.get("message_checked_at") or 0)
+                 and (sample.busy or not (started or task.get("awaiting_reply"))
+                      or sample.message_at >= sample.at))
     if sample.busy:
         if not started or previous and sample.at - previous > RUN_GAP_RESET_SECONDS * 1000:
             started = sample.at
@@ -1260,7 +1262,7 @@ def apply_evidence_sample(task: dict, sample: QueueSample, act: dict,
         if valid:
             task["message_observed_update"] = task.get("update_ms") or 0
     # A fresh idle sample without a new assistant does not erase the prior unread or the expected reply.
-    task["awaiting_reply"] = expected and not new_count
+    task["awaiting_reply"] = (expected or task.get("message_gap", False)) and not new_count
     if new_count:
         task["awaiting_reply"] = False
     if not task.get("message_seeded") and not valid:
@@ -1439,16 +1441,49 @@ def poll_tick(agent: AgentClient, *, full: bool, discovery: bool = False,
             begin()
     tasks = base.get("tasks") or {}
     stamp = now_ms()
+    web = isinstance(agent, WebProvider)
+    if web:
+        snapshot = agent._snap()
+        age = agent.age_seconds()
+        error = snapshot.get("error")
+        if age is None or age > WEB_STALE_SECONDS or error or not isinstance(snapshot.get("conversations"), list):
+            # No valid current-generation list: do not seed historical replies, archive tasks,
+            # or advance observation timestamps while the bridge is reconnecting.
+            with _lock:
+                if (source_mode(), _source_epoch) != gen:
+                    return base
+                state = load_state()
+                state["poller_error"] = ("页面采集失败：%s" % str(error)[:100] if error else
+                                         "等待当前浏览器采集源重新连接，显示上次缓存")
+                state["poller_error_at"] = stamp
+                state.pop("auth_required", None)
+                state.pop("retry_at", None)
+                save_state(state)
+                return state
     listed: list[dict] = []
     fetched: list[dict] = []
     if full or discovery:
         fetched = agent.conversations(request_timeout(deadline))
         listed = fetched[:WATCH_LIMIT]
+        if web:
+            # WEB wakes on each report. A full poll must consume tracked work beyond the
+            # list window too; otherwise repeated reports can starve the fast-poll lane.
+            selected = {str(c["id"]) for c in listed}
+            def tracked(task):
+                return not task.get("muted") and (running(task) or task.get("awaiting_reply")
+                        or task.get("pending_replies") or task.get("important"))
+            listed.extend(c for c in fetched if str(c["id"]) not in selected and tracked(tasks.get(str(c["id"]), {})))
         if full:
             # 慢请求耗尽预算时，下轮先补最久未检查的会话。
             listed.sort(key=lambda conv: tasks.get(str(conv["id"]), {}).get("queue_checked_at") or 0)
     if full:
-        conversations = listed
+        conversations = listed[:]
+        if web:
+            selected = {str(c["id"]) for c in conversations}
+            queues = agent._snap().get("queues") or {}
+            conversations.extend({"id": task["id"], "updateTime": task.get("update_ms") or 0}
+                                 for cid, task in tasks.items()
+                                 if cid not in selected and cid in queues and tracked(task))
     elif discovery:
         # 秒级发现：列表已经拿到了，新会话、刚起新一轮的会话顺带取队列，运行中的照旧复查两个。
         fresh = [conv for conv in listed if str(conv["id"]) not in tasks]
@@ -1785,7 +1820,9 @@ def view(state: dict) -> dict:
         "updated": state.get("updated"),
         "source": source, "source_age": source_age, "scope": source_scope(),
         "action_scope": action_scope(),
-        "poller_error": state.get("poller_error"),
+        "poller_error": (state.get("poller_error") or
+                         ("等待当前浏览器采集源重新连接" if mode == "web" and
+                          (source_age is None or source_age > WEB_STALE_SECONDS) else None)),
         # 401：凭据失效，只有重新扫码能恢复。App 据此显示「重新授权」按钮
         "auth_required": bool(state.get("auth_required")),
         # 还剩几秒会再试；没有退避（比如等页面上报）时为 null

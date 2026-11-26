@@ -562,6 +562,40 @@ class PollingTests(unittest.TestCase):
         self.assertTrue(task.get("deadline"), "用户设的截止时间被采样落盘覆盖了")
         self.assertGreater(task["deadline"], self.stamp)
 
+    def test_web_full_reports_keep_tracking_running_tasks_outside_limit(self):
+        path = Path(self.directory) / "webstate.json"
+        with patch.multiple(poller, WEBSTATE_FILE=str(path), source_mode=lambda: "web", WATCH_LIMIT=1):
+            def report(convs, queues, messages):
+                path.write_text(json.dumps({
+                    "at": self.stamp, "listAt": self.stamp,
+                    "generation": poller.web_generation(), "collector": "tracked-web", "browser": "edge",
+                    "conversations": convs, "queues": queues,
+                    "queueAt": {cid: self.stamp for cid in queues}, "lastMessages": messages,
+                }), encoding="utf-8")
+                return poller.poll_tick(poller.WebProvider(), full=True)
+            a = {"id": 1, "name": "A", "updateTime": NOW - 1000}
+            b = {"id": 2, "name": "B", "updateTime": NOW + 1000}
+            busy = {"state": "RUNNING", "pending": []}
+            idle = {"state": "IDLE", "pending": []}
+            first = report([a], {"1": busy}, {"1": {"sampledAt": NOW, "messages": []}})
+            self.assertEqual(first["tasks"]["1"]["status"], "running")
+            self.stamp += 4000
+            result = report([b, a], {"1": idle, "2": busy},
+                {"1": {"sampledAt": self.stamp, "messages": [
+                    {"id": "reply-a", "sender": "assistant", "createTime": self.stamp}]}})
+            self.assertTrue(result["tasks"]["1"]["reply_pending"])
+            self.assertEqual(result["tasks"]["2"]["status"], "running")
+
+    def test_web_missing_generation_does_not_create_baseline_or_advance_tasks(self):
+        path = Path(self.directory) / "webstate.json"
+        path.write_text(json.dumps({"at": NOW, "generation": "old-process", "collector": "test-web",
+                                    "conversations": [conversation(1)]}), encoding="utf-8")
+        with patch.multiple(poller, WEBSTATE_FILE=str(path), source_mode=lambda: "web"):
+            result = poller.poll_tick(poller.WebProvider(), full=True)
+            self.assertTrue(result.get("poller_error"))
+            self.assertFalse(result.get("baseline_at"))
+            self.assertFalse(result.get("tasks"))
+
     def test_web_old_queue_sample_is_not_renewed(self):
         """页面重复上报同一份旧队列，不能把观测时间一路往后推。"""
         path = str(Path(self.directory) / "webstate.json")
