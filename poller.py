@@ -1846,13 +1846,15 @@ def view(state: dict) -> dict:
         return True
 
     active = [r for r in rows if visible(r)]
+    web_unavailable = mode == "web" and (source_age is None or source_age > WEB_STALE_SECONDS)
+    error = state.get("poller_error") or ("等待当前浏览器采集源重新连接" if web_unavailable else None)
+    if web_unavailable and profiles and not any(p.get("collector") for p in profiles.values()):
+        error = "检测到旧版桌面配套扩展，请在 Chrome/Edge 扩展管理页重新加载 TaskPulse Tab Bridge"
     return {
         "updated": state.get("updated"),
         "source": source, "source_age": source_age, "scope": source_scope(),
         "action_scope": action_scope(),
-        "poller_error": (state.get("poller_error") or
-                         ("等待当前浏览器采集源重新连接" if mode == "web" and
-                          (source_age is None or source_age > WEB_STALE_SECONDS) else None)),
+        "poller_error": error,
         # 401：凭据失效，只有重新扫码能恢复。App 据此显示「重新授权」按钮
         "auth_required": bool(state.get("auth_required")),
         # 还剩几秒会再试；没有退避（比如等页面上报）时为 null

@@ -627,6 +627,22 @@ class PollingTests(unittest.TestCase):
             self.assertTrue(result["tasks"]["1"]["reply_pending"])
             self.assertEqual(result["tasks"]["2"]["status"], "running")
 
+    def test_web_waiting_on_legacy_bridge_has_reload_hint(self):
+        with patch.object(poller, "source_mode", return_value="web"):
+            with self.serve() as url:
+                client = self.auth()
+                old = {"at": self.stamp, "browser": "edge", "tabs": [],
+                       "web": {"hasApi": True}, "active": {"focused": False}}
+                self.assertTrue(client.post(url + "/tabs", json=old, timeout=2).json()["ok"])
+                state = client.get(url + "/state", timeout=2).json()
+                self.assertIn("重新加载 TaskPulse Tab Bridge", state["poller_error"])
+                # A current bridge reporting from another browser should clear
+                # this specific legacy-only diagnostic.
+                modern = {**old, "browser": "chrome", "collector": "chrome-current"}
+                client.post(url + "/tabs", json=modern, timeout=2)
+                state = client.get(url + "/state", timeout=2).json()
+                self.assertNotIn("重新加载 TaskPulse Tab Bridge", state["poller_error"] or "")
+
     def test_web_missing_generation_does_not_create_baseline_or_advance_tasks(self):
         path = Path(self.directory) / "webstate.json"
         path.write_text(json.dumps({"at": NOW, "generation": "old-process", "collector": "test-web",

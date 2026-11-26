@@ -7,16 +7,13 @@ import Foundation
 
 /// 后台服务的端口跟 poller 共用 ~/.taskpulse/config.json，没配就用 8899
 func taskPulsePort() -> Int {
-    let path = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".taskpulse/config.json")
-    guard let data = try? Data(contentsOf: path),
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let ui = obj["ui"] as? [String: Any],
-          let port = ui["port"] as? Int else { return 8899 }
-    return port
+    guard let data = FileManager.default.contents(atPath: Bootstrap.configPath),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return 8899 }
+    return Bootstrap.configuredPort(obj)
 }
 
-let endpoint = "http://127.0.0.1:\(taskPulsePort())"
+// Updated on the main thread after the real configuration has been prepared.
+private(set) var endpoint = "http://127.0.0.1:\(taskPulsePort())"
 
 /// 本机服务的共享密钥：~/.taskpulse/token（由 poller / 安装脚本生成，权限 0600）。
 /// 没有它 poller 会回 401，所以每个请求都要挂上 X-TP-Token。
@@ -31,8 +28,7 @@ enum TokenCache {
 /// 为什么要缓存：/state 每秒拉一次，每次都读盘 + 解析纯属浪费；
 /// 为什么用 mtime 当键：用户换钥匙（重装、手动删文件）后能立刻生效，不需要重启 App。
 func taskPulseToken() -> String {
-    let path = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".taskpulse/token")
+    let path = URL(fileURLWithPath: Bootstrap.tokenPath)
     guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else {
         // 文件还不存在：按空 token 发（服务端会回 401），只记一次日志。
         // 不在这里崩、也不静默跳过请求——「发出去被拒」在界面上是明确的未授权。
@@ -1754,11 +1750,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         buildPanel()
         applyLayout()
         dbg("TaskPulse 界面已启动：\(Bundle.main.bundlePath)")
-        refresh()
         // 首次打开：先把运行环境准备到用户目录（原来由 install.command 做），
         // 之后再起后台。已经初始化过的机器直接起，跳过一次额外检查。
         if Bootstrap.isReady() && Bootstrap.refreshPaths() {
+            endpoint = "http://127.0.0.1:\(taskPulsePort())"
             poller.startIfNeeded()
+            refresh()
         } else {
             runBootstrap()
         }
@@ -1975,7 +1972,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         OnboardingController.shared.showBootstrap { [weak self] plan in
             guard let self else { return }
             self.bootstrapRunning = false
+            endpoint = "http://127.0.0.1:\(plan.port)"
             self.poller.start(with: plan)
+            self.refresh()
         }
     }
 
@@ -2589,7 +2588,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func refresh() {
-        guard !dataRequestInFlight, ProcessInfo.processInfo.systemUptime >= nextReadAt,
+        guard !bootstrapRunning, !dataRequestInFlight, ProcessInfo.processInfo.systemUptime >= nextReadAt,
               let url = URL(string: endpoint + "/state") else { return }
         dataRequestInFlight = true
         var req = URLRequest(url: url)
