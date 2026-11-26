@@ -278,6 +278,8 @@
       task.replyUpdate = task.update;
       task.replyAt = time(message.atMessage);
       task.replyActivityAt = task.replyAt || at;
+      // Verification belongs to this exact reply, not its predecessor.
+      task.replyVerifiedAt = 0;
       task.phaseAt = at;
       task.pending = true;
       task.failed = Boolean(message.failed);
@@ -395,6 +397,9 @@
       if (errorAt > task.observedAt) task.queueError = true;
       const confirmed = taskFresh(state, task, now);
       if (task.pending && verifiedReply(task) && confirmed && canAcknowledge(task)) {
+        // Record the last accepted confirmation of this pending revision.
+        // The reply's creation timestamp is not a revalidation timestamp.
+        task.replyVerifiedAt = Math.max(task.replyVerifiedAt || 0, task.observedAt);
         if (cid === activeId && task.status === "attention") {
           // Auto-read must also apply to a reply that has already been notified.
           task = acknowledge(task);
@@ -423,15 +428,22 @@
       if (task.listedAt !== state.listAt || !taskAccessible(state, task) ||
           !recentActivity(task, now) || isDismissed(task) || !include(task)) continue;
       const uncertain = !taskFresh(state, task, now) || task.messageUncertain;
-      // 已确认的未读是既成事实：采集抖动（队列失败/消息未同步/采样超时）
-      // 只说明「这条数据还不新鲜」，不该让它从黄色计数里消失。
-      // 只放过「采集不新鲜」（队列失败/消息未同步/采样超时）；
-      // 登出、账号切换、列表回退会把证据代际作废，那种未读不能立刻认。
-      const unread = task.pending === true &&
+      // Keep DS's confirmed-unread presentation, but use confirmation
+      // evidence rather than server creation time after a recovery fence.
+      // Legacy snapshots use the previous conservative fallback until the
+      // next valid confirmation. Never inherit evidence across a new reply.
+      const replyEvidence = task.replyVerifiedAt ?? (task.replyAt || task.replyUpdate || 0);
+      const unread = task.pending === true && !task.listUncertain &&
         (task.status === "attention" || task.status === "stuck") && verifiedReply(task) &&
-        (task.replyAt || task.replyUpdate || 0) >= evidenceFloor(state, task);
-      if ((unread || !uncertain) && Object.hasOwn(counts, task.status)) counts[task.status]++;
-      tasks.push({ ...task, uncertain });
+        !task.runAt && !task.awaitingReply && replyEvidence > 0 &&
+        replyEvidence >= evidenceFloor(state, task);
+      // One classification for counters, groups, filtering and row tint.
+      // Unconfirmed running/blocked executions stay visible as uncertain,
+      // but are not counted as verified active states.
+      const displayStatus = (unread || !uncertain) && Object.hasOwn(counts, task.status)
+        ? task.status : "seen";
+      if (Object.hasOwn(counts, displayStatus)) counts[displayStatus]++;
+      tasks.push({ ...task, uncertain, displayStatus });
     }
     tasks.sort((a, b) => order[a.status] - order[b.status] || b.update - a.update);
     return { counts, tasks, stale, offline, error };

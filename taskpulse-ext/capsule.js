@@ -172,12 +172,14 @@
     return uncertain ? uncertain + " 个会话状态待确认" : "";
   }
 
-  const checkedTask = task => !!task.checkedRevision && rules.canAcknowledge(task) && task.checkedRevision === rules.revision(task);
-  // 采集不确定不代表未读不存在：它只影响「能否确认已读」，不影响归属与筛选
-  const isLive = (task, kind) => !checkedTask(task) && task.status === kind;
+  const checkedTask = task => task.displayStatus === "seen" && !!task.checkedRevision &&
+    rules.canAcknowledge(task) && task.checkedRevision === rules.revision(task);
+  // Consume the same projection as the counter; uncertainty alone is not
+  // a reason to hide a confirmed unread reply.
+  const isLive = (task, kind) => task.displayStatus === kind;
 
   function taskStatus(task) {
-    return checkedTask(task) ? "done" : task.status;
+    return checkedTask(task) ? "done" : task.displayStatus;
   }
   function progress(task, now) {
     if (checkedTask(task)) return 1;
@@ -231,7 +233,7 @@
 
   function taskRow(task) {
     const done = checkedTask(task);
-    const tint = done ? "done" : (filter && !isLive(task, filter)) ? "seen" : task.status;
+    const tint = taskStatus(task);
     const row = element("div", "row " + tint);
     const plate = element("i", "row-plate");
     const link = element("button", "task-open");
@@ -284,10 +286,10 @@
       if (!buckets.has(identity.key)) buckets.set(identity.key, { ...identity, tasks: [], active: 0, worst: "seen", matched: [] });
       const group = buckets.get(identity.key);
       group.tasks.push(task);
-      // 只在状态无法归类时跳过；uncertain 仍参与组号与自动展开
-      if (!severity[taskStatus(task)]) continue;
+      const status = taskStatus(task);
+      if (!severity[status]) continue;
       group.active++;
-      if (severity[task.status] > severity[group.worst]) group.worst = task.status;
+      if (severity[status] > severity[group.worst]) group.worst = status;
       if (filter && isLive(task, filter)) group.matched.push(task);
     }
     return [...buckets.values()].sort((a, b) => severity[b.worst] - severity[a.worst] || a.name.localeCompare(b.name));
@@ -319,7 +321,7 @@
     box.append(button);
     groupViews.push({ group, line });
     if (open) {
-      const tasks = filter && group.matched.length ? group.matched : group.tasks;
+      const tasks = filter ? group.matched : group.tasks;
       for (const task of tasks) box.append(taskRow(task));
     }
     return box;
@@ -327,7 +329,7 @@
 
   function drawRows(tasks, unavailable) {
     const key = JSON.stringify([filter, groupMode, [...choices], unavailable, tasks.map(task => [
-      rules.displayVersion(task), ui.groupFor(task, groupMode, tabGroups), task.name, task.status, task.uncertain,
+      rules.displayVersion(task), ui.groupFor(task, groupMode, tabGroups), task.name, task.status, task.displayStatus, task.uncertain,
       task.checkedRevision, task.uncertain ? task.observedAt : 0, task.runAt, task.phaseAt, task.failed, task.messageUncertain
     ])]);
     if (key === lastRows) return;
@@ -339,11 +341,11 @@
     groups = makeGroups(tasks);
     const content = document.createDocumentFragment();
     if (groupMode === "dataagent" && groups.length === 1 && groups[0].name === "未分组") {
-      for (const task of groups[0].tasks) content.append(taskRow(task));
+      for (const task of filter ? groups[0].matched : groups[0].tasks) content.append(taskRow(task));
     } else {
       for (const group of groups) content.append(groupRow(group));
     }
-    if (!groups.length && !unavailable) {
+    if ((!groups.length || filter && !groups.some(group => group.matched.length)) && !unavailable) {
       content.append(element("p", "empty", filter ? "没有" + names[filter] + "的任务" : "没有正在跑的任务"));
     }
     list.replaceChildren(content);

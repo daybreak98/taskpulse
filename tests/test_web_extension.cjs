@@ -2080,3 +2080,156 @@ test("in-flight surface storage writes serialize and a revoked credential trigge
   await until(() => messages.some(packet => packet.kind === "tp.surface-repair"));
   assert.equal(messages.find(packet => packet.kind === "tp.surface-repair").token, firstToken);
 });
+
+
+// f7eaaad follow-up: exercise the real state engine and the actual panel
+// grouping functions, not a separately implemented approximation.
+function panelGroups(view, filter = "", groupMode = "dataagent", tabGroups = {}) {
+  const source = fs.readFileSync(path.join(ext, "capsule.js"), "utf8");
+  const status = source.slice(source.indexOf("  const checkedTask ="), source.indexOf("  function progress("));
+  const groups = source.slice(source.indexOf("  function makeGroups("), source.indexOf("  function groupRow("));
+  const evaluate = new Function("rules", "ui", "filter", "groupMode", "tabGroups", "severity", "choices",
+    status + groups + "\nreturn { makeGroups, isOpen };");
+  const actual = evaluate(rules, ui, filter, groupMode, tabGroups,
+    { stuck: 3, attention: 2, running: 1, seen: 0, done: 0 }, new Map());
+  return { groups: actual.makeGroups(view.tasks), isOpen: actual.isOpen };
+}
+
+test("P1 verified unread survives failure, full recovery, restart and another queue failure", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  const revision = exactRevision(app), acked = currentTask(app).acked;
+  await app.deliver(report(now + 10_000, row(update), { busy: null, error: "HTTP 503" }));
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 10_000).stale, true);
+  await app.deliver(replyReport(now + 15_000, update, "A"));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 15_000).counts.attention, 1);
+  const restarted = worker({ local: app.local.data, session: app.session.data, notices: [...app.notices] });
+  await restarted.deliver(report(now + 20_000, row(update), { busy: null, queueError: true }));
+  const view = rules.view(restarted.local.data[web.keys.state], now + 20_000);
+  assert.equal(currentTask(restarted).pending, true);
+  assert.equal(currentTask(restarted).acked, acked);
+  assert.equal(exactRevision(restarted), revision);
+  assert.equal(view.tasks[0].uncertain, true);
+  assert.equal(rules.canAcknowledge(currentTask(restarted)), false);
+  assert.equal(view.counts.attention, 1, "revalidated unread disappeared during the next transient failure");
+  assert.equal(restarted.notices.size, 1, "same reply must not notify twice");
+});
+
+test("P1 existing unread survives a queue-only valid revalidation; auth fence still blocks stale samples", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  await app.deliver(report(now + 10_000, row(update), { busy: null, error: "HTTP 401" }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 10_000).tasks.length, 0);
+  await app.deliver(report(now + 15_000, row(update), { queueAt: now + 5_000 }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 15_000).counts.attention, 0);
+  await app.deliver(report(now + 20_000, row(update)));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 20_000).counts.attention, 1);
+  await app.deliver(report(now + 25_000, row(update), { busy: null, queueError: true }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 25_000).counts.attention, 1);
+  assert.equal(currentTask(app).pending, true);
+  await app.deliver(report(now + 30_000, row(update), { busy: null, accessError: true }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 30_000).tasks.length, 0);
+});
+
+test("P1 DA and TAB counters, actual group badges and filter membership agree during uncertainty", () => {
+  const tracker = timeline(), update = now + 1_000, at = now + 10_000;
+  tracker.next(report(now, row()));
+  tracker.next(replyReport(now + 5_000, update, "A"));
+  const { state } = tracker.next(report(at, row(update), { busy: null, queueError: true }));
+  const unread = state.tasks[id];
+  state.tasks["43"] = { ...unread, id: "43", status: "running", runAt: now, awaitingReply: true,
+    pending: false, replyKey: undefined, replyAt: 0 };
+  state.tasks["44"] = { ...unread, id: "44", status: "stuck", runAt: now, awaitingReply: true,
+    pending: false, replyKey: undefined, replyAt: 0 };
+  state.tasks["45"] = { ...unread, id: "45", status: "stuck", failed: true };
+  state.tasks["46"] = { ...unread, id: "46", status: "running", runAt: now, awaitingReply: true,
+    queueError: false, observedAt: at, pending: false, replyKey: undefined, replyAt: 0 };
+  const tabs = [id, "43", "44", "46"].map((cid, i) => ({
+    id: 100 + i, groupId: 8, url: web.conversationUrl(cid, agent)
+  }));
+  const mapping = ui.buildGroups(tabs, [{ id: 8, title: "真实标签组", color: "blue" }], web);
+  for (const mode of ["dataagent", "tab"]) {
+    const view = rules.view(state, at, mode === "tab" ? task => !!ui.groupFor(task, mode, mapping) : undefined);
+    assert.deepEqual(view.counts, { running: 1, attention: 1, stuck: mode === "tab" ? 0 : 1 });
+    const total = Object.values(view.counts).reduce((a, b) => a + b, 0);
+    assert.equal(panelGroups(view, "", mode, mapping).groups.reduce((n, g) => n + g.active, 0), total);
+    for (const kind of ["running", "attention", "stuck"]) {
+      const p = panelGroups(view, kind, mode, mapping);
+      assert.equal(p.groups.reduce((n, g) => n + g.matched.length, 0), view.counts[kind]);
+      assert.ok(p.groups.every(g => p.isOpen(g) === (g.matched.length > 0)));
+    }
+  }
+});
+
+test("P1 regressed list is not authoritative; unread display recovers after a fresh matching sample", () => {
+  const tracker = timeline(), update = now + 1_000;
+  tracker.next(report(now, row()));
+  tracker.next(replyReport(now + 5_000, update, "A"));
+  const regressed = tracker.next(report(now + 10_000, row(old)));
+  assert.equal(regressed.task.listUncertain, true);
+  assert.equal(regressed.task.pending, true);
+  const view = rules.view(regressed.state, now + 10_000);
+  assert.equal(view.counts.attention, 0);
+  assert.equal(panelGroups(view, "attention").groups.reduce((n, g) => n + g.matched.length, 0), 0);
+  const recovered = tracker.next(replyReport(now + 15_000, update, "A"));
+  assert.equal(rules.view(recovered.state, now + 15_000).counts.attention, 1);
+});
+
+test("P1 red row successfully landed during a queue error acknowledges only its exact reply on recovery", async () => {
+  for (const mode of ["same", "newer", "background", "running", "aged"]) {
+    const app = worker(), update = now + 1000;
+    await app.deliver(report(now, row()));
+    await app.deliver(replyReport(now + 5000, update, "A", { failed: mode !== "aged" }));
+    let stamp = now + 5000;
+    if (mode === "aged") {
+      stamp += 31 * 60_000;
+      await app.deliver(replyReport(stamp, update, "A"));
+    }
+    assert.equal(currentTask(app).status, "stuck");
+    const revision = exactRevision(app);
+    await app.deliver(report(stamp + 5000, row(update), { busy: null, queueError: true }));
+    app.tabs.push({ id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete", active: false });
+    const result = await app.send({ kind: "tp.open", id, revision, intent: "row" });
+    assert.equal(result.ok, true);
+    assert.equal(result.clearNotice, false);
+    assert.equal(currentTask(app).pending, true);
+    const restarted = worker({ local: app.local.data, session: app.session.data, notices: [...app.notices] });
+    restarted.tabs.splice(0, restarted.tabs.length, ...structuredClone(app.tabs));
+    if (mode === "background") {
+      restarted.tabs.find(t => t.id === 9).active = false;
+      restarted.tabs[0].active = true;
+    }
+    if (mode === "running") {
+      await restarted.deliver(report(stamp + 10000, row(update), { busy: true }));
+      assert.equal(currentTask(restarted).pending, true);
+      assert.ok(currentTask(restarted).runAt);
+      assert.equal(currentTask(restarted).readRevision, undefined);
+      continue;
+    }
+    const later = stamp + 10000;
+    await restarted.deliver(replyReport(later, mode === "newer" ? later - 1000 : update,
+      mode === "newer" ? "B" : "A", { failed: mode !== "aged" && mode !== "newer" }));
+    const shouldRead = mode === "same" || mode === "aged";
+    assert.equal(currentTask(restarted).pending, !shouldRead, mode);
+    if (shouldRead) {
+      assert.equal(currentTask(restarted).readRevision, revision);
+      assert.equal(rules.view(restarted.local.data[web.keys.state], later).counts.stuck, 0);
+      assert.equal(restarted.notices.size, 0);
+    } else if (mode === "newer") {
+      assert.notEqual(exactRevision(restarted), revision);
+      assert.equal(currentTask(restarted).replyKey, "message.B");
+      assert.ok([...restarted.notices.keys()].some(key => key.endsWith("message.B")));
+    }
+  }
+});
+
+test("P2 running and stuck row fills have distinct visible tint while capsule palette stays intact", () => {
+  const css = fs.readFileSync(path.join(ext, "capsule.css"), "utf8");
+  for (const [kind, minimum] of [["running", .35], ["stuck", .38]]) {
+    const match = css.match(new RegExp("\\.row\\." + kind + "\\s*\\{[^}]*--row-tint:\\s*rgb\\([^/]+/\\s*([.\\d]+)\\)"));
+    assert.ok(match && Number(match[1]) >= minimum, kind + " row tint is too faint");
+  }
+});

@@ -17,6 +17,7 @@ const leaderKey = "tp-web-leader-v1";
 async function startFixture() {
   const requests = [];
   let updated = seed, working = true, lastReply = seed, pendingReply = seed, replyReadyAt = 0;
+  let lastFailed = false, pendingFailed = false, queueFault = false, listFault = false;
   let account = "a";
   const alternate = { id: 21, agentId: 515, name: "合成账号 B 的会话" };
   const expired = { id: 22, agentId: 515, name: "25 小时前的会话" };
@@ -53,6 +54,10 @@ async function startFixture() {
       response.writeHead(account === "logout" ? 401 : 403).end();
       return;
     }
+    if (account === "a" && (listFault && url.pathname.endsWith("/list") ||
+        queueFault && url.pathname.endsWith("/11/queue"))) {
+      response.writeHead(503).end(); return;
+    }
     if (account === "b" && url.pathname.endsWith("/21/queue")) {
       response.writeHead(503).end(); return;
     }
@@ -72,9 +77,11 @@ async function startFixture() {
     } else if (url.pathname.endsWith("/queue")) {
       data = { sessionState: url.pathname.includes("/11/") && working ? "BUSY" : "IDLE", pending: [] };
     } else if (url.pathname.endsWith("/messages")) {
-      if (Date.now() >= replyReadyAt) lastReply = pendingReply;
-      const stamp = url.pathname.includes("/11/") ? lastReply : seed;
-      data = { list: [{ sender: "assistant", id: "m" + stamp, createTime: stamp, content: "Synthetic private reply" }] };
+      if (Date.now() >= replyReadyAt) { lastReply = pendingReply; lastFailed = pendingFailed; }
+      const primary = url.pathname.includes("/11/");
+      const stamp = primary ? lastReply : seed;
+      data = { list: [{ sender: "assistant", id: "m" + stamp, createTime: stamp,
+        content: primary && lastFailed ? "当前服务繁忙" : "Synthetic private reply" }] };
     } else {
       response.writeHead(404).end();
       return;
@@ -88,11 +95,13 @@ async function startFixture() {
   });
   return {
     server, requests, origin: "http://127.0.0.1:" + server.address().port,
-    releaseReply: (lag = 0) => {
+    releaseReply: (lag = 0, failed = false) => {
       working = false; updated = Date.now() + 1;
-      pendingReply = updated; replyReadyAt = Date.now() + lag; return updated;
+      pendingReply = updated; pendingFailed = failed; replyReadyAt = Date.now() + lag; return updated;
     },
     startRun: () => { working = true; updated = Date.now() + 1; return updated; },
+    setQueueFault: value => { queueFault = value; },
+    setListFault: value => { listFault = value; },
     setAccount: value => { account = value; }
   };
 }
@@ -316,6 +325,8 @@ async function trial() {
     const first = panel.locator("[data-cid='11'] .task-name");
     await first.waitFor();
     assert.equal((await panel.locator(".row.running").boundingBox()).height, 28);
+    assert.equal(await panel.locator(".row.running .row-plate").evaluate(el => getComputedStyle(el).backgroundColor),
+      "rgba(97, 159, 190, 0.38)", "running row must retain a visible blue fill");
     assert.equal((await first.textContent()).trim(), task.name);
     assert.equal((await currentLeader()).tabId, leader.tabId);
     assert.ok(listReads() >= 1);
@@ -330,6 +341,8 @@ async function trial() {
     assert.deepEqual((await readPalette(horizontal)).map(p => p.base),
       [palette.zero[0].base, palette.active[1].base, palette.zero[2].base]);
     console.log("Active reply end-to-end latency ms:", Date.now() - firstRelease);
+    assert.equal(await panel.locator(".row.attention .row-plate").evaluate(el => getComputedStyle(el).backgroundColor),
+      "rgba(200, 164, 96, 0.31)", "existing amber row tint must be preserved");
     const toast = page.locator(root + " .toast").filter({ hasText: task.name });
     await toast.waitFor();
     assert.deepEqual(await toast.boundingBox(), { x: 1098, y: 14, width: 288, height: 64 });
@@ -560,6 +573,103 @@ async function trial() {
     await waitState(s => s?.tasks["11"]?.pending === false, "global toast acknowledged");
     assert.equal(await worker.evaluate(async () =>
       (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]?.url), existing);
+
+    // Real extension UI: keep a verified unread through a list outage,
+    // revalidation, and a subsequent queue outage. Nudge the existing
+    // collector using its real activity protocol to avoid a cold 60s wait.
+    // Never write synthetic task state into extension storage.
+    await created.bringToFront();
+    const continuityPanel = created.locator(root + " .panel");
+    const yellow = continuityPanel.locator(".horizontal [data-filter='attention']");
+    const red = continuityPanel.locator(".horizontal [data-filter='stuck']");
+    const continuityGroup = continuityPanel.locator(".group-head").filter({ hasText: "数据质量" });
+    async function nudgePrimary() {
+      const lead = await currentLeader();
+      assert.ok(lead?.tabId);
+      await worker.evaluate(async lead => {
+        await chrome.tabs.sendMessage(lead.tabId, {
+          kind: "tp.nudge", pageId: lead.pageId, activity: true, cid: "11"
+        }, { frameId: 0 });
+      }, lead);
+    }
+    const continuityStamp = fixture.releaseReply();
+    await nudgePrimary();
+    await waitState(s => s?.tasks["11"]?.replyKey === "message.m" + continuityStamp &&
+      s.tasks["11"].pending && s.tasks["11"].status === "attention", "continuity unread reply");
+    await yellow.filter({ hasText: /^1$/ }).waitFor();
+    await yellow.click();
+    await continuityPanel.locator("[data-cid='11']").waitFor({ state: "visible" });
+    fixture.setListFault(true);
+    await nudgePrimary();
+    await waitState(s => s?.error === "HTTP 503" && s.tasks["11"]?.pending, "list outage for unread");
+    fixture.setListFault(false);
+    await nudgePrimary();
+    await waitState(s => !s?.error && !s?.sourceUnavailable && s?.tasks["11"]?.pending &&
+      s.tasks["11"].observedAt >= s.revalidateAfter && !s.tasks["11"].messageUncertain &&
+      !s.tasks["11"].queueError, "unread revalidated after list outage");
+    await yellow.filter({ hasText: /^1$/ }).waitFor();
+    fixture.setQueueFault(true);
+    await nudgePrimary();
+    const uncertainUnread = await waitState(s => s?.tasks["11"]?.queueError &&
+      s.tasks["11"].pending, "second outage for same unread");
+    assert.equal(uncertainUnread.tasks["11"].replyKey, "message.m" + continuityStamp);
+    await yellow.filter({ hasText: /^1$/ }).waitFor({ timeout: 8_000 });
+    assert.equal(await continuityGroup.locator(".group-open").textContent(), "1");
+    assert.equal(await continuityGroup.getAttribute("aria-expanded"), "true");
+    assert.equal(await continuityPanel.locator(".task-open").count(), 1);
+    assert.equal(await continuityPanel.locator(".row.attention .row-plate").evaluate(el => getComputedStyle(el).backgroundColor),
+      "rgba(200, 164, 96, 0.31)");
+    fixture.setQueueFault(false);
+    await nudgePrimary();
+    await waitState(s => s?.tasks["11"]?.pending && !s.tasks["11"].queueError, "queue recovered");
+    console.log("Repeated list/queue outage preserves exact unread, yellow counter, group, filter and amber row");
+
+    // Red completed reply, not a genuinely busy execution. Click the actual
+    // row while a 503 prevents immediate acknowledgement; recover while
+    // the destination remains active. No fake read or direct storage write.
+    const redStamp = fixture.releaseReply(0, true);
+    await nudgePrimary();
+    await waitState(s => s?.tasks["11"]?.replyKey === "message.m" + redStamp &&
+      s.tasks["11"].pending && s.tasks["11"].status === "stuck" && !s.tasks["11"].runAt,
+      "completed failed reply");
+    await red.filter({ hasText: /^1$/ }).waitFor();
+    await red.click();
+    await continuityPanel.locator(".row.stuck [data-cid='11']").waitFor();
+    assert.equal(await continuityPanel.locator(".row.stuck .row-plate").evaluate(el => getComputedStyle(el).backgroundColor),
+      "rgba(206, 112, 100, 0.4)", "completed failed reply must have coral fill");
+    fixture.setQueueFault(true);
+    await nudgePrimary();
+    await waitState(s => s?.tasks["11"]?.queueError && s.tasks["11"].pending, "red row temporary queue fault");
+    await red.filter({ hasText: /^1$/ }).waitFor();
+    await continuityPanel.locator(".row.stuck [data-cid='11']").click();
+    await waitState(s => s?.tasks["11"]?.pending, "red reply remains pending until recovery");
+    // Wait for the actual landing and its durable deferred guard before
+    // unblocking the queue so this test cannot accidentally take the fresh path.
+    let deferred;
+    for (let i = 0; i < 80; i++) {
+      deferred = await worker.evaluate(async target => {
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        const guards = (await chrome.storage.session.get("tp-web-jump-tabs-v1"))["tp-web-jump-tabs-v1"] || {};
+        return tab?.url === target && guards[tab.id]?.deferredRead ? guards[tab.id] : null;
+      }, existing);
+      if (deferred) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(deferred, "red row did not retain exact landed deferred read");
+    assert.ok(deferred.revision.endsWith("message.m" + redStamp));
+    fixture.setQueueFault(false);
+    await nudgePrimary();
+    const redRead = await waitState(s => s?.tasks["11"]?.pending === false &&
+      s.tasks["11"].readRevision === deferred.revision, "exact red reply acknowledged after recovery");
+    assert.equal(redRead.tasks["11"].status, "seen");
+    await created.bringToFront();
+    // The selected red filter has no match. Manually opening a quiet group
+    // must not leak nonmatching historical/seen rows into filter results.
+    await red.filter({ hasText: /^0$/ }).waitFor();
+    if (await continuityGroup.getAttribute("aria-expanded") === "false") await continuityGroup.click();
+    assert.equal(await continuityPanel.locator(".task-open").count(), 0);
+    await red.click(); // restore all-rows view for the remaining original checks
+    console.log("Real red row jump defers exact read through 503, clears on recovery, and keeps zero-match filter exact");
 
     // Preserve the original logout test with an independent unread reply.
     await created.bringToFront();
