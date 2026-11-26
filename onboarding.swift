@@ -275,6 +275,90 @@ final class OnboardingController {
         }.resume()
     }
 
+    // MARK: - 首次初始化
+
+    private var bootstrapReady: ((Bootstrap.Plan) -> Void)?
+    private var bootstrapRetry: (() -> Void)?
+
+    /// 首次打开 App 时走这里：把 uv / Python / 配置 / 扩展准备到用户目录。
+    func showBootstrap(onReady: @escaping (Bootstrap.Plan) -> Void) {
+        bootstrapReady = onReady
+        show()
+        beginBootstrap()
+    }
+
+    /// 安装器把 TaskPulse.app 装到 ~/Applications 后再打开它。
+    func showInstalling(_ step: String = "安装到「应用程序」文件夹…") {
+        show()
+        renderBootstrapping(step)
+    }
+
+    func showInstallFailure(_ message: String, retry: @escaping () -> Void) {
+        bootstrapRetry = retry
+        show()
+        let s = newBody()
+        s.addArrangedSubview(label("TaskPulse 安装没完成", size: 16, weight: .semibold,
+                                   color: palette["attention"] ?? mainText))
+        s.addArrangedSubview(label(message, size: 11.5, color: mainText))
+        s.addArrangedSubview(actionButton("重试", #selector(retryBootstrap), key: "\r"))
+        s.addArrangedSubview(linkButton("打开日志目录", #selector(revealLogs)))
+        fitHeight()
+    }
+
+    private func beginBootstrap() {
+        renderBootstrapping("检查目录")
+        Bootstrap.run(progress: { [weak self] step in
+            self?.renderBootstrapping(step)
+        }, completion: { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case let .success(plan):
+                self.bootstrapReady?(plan)
+                self.renderChoice()
+            case let .failure(err):
+                // 失败原因同时写进日志，用户反馈时可以直接发文件
+                dbg("初始化失败：\(err)")
+                self.renderBootstrapFailed("\(err)")
+            }
+        })
+    }
+
+    private func renderBootstrapping(_ step: String) {
+        let s = newBody()
+        s.addArrangedSubview(label("正在准备运行环境", size: 16, weight: .semibold))
+        s.addArrangedSubview(label(
+            "第一次打开要把运行环境放到你的用户目录，通常十几秒（首次连内网装依赖会久一点）。"
+            + "不需要终端，也不需要预装 Python。",
+            size: 11.5, color: secondaryText))
+        let line = label("…  " + step, size: 12.5, color: mainText)
+        line.identifier = NSUserInterfaceItemIdentifier("bootstep")
+        s.addArrangedSubview(line)
+        fitHeight()
+    }
+
+    private func renderBootstrapFailed(_ message: String) {
+        bootstrapRetry = { [weak self] in self?.beginBootstrap() }
+        let s = newBody()
+        s.addArrangedSubview(label("初始化没完成", size: 16, weight: .semibold,
+                                   color: palette["attention"] ?? mainText))
+        s.addArrangedSubview(label(message, size: 11.5, color: mainText))
+        s.addArrangedSubview(label(
+            "常见原因：没连公司网络（装依赖要走内网源），或者系统拦下了 App 里的运行文件。"
+            + "处理好之后点「重试」，已经完成的部分不会重来。",
+            size: 10.5, color: secondaryText))
+        s.addArrangedSubview(actionButton("重试", #selector(retryBootstrap), key: "\r"))
+        s.addArrangedSubview(linkButton("打开日志目录", #selector(revealLogs)))
+        fitHeight()
+    }
+
+    @objc private func retryBootstrap() {
+        bootstrapRetry?()
+    }
+
+    @objc private func revealLogs() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs"))
+    }
+
     private func renderChoice() {
         let s = newBody()
         s.addArrangedSubview(label("TaskPulse 已装好", size: 16, weight: .semibold))

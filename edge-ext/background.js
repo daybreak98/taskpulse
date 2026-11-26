@@ -30,6 +30,22 @@ const BROWSER = (() => {
   return "unknown";
 })();
 
+let collectorPromise = null;
+let modeActionScope = "";
+function collectorId() {
+  if (!collectorPromise) {
+    collectorPromise = (async () => {
+      const key = "tp-desktop-collector";
+      const saved = await chrome.storage.local.get(key);
+      if (typeof saved[key] === "string" && saved[key].startsWith(BROWSER + "-")) return saved[key];
+      const id = BROWSER + "-" + crypto.randomUUID();
+      await chrome.storage.local.set({ [key]: id });
+      return id;
+    })().catch(() => { collectorPromise = null; return ""; });
+  }
+  return collectorPromise;
+}
+
 async function snapshot() {
   if (!SCOPE) return [];
   const [tabs, groups] = await Promise.all([
@@ -56,7 +72,7 @@ async function activeInfo() {
       t = tabs && tabs[0];
     }
     return {
-      url: (t && t.url) || "",
+      url: t?.status === "complete" && !t.discarded && !t.frozen && (!t.pendingUrl || t.pendingUrl === t.url) ? t.url || "" : "",
       tabId: (t && typeof t.id === "number") ? t.id : -1,
       focused: !!(w && w.focused)
     };
@@ -65,9 +81,15 @@ async function activeInfo() {
   }
 }
 
+let pushSeq = 0;
 async function push() {
   if (!SCOPE) return;
+  const seq = ++pushSeq;
+  const observedAt = Date.now();
+  const actionScope = modeActionScope;
   try {
+    const collector = await collectorId();
+    if (!collector) return;
     const [tabs, active] = await Promise.all([snapshot(), activeInfo()]);
     // web 段是排障用的自检：装上报里就能看出「为什么浏览器内取数没起来」
     let registered = [];
@@ -81,10 +103,11 @@ async function push() {
       pages: tabs.length,
       registered: registered,
     };
+    if (seq !== pushSeq) return;
     await fetch(ENDPOINT, {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ at: Date.now(), browser: BROWSER, tabs, active, web })
+      body: JSON.stringify({ at: observedAt, action_scope: actionScope, browser: BROWSER, collector, tabs, active, web })
     });
   } catch (_) {
     // TaskPulse 没在跑时静默失败
@@ -92,20 +115,22 @@ async function push() {
 }
 
 // 用户切到某个目标站点标签页 → 通知 TaskPulse 把对应任务标记为已查看
-async function notifyActive(tabId) {
+async function notifyActive(tabId, explicit = false, observedAt = Date.now()) {
+  const actionScope = modeActionScope;
   try {
+    const collector = await collectorId();
     const t = await chrome.tabs.get(tabId);
-    if (!t || !t.url || !ORIGIN || !t.url.startsWith(ORIGIN + "/")) return;
-    // 后台窗口里的程序化切标签不该算「用户在看」→ 带上窗口是否聚焦
-    let focused = false;
-    try {
-      const w = await chrome.windows.get(t.windowId);
-      focused = !!(w && w.focused);
-    } catch (_) {}
+    if (!collector || !t || !t.active || t.status !== "complete" ||
+        t.pendingUrl && t.pendingUrl !== t.url || !isConversationTab(t.url)) return;
+    const w = await chrome.windows.get(t.windowId);
+    const actual = await chrome.tabs.get(tabId);
+    if (!w?.focused || !actual?.active || actual.url !== t.url || actual.status !== "complete" ||
+        actual.pendingUrl && actual.pendingUrl !== actual.url) return;
     await fetch(ACTIVE_ENDPOINT, {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ url: t.url, focused, at: Date.now() })
+      body: JSON.stringify({ url: t.url, focused: true, at: observedAt, collector,
+        action_scope: actionScope, explicit })
     });
   } catch (_) {}
 }
@@ -127,69 +152,90 @@ function isConversationTab(url) {
   return rest === "" || rest[0] === "?" || rest[0] === "#" || rest[0] === "/";
 }
 
-async function closeTabsFor(map, expires) {
-  if (!!expires && Date.now() > expires) return 0;
+async function closeTabsFor(targets, expires, scope, collector) {
+  if (!scope || !collector || (expires && Date.now() > expires)) return 0;
   let closed = 0;
-  for (const cid of Object.keys(map || {})) {
-    const wanted = map[cid];
-    let hit = null;
-    const re = new RegExp("[?&]conversationId=" + cid + "(?:[&#]|$)");
-    if (typeof wanted === "number") {
-      try {
-        const t = await chrome.tabs.get(wanted);
-        if (t && isConversationTab(t.url) && re.test(t.url)) hit = t;
-      } catch (_) {}
-    }
-    if (!hit && SCOPE) {
-      try {
-        const tabs = await chrome.tabs.query({ url: SCOPE });
-        hit = tabs.find((t) => isConversationTab(t.url) && re.test(t.url));
-      } catch (_) {}
-    }
-    if (!hit) continue;
+  for (const [cid, wanted] of Object.entries(targets || {})) {
+    if (expires && Date.now() > expires) break;
+    if (typeof wanted.tabId !== "number" || !wanted.url || !wanted.revision) continue;
     try {
-      await chrome.tabs.remove(hit.id);
+      const r = await fetch(BASE + "/state", { cache: "no-store", headers: authHeaders(), signal: AbortSignal.timeout(2000) });
+      if (!r.ok) continue;
+      const state = await r.json();
+      if (state.action_scope !== scope || state.poller_error) break;
+      const row = (state.all || []).find(t => String(t.id) === cid);
+      if (!row || row.action_revision !== wanted.revision || row.stale || row.awaiting_reply ||
+          row.status === "running" || row.status === "stuck" || !row.has_tab) continue;
+      const tab = await chrome.tabs.get(wanted.tabId);
+      if (!tab || !matchesConversation(tab.url, cid, wanted.url) || tab.pendingUrl && tab.pendingUrl !== tab.url) continue;
+      if (expires && Date.now() > expires) break;
+      await chrome.tabs.remove(tab.id);
       closed += 1;
     } catch (_) {}
   }
   return closed;
 }
 
-async function focusConversation(cid, url, tabId, stale) {
-  const re = new RegExp("[?&]conversationId=" + cid + "(?:[&#]|$)");
+function matchesConversation(url, cid, targetUrl = "") {
+  if (!isConversationTab(url) || !/^\d+$/.test(cid)) return false;
+  try {
+    const actual = new URL(url).searchParams;
+    const values = actual.getAll("conversationId");
+    const agent = targetUrl ? new URL(targetUrl).searchParams.getAll("agentId") : [];
+    return values.length === 1 && values[0] === cid &&
+      (!agent.length || JSON.stringify(actual.getAll("agentId")) === JSON.stringify(agent));
+  } catch (_) { return false; }
+}
+
+async function arrived(tabId, cid, targetUrl) {
+  const t = await chrome.tabs.get(tabId).catch(() => null);
+  if (!t || !t.active || t.status !== "complete" || t.pendingUrl && t.pendingUrl !== t.url ||
+      !matchesConversation(t.url, cid, targetUrl)) return false;
+  const w = await chrome.windows.get(t.windowId).catch(() => null);
+  const after = await chrome.tabs.get(tabId).catch(() => null);
+  return !!w?.focused && !!after?.active && after.status === "complete" &&
+    (!after.pendingUrl || after.pendingUrl === after.url) && matchesConversation(after.url, cid, targetUrl);
+}
+
+async function waitForArrival(tabId, cid, targetUrl) {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    if (await arrived(tabId, cid, targetUrl)) return true;
+    const t = await chrome.tabs.get(tabId).catch(() => null);
+    if (!t || t.status === "complete" && t.url && t.url !== "about:blank" &&
+        !matchesConversation(t.url, cid, targetUrl) && !matchesConversation(t.pendingUrl, cid, targetUrl)) return false;
+    await sleep(100);
+  }
+  return false;
+}
+
+async function focusConversation(cid, url, tabId, expires, allowCreate = true) {
+  if (!matchesConversation(url, cid, url)) return "not_started";
+  const matches = t => t && (matchesConversation(t.url, cid, url) || matchesConversation(t.pendingUrl, cid, url));
   let hit = null;
-  // 优先用 TaskPulse 缓存的 tabId（单标签查询，比全量 query 快一个量级）
   if (typeof tabId === "number") {
     try {
       const t = await chrome.tabs.get(tabId);
-      if (t && t.url && re.test(t.url)) hit = t;
+      if (matches(t)) hit = t;
     } catch (_) {}
   }
   if (!hit && SCOPE) {
     const tabs = await chrome.tabs.query({ url: SCOPE });
-    hit = tabs.find((t) => t.url && re.test(t.url));
+    hit = tabs.find(matches);
+    if (!hit) hit = (await chrome.tabs.query({})).find(matches);
   }
-  // 过期命令一律不执行：后端已经用 AppleScript 兜底动过手了，
-  // 这里再切一次就是两个执行方做同一件事（评审要求二者互斥）
-  if (stale) return "expired";
-
+  if (expires && Date.now() > expires) return "expired";
   if (hit) {
-    // 切标签与把窗口激活到前台并行发起，省掉一次串行等待
-    const jobs = [chrome.tabs.update(hit.id, { active: true })];
-    if (typeof hit.windowId === "number") {
-      jobs.push(chrome.windows.update(hit.windowId, { focused: true }).catch(() => {}));
-    }
-    await Promise.all(jobs);
-    return "focused";
+    const current = await chrome.tabs.get(hit.id).catch(() => null);
+    if (!matches(current) || expires && Date.now() > expires) return "not_started";
+    await chrome.tabs.update(hit.id, { active: true });
+    if (typeof hit.windowId === "number") await chrome.windows.update(hit.windowId, { focused: true });
+    return await waitForArrival(hit.id, cid, url) ? "focused" : "unconfirmed";
   }
-
-  if (!url) return "expired";
-
-  // 这个会话没有自己的标签页。就用新标签打开，不去改动用户已经打开的页面：
-  // 覆盖式导航看似省一个标签，但会把用户正在看的会话换掉，行为不可预期。
-  // 上面两次查找已经按 URL 全量扫过，所以「找不到」是真的没有，不是映射过期。
-  await chrome.tabs.create({ url, active: true });
-  return "created";
+  if (!allowCreate) return "not_started";
+  const created = await chrome.tabs.create({ url, active: true });
+  if (typeof created.windowId === "number") await chrome.windows.update(created.windowId, { focused: true });
+  return await waitForArrival(created.id, cid, url) ? "created" : "unconfirmed";
 }
 
 // 长轮询：TaskPulse 点提示条时，命令在这里被毫秒级接走
@@ -199,32 +245,43 @@ async function listen() {
   listening = true;
   while (true) {
     try {
-      const r = await fetch(CMD_ENDPOINT, { cache: "no-store", headers: authHeaders() });
+      const collector = await collectorId();
+      if (!collector) { await sleep(1000); continue; }
+      const r = await fetch(CMD_ENDPOINT + "?collector=" + encodeURIComponent(collector), {
+        cache: "no-store", headers: authHeaders(), signal: AbortSignal.timeout(15000)
+      });
       if (r.status === 200) {
         const cmd = await r.json();
         if (cmd && cmd.cmd === "closeTabs") {
           let n = 0;
           try {
-            n = await closeTabsFor(cmd.tabIds || {}, cmd.expires);
+            if (cmd.collector === collector)
+              n = await closeTabsFor(cmd.targets || {}, cmd.expires, cmd.scope, collector);
           } catch (_) {}
           if (cmd.id) {
             try {
               await fetch(ACK_ENDPOINT + "?id=" + encodeURIComponent(cmd.id)
-                          + "&result=closed&n=" + n,
+                          + "&result=closed&n=" + n + "&collector=" + encodeURIComponent(collector),
                 { method: "POST", headers: authHeaders() });
             } catch (_) {}
           }
         }
         if (cmd && cmd.cmd === "focus" && cmd.cid) {
-          const stale = !!cmd.expires && Date.now() > cmd.expires;
           let how = "unknown";
           try {
-            how = await focusConversation(String(cmd.cid), cmd.url || "", cmd.tabId, stale);
+            if (cmd.scope) {
+              const mode = await fetch(BASE + "/mode", { cache: "no-store", headers: authHeaders(), signal: AbortSignal.timeout(3000) });
+              const current = mode.ok ? await mode.json() : {};
+              if (current.action_scope !== cmd.scope || cmd.collector !== collector) how = "not_started";
+              else how = await focusConversation(String(cmd.cid), cmd.url || "", cmd.tabId, cmd.expires, cmd.allowCreate !== false);
+            } else {
+              how = await focusConversation(String(cmd.cid), cmd.url || "", cmd.tabId, cmd.expires);
+            }
           } catch (_) {}
           if (cmd.id) {
             try {
               await fetch(ACK_ENDPOINT + "?id=" + encodeURIComponent(cmd.id)
-                          + "&result=" + encodeURIComponent(how),
+                          + "&result=" + encodeURIComponent(how) + "&collector=" + encodeURIComponent(collector),
                 { method: "POST", headers: authHeaders() });
             } catch (_) {}
           }
@@ -281,10 +338,10 @@ async function nudgeWebBridge() {
 // alarm 的最小周期在未打包扩展里也就 30 秒，页面被节流时数据会拖到半分钟以上。
 // 用自排队的 setTimeout 补到 15 秒；长轮询本身就占着 service worker，
 // 不会因为空闲被回收，alarm 只作为「被回收后叫醒」的兜底。
-const NUDGE_MS = 15000;
+const NUDGE_MS = 5000;
 function scheduleNudge() {
-  setTimeout(() => {
-    nudgeWebBridge().catch(() => void 0);
+  setTimeout(async () => {
+    try { await refreshSource(); await ensureLeader(); await nudgeWebBridge(); } catch (_) {}
     scheduleNudge();
   }, NUDGE_MS);
 }
@@ -322,7 +379,7 @@ chrome.tabs.onRemoved.addListener(() => ensureLeader());
 chrome.tabs.onCreated.addListener(() => ensureLeader());
 chrome.tabs.onUpdated.addListener((_tabId, info) => {
   if (!info) return;
-  if (info.discarded || info.status === "complete" || info.url) ensureLeader();
+  if (info.discarded !== undefined || info.frozen !== undefined || info.status === "complete" || info.url) ensureLeader();
 });
 
 chrome.alarms.create("tp-sync", { periodInMinutes: 0.5 });
@@ -371,22 +428,45 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     respond(API_CFG ? { api: API_CFG } : null);
     return;
   }
+  if (msg.kind === "tp-user-visit" && sender?.frameId === 0 && Number.isInteger(sender?.tab?.id)) {
+    void notifyActive(sender.tab.id, true, Number(msg.at) || 0);
+    respond({ ok: true });
+    return;
+  }
   if (msg.kind === "tp-role-ask") {
-    // 页面刚注入时自己来问一句：默认不开采集，否则五十个标签页会同时开火
-    const tabId = sender && sender.tab && sender.tab.id;
-    const leader = typeof tabId === "number" && tabId === leaderId && !pausedByApi;
-    if (leader) roleSent = true;
-    respond({ leader });
-    // 还没选过主（刚装好/刚唤醒）就顺手补一次，问话的那一页也可能是该干活的那页
+    const tabId = sender?.tab?.id;
+    const leader = typeof tabId === "number" && tabId === leaderId && sender?.frameId === 0 &&
+      isConversationTab(sender.url) && !pausedByApi && !!modeGeneration && typeof msg.pageId === "string";
+    if (leader) {
+      if (leaderPageId && leaderPageId !== msg.pageId) roleLease = crypto.randomUUID();
+      leaderPageId = msg.pageId;
+      roleSent = roleKey();
+    }
+    respond({ leader, generation: modeGeneration, lease: roleLease });
     if (!leaderReady || leaderId === -1) ensureLeader();
     return;
   }
   if (msg.kind === "webstate" && msg.payload) {
-    fetch(WEBSTATE_ENDPOINT, {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify(msg.payload)
-    }).then(() => respond({ ok: true })).catch(() => respond({ ok: false }));
+    if (pausedByApi || sender?.tab?.id !== leaderId || sender?.frameId !== 0 || !isConversationTab(sender.url) ||
+        msg.pageId !== leaderPageId || msg.lease !== roleLease || msg.payload.generation !== modeGeneration) {
+      respond({ ok: false });
+      return;
+    }
+    const lease = roleLease;
+    void (async () => {
+      const collector = await collectorId();
+      if (!collector || lease !== roleLease || pausedByApi) return respond({ ok: false });
+      const r = await fetch(WEBSTATE_ENDPOINT, {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ ...msg.payload, browser: BROWSER, collector })
+      });
+      const result = await r.json();
+      if (result.ignored === "old generation" || result.ignored === "other collector") {
+        void refreshSource().catch(() => {});
+      }
+      respond({ ok: r.ok && !result.ignored });
+    })().catch(() => respond({ ok: false }));
     return true;
   }
 });
@@ -397,15 +477,26 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
 const LEADER_KEY = "tp-leader-tab";
 let leaderId = -1;        // 当前负责采集的标签页
 let leaderReady = false;  // 是否已从 storage.session 读回上次的选主结果
-let pausedByApi = false;  // api 模式下 TaskPulse 自己取数，页面不必再采集
-let roleSent = null;      // 已通知过 leader 的角色，稳定状态下不再重复发消息
+let pausedByApi = true;
+let modeGeneration = "";
+let roleLease = crypto.randomUUID();
+let leaderPageId = "";
+let roleSent = null;
+let roleSending = null;
+const roleKey = () => roleLease + ":" + modeGeneration + ":" + String(!pausedByApi);
 let electing = null;      // 在途的选主，避免事件成串时重复选
 let electAgain = false;
 
-function postRole(tabId, leader) {
+async function postRole(tabId, leader) {
+  const key = roleKey();
+  const lease = roleLease;
+  const generation = modeGeneration;
   try {
-    const p = chrome.tabs.sendMessage(tabId, { kind: "tp-role", leader });
-    if (p && p.catch) p.catch(() => void 0);
+    const result = await chrome.tabs.sendMessage(tabId, { kind: "tp-role", leader, generation, lease }, { frameId: 0 });
+    if (tabId === leaderId && key === roleKey() && typeof result?.pageId === "string") {
+      leaderPageId = result.pageId;
+      roleSent = key;
+    }
   } catch (_) {}
 }
 
@@ -428,10 +519,12 @@ async function restoreLeader() {
 
 function syncRole() {
   if (leaderId === -1) return;
-  const want = !pausedByApi;
-  if (roleSent === want) return;
-  roleSent = want;
-  postRole(leaderId, want);
+  const key = roleKey();
+  if (roleSent === key || roleSending === key) return;
+  roleSending = key;
+  void postRole(leaderId, !pausedByApi && !!modeGeneration).finally(() => {
+    if (roleSending === key) roleSending = null;
+  });
 }
 
 function applyLeader(next) {
@@ -441,9 +534,11 @@ function applyLeader(next) {
   }
   const prev = leaderId;
   leaderId = next;
-  roleSent = null;   // 换了页面，新 leader 要从头通知一次
+  roleLease = crypto.randomUUID();
+  leaderPageId = "";
+  roleSent = null;
   persistLeader(next);
-  if (prev !== -1) postRole(prev, false);   // 老 leader 立刻停手，不等它自己发现
+  if (prev !== -1) void postRole(prev, false);
   syncRole();
 }
 
@@ -451,7 +546,7 @@ async function pickLeader(tabs) {
   // discarded 的页面里没有 content script 在跑，敲了也不动；
   // status 不到 complete 的还在加载，dom 都还没稳，同样采不到东西
   const usable = tabs.filter((t) =>
-    typeof t.id === "number" && !t.discarded && t.status === "complete");
+    typeof t.id === "number" && !t.discarded && !t.frozen && t.status === "complete" && isConversationTab(t.url));
   if (!usable.length) return -1;
 
   let focusedWin = -1;
@@ -490,7 +585,7 @@ async function doEnsureLeader() {
   if (leaderId !== -1) {
     const cur = alive.get(leaderId);
     // 粘性：leader 还活着就不要换，否则用户每切一次标签都要重新拉一遍会话列表
-    if (cur && !cur.discarded && cur.status === "complete") next = leaderId;
+    if (cur && !cur.discarded && !cur.frozen && cur.status === "complete" && isConversationTab(cur.url)) next = leaderId;
   }
   if (next === -1) next = await pickLeader(tabs);
   applyLeader(next);
@@ -517,19 +612,28 @@ function ensureLeader() {
 
 // api 模式下页面采到的数据没人用，继续拉只是白发请求；所以定时看一眼来源，
 // 切到 api 就收走 leader 的采集权，切回 web 再发还。
+let modeRequest = 0;
 async function refreshSource() {
   if (!API_CFG) return;
-  let src = "";
+  const request = ++modeRequest;
+  let data, collector;
   try {
-    const r = await fetch(BASE + "/mode", { cache: "no-store", headers: authHeaders() });
-    if (r.ok) src = String(((await r.json()) || {}).source || "");
-  } catch (_) {
-    return;   // TaskPulse 没在跑：维持现状，别把采集权误收走
+    collector = await collectorId();
+    const r = await fetch(BASE + "/mode", { cache: "no-store", headers: authHeaders(), signal: AbortSignal.timeout(4000) });
+    if (!r.ok) return;
+    data = await r.json();
+  } catch (_) { return; }
+  if (request !== modeRequest || !collector || !["api", "web"].includes(data?.source) ||
+      typeof data.generation !== "string") return;
+  modeActionScope = typeof data.action_scope === "string" ? data.action_scope : "";
+  const paused = data.source !== "web" || !!data.collector && data.collector !== collector;
+  if (paused !== pausedByApi || modeGeneration !== data.generation) {
+    pausedByApi = paused;
+    modeGeneration = data.generation;
+    roleLease = crypto.randomUUID();
+    leaderPageId = "";
+    roleSent = null;
   }
-  if (src !== "api" && src !== "web") return;   // 老版本没有 /mode，别乱动
-  const paused = src === "api";
-  if (paused === pausedByApi) return;
-  pausedByApi = paused;
   syncRole();
 }
 

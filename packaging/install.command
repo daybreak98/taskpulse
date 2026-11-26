@@ -261,11 +261,9 @@ cp poller.py "$DEST/"
 rm -rf "$DEST/edge-ext"
 cp -R edge-ext "$DEST/"
 # 配套脚本都留一份到安装目录：用户以后自查、登录、卸载，都不必再找回当初解压的包
-for f in uninstall.command health_check.sh api_check.command api_login.command; do
+for f in uninstall.command health_check.sh api_check.command api_login.command api_runtime.sh; do
   [ -f "$f" ] && cp "$f" "$DEST/" && chmod +x "$DEST/$f"
 done
-# 去掉 Gatekeeper 隔离标记，避免「已损坏，无法打开」
-xattr -dr com.apple.quarantine "$HOME/Applications/$APP_NAME.app" 2>/dev/null
 
 # ---------- 4.5 本机接口密钥：生成并交给扩展 ----------
 # poller / App / 浏览器扩展三方共用这一把钥匙。它只存在本机家目录里：

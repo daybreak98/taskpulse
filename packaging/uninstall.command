@@ -18,6 +18,7 @@ rm -rf "$HOME/Applications/TaskPulse.app" \
        "$HOME/Applications/TaskPulse"
 rm -f "$HOME/Desktop/TaskPulse"
 rm -f "$HOME/.taskpulse/runtime.json"
+rm -f "$HOME/.taskpulse/installer.lock" "$HOME/.taskpulse/ui.lock"
 defaults delete com.hyj.taskpulse 2>/dev/null
 # 状态文件按需保留（里面有你的任务历史）
 echo "-- 已卸载（含后台项目登记与界面偏好）。"

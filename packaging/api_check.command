@@ -7,9 +7,8 @@ cd "$(dirname "$0")" || exit 1
 CFG="$HOME/.taskpulse/config.json"
 TOKEN_FILE="$HOME/.taskpulse/token"
 WEBSTATE="$HOME/.taskpulse/webstate.json"
-UV="$HOME/.local/bin/uv"
-[ -x "$UV" ] || UV="$(command -v uv || true)"
-PY() { "$UV" run --quiet --no-project --python ">=3.10" python "$@"; }
+
+. ./api_runtime.sh || exit 1
 
 # 端口必须来自实际配置：当前后台就是按这份配置监听的
 PORT="$(PY -c '
@@ -24,9 +23,6 @@ say() { printf '%-8s %s\n' "$1" "$2"; }
 api() { curl -s -m 4 -H "X-TP-Token: $(cat "$TOKEN_FILE" 2>/dev/null)" "http://127.0.0.1:${PORT}$1" ${2:-} 2>/dev/null; }
 
 echo "== TaskPulse 自检 =="
-
-# poller.py 与脚本通常同目录（安装后就是这样）；在仓库里直接跑时它在上一级
-[ -f "poller.py" ] || cd .. || exit 1
 
 # ── 0. 服务在不在 ────────────────────────────────────────────────
 if ! api /mode >/dev/null 2>&1; then
@@ -78,8 +74,7 @@ except Exception:
 USER_NAME="$(printf '%s' "$IDENT" | awk '{print $1}')"
 ISSUER="$(printf '%s' "$IDENT" | awk '{print $2}')"
 AUD="$(printf '%s' "$IDENT" | awk '{print $3}')"
-SDK_VER="$("$UV" run --quiet --no-project --python ">=3.10" --with 'ks-aimate>=1.4.0' \
-  --index https://pypi.corp.kuaishou.com/kuaishou/prod/+simple/ \
+SDK_VER="$("${API_RUN[@]}" \
   python -c 'from importlib.metadata import version; print(version("ks_aimate"))' 2>/dev/null | tail -1)"
 say "客户端" "${APP}（票据签发方 ${ISSUER}）"
 say "登录账号" "${USER_NAME}"
@@ -127,13 +122,10 @@ case "$CODE" in
 esac
 
 # ── 2. 直连取数（和常驻服务完全同一套参数）────────────────────────
-RESULT="$("$UV" run --quiet --no-project --python ">=3.10" \
-  --with 'ks-aimate>=1.4.0' \
-  --index https://pypi.corp.kuaishou.com/kuaishou/prod/+simple/ \
-  python - "$CFG" <<'PY' 2>&1 | tail -1
+RESULT="$("${API_RUN[@]}" python - "$CFG" "$POLLER_PATH" <<'PY' 2>&1 | tail -1
 import importlib.util, os, sys
 os.environ["TASKPULSE_CONFIG"] = sys.argv[1]
-spec = importlib.util.spec_from_file_location("tp", "poller.py")
+spec = importlib.util.spec_from_file_location("tp", sys.argv[2])
 m = importlib.util.module_from_spec(spec)
 try:
     spec.loader.exec_module(m)
