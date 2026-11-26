@@ -10,21 +10,68 @@
   const clamp = (value, lo, hi) => Math.min(Math.max(value, lo), Math.max(lo, hi));
   const normalized = value => ({
     x: Number.isFinite(value?.x) ? clamp(value.x, 0, 1) : 1,
-    y: Number.isFinite(value?.y) ? clamp(value.y, 0, 1) : null
+    y: Number.isFinite(value?.y) ? clamp(value.y, 0, 1) : null,
+    ...(value?.edge === "top" ? { edge: "top" } : {})
   });
+  // One geometry for every presentation, including the expanded header.
+  // The vertical capsule is an exact 90-degree rotation; digits stay upright.
+  const pill = Object.freeze({ long: 96, short: 28 });
+  const pillSize = horizontal => horizontal ? { width: pill.long, height: pill.short } :
+    { width: pill.short, height: pill.long };
+  function move(value, dx, dy, w, h) {
+    const p = normalized(value), wasTop = p.edge === "top";
+    const before = pillSize(wasTop);
+    const oldW = Math.min(w, before.width), oldH = Math.min(h, before.height);
+    const x = p.x * Math.max(0, w - oldW) + oldW / 2 + dx;
+    const y = (wasTop ? 8 : p.y === null ? 22 : p.y * Math.max(0, h - oldH)) + dy;
+    const edge = y <= (wasTop ? 64 : 42) ? "top" : "";
+    const after = pillSize(Boolean(edge));
+    const cw = Math.min(w, after.width), ch = Math.min(h, after.height);
+    return { x: clamp((x - cw / 2) / Math.max(1, w - cw), 0, 1),
+      y: edge ? 0 : clamp(y / Math.max(1, h - ch), 0, 1), ...(edge ? { edge } : {}) };
+  }
   function place(value, viewportWidth, viewportHeight, width, height) {
     const p = normalized(value);
-    // The default remains the original right-edge, 22px top capsule.
     const anchorX = p.x * Math.max(0, viewportWidth - 44);
     const anchorY = p.y === null ? 22 : p.y * Math.max(0, viewportHeight - 84);
     return { left: Math.round(clamp(anchorX - (width - 44) * p.x, 0, viewportWidth - width)),
       top: Math.round(clamp(anchorY, 0, viewportHeight - height)) };
   }
-  function move(value, dx, dy, w, h) {
-    const p = normalized(value);
-    const x = p.x * Math.max(0, w - 44), y = p.y === null ? 22 : p.y * Math.max(0, h - 84);
-    return { x: clamp((x + dx) / Math.max(1, w - 44), 0, 1),
-      y: clamp((y + dy) / Math.max(1, h - 84), 0, 1) };
+  const rect = (left, top, width, height) => ({
+    left: Math.round(left), top: Math.round(top), width: Math.round(width), height: Math.round(height)
+  });
+  function glassLayout(value, w, h, expanded = false, panelHeight = 0) {
+    const p = normalized(value), horizontal = p.edge === "top";
+    w = Math.max(1, Math.round(w)); h = Math.max(1, Math.round(h));
+    const size = pillSize(horizontal);
+    const cw = Math.min(w, size.width), ch = Math.min(h, size.height);
+    const x = Math.round(p.x * (w - cw));
+    const y = Math.round(clamp(horizontal ? 8 : p.y === null ? 22 : p.y * (h - ch), 0, h - ch));
+    if (expanded) {
+      // Restore the original replacement interaction: the panel occupies
+      // the capsule's anchor, with a horizontal counter inside its header.
+      // Cover the previous capsule so hover expansion cannot flicker.
+      const pw = Math.min(240, w);
+      const ph = Math.min(h, Math.max(ch, Math.round(panelHeight) || 0));
+      const left = clamp(x - (pw - cw) * p.x, 0, w - pw);
+      const top = clamp(y, 0, h - ph);
+      return { ...rect(left, top, pw, ph), horizontal, capsule: null, panel: rect(0, 0, pw, ph) };
+    }
+    return { ...rect(x, y, cw, ch), horizontal, capsule: rect(0, 0, cw, ch), panel: null };
+  }
+  // Clip to the rounded shapes, not to their bounding rectangles: a
+  // rectangular iframe clip leaves visibly cut-off shadow corners on light pages.
+  function glassClip(layout) {
+    const rounded = (r, radius) => {
+      const x = r.left, y = r.top, right = x + r.width, bottom = y + r.height;
+      const k = Math.min(radius, r.width / 2, r.height / 2);
+      if (!k) return "M" + x + " " + y + "H" + right + "V" + bottom + "H" + x + "Z";
+      const arc = (a, b) => "A" + k + " " + k + " 0 0 1 " + a + " " + b;
+      return "M" + (x + k) + " " + y + "H" + (right - k) + arc(right, y + k) +
+        "V" + (bottom - k) + arc(right - k, bottom) + "H" + (x + k) +
+        arc(x, bottom - k) + "V" + (y + k) + arc(x + k, y) + "Z";
+    };
+    return "path('" + (layout.panel ? rounded(layout.panel, 12) : rounded(layout.capsule, 999)) + "')";
   }
   function ordinary(value) {
     try {
@@ -61,5 +108,5 @@
     if (match && (!match.agentId || match.agentId === task.agentId)) return match;
     return { key: "closed:" + platform, name: "未打开 · " + platform, color: "" };
   }
-  globalThis.TaskPulseUI = { keys, origins, normalized, place, move, ordinary, buildGroups, groupFor };
+  globalThis.TaskPulseUI = { keys, origins, normalized, place, move, pill, glassLayout, glassClip, ordinary, buildGroups, groupFor };
 })();

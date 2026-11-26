@@ -1493,10 +1493,11 @@ test("drag position preserves original default and clamps across viewport and pa
   assert.deepEqual(ui.place(undefined, 1400, 880, 44, 84), { left: 1356, top: 22 });
   assert.deepEqual(ui.place(undefined, 1400, 880, 240, 200), { left: 1160, top: 22 });
   const position = ui.move(undefined, -200, 100, 1400, 880);
-  assert.deepEqual(ui.place(position, 1400, 880, 44, 84), { left: 1156, top: 122 });
+  const moved = ui.glassLayout(position, 1400, 880);
+  assert.deepEqual({ left: moved.left, top: moved.top }, { left: 1172, top: 122 });
   const small = ui.place(position, 320, 240, 240, 200);
   assert.ok(small.left >= 0 && small.left <= 80 && small.top >= 0 && small.top <= 40);
-  assert.deepEqual(ui.move(undefined, 1e6, -1e6, 1400, 880), { x: 1, y: 0 });
+  assert.deepEqual(ui.move(undefined, 1e6, -1e6, 1400, 880), { x: 1, y: 0, edge: "top" });
 });
 
 test("global presentation is opt-in; external frame needs same-tab opaque registration", async () => {
@@ -1653,4 +1654,36 @@ test("hidden active collector is nudged without a second lease and stops waking 
   await app.deliver({ ...replyReport(now + 5_000, now + 4_000, "finished"), hidden: true });
   assert.equal(currentTask(app).pending, true);
   assert.equal(timers.size, 0);
+});
+
+test("top and side pills are exact rotations; expansion replaces the capsule with one rounded panel", () => {
+  const side = ui.glassLayout(undefined, 1400, 880);
+  assert.deepEqual(ui.pill, { long: 96, short: 28 });
+  assert.deepEqual(side.capsule, { left: 0, top: 0, width: 28, height: 96 });
+  const top = ui.move(undefined, -600, -90, 1400, 880);
+  const a = ui.glassLayout(top, 1400, 880);
+  assert.equal(a.horizontal, true);
+  assert.equal(a.top, 8);
+  assert.deepEqual(a.capsule, { left: 0, top: 0, width: side.capsule.height, height: side.capsule.width });
+  const b = ui.glassLayout(top, 1400, 880, true, 220);
+  assert.equal(b.capsule, null);
+  assert.deepEqual(b.panel, { left: 0, top: 0, width: 240, height: 220 });
+  assert.equal(b.top, a.top);
+  assert.ok(b.left <= a.left && b.left + b.width >= a.left + a.width);
+  assert.ok(ui.glassClip(b).includes("A12 12 0 0 1"));
+  assert.ok(!ui.glassClip(b).includes("A14 14 0 0 1"));
+  assert.ok(ui.glassClip(a).includes("A14 14 0 0 1"));
+  assert.ok(ui.glassClip(side).includes("A14 14 0 0 1"));
+  const back = ui.move(top, 400, 240, 1400, 880);
+  const c = ui.glassLayout(back, 1400, 880);
+  assert.equal(c.horizontal, false);
+  assert.equal(c.width, 28);
+  assert.equal(c.height, 96);
+  const panel = ui.glassLayout(back, 1400, 880, true, 60);
+  assert.equal(panel.capsule, null);
+  assert.ok(panel.left <= c.left && panel.left + panel.width >= c.left + c.width);
+  assert.ok(panel.top <= c.top && panel.top + panel.height >= c.top + c.height);
+  const clamped = ui.glassLayout(top, 320, 180, true, 1000);
+  assert.ok(clamped.left >= 0 && clamped.top >= 0 && clamped.left + clamped.width <= 320 && clamped.top + clamped.height <= 180);
+  assert.deepEqual(ui.glassLayout(top, 1400, 880), a);
 });

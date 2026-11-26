@@ -131,13 +131,40 @@ async function trial() {
     const panel = page.locator(root + " .panel");
     const horizontal = panel.locator(".horizontal");
     await compact.locator("[data-filter='running']").filter({ hasText: /^1$/ }).waitFor({ timeout: 16_000 });
-    assert.deepEqual(await compact.boundingBox(), { x: 1356, y: 22, width: 44, height: 84 });
+    const vertical = await compact.boundingBox();
+    assert.deepEqual(vertical, { x: 1372, y: 22, width: 28, height: 96 });
+    const pillFont = await compact.locator(".number").first().evaluate(el => getComputedStyle(el).fontSize);
+    assert.equal(pillFont, "16px");
     await compact.hover();
-    await horizontal.waitFor();
-    assert.deepEqual(await horizontal.boundingBox(), { x: 1170, y: 24, width: 96, height: 24 });
+    await panel.waitFor({ state: "visible" });
+    await compact.waitFor({ state: "hidden" });
+    assert.deepEqual(await horizontal.boundingBox(), { x: 1172, y: 26, width: vertical.height, height: vertical.width });
+    assert.equal(await horizontal.locator(".number").first().evaluate(el => getComputedStyle(el).fontSize), pillFont);
+    assert.equal(await panel.locator(".panel-title, .glass-bridge").count(), 0);
     assert.equal((await panel.boundingBox()).width, 240);
     assert.equal(await panel.locator("[data-mode='dataagent']").getAttribute("aria-pressed"), "true");
     assert.equal(await panel.locator(".footer span").textContent(), "WEB");
+    await page.mouse.move(600, 400);
+    await panel.waitFor({ state: "hidden" });
+    const initial = await compact.boundingBox();
+    await page.mouse.move(initial.x + initial.width / 2, initial.y + initial.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(700, 7, { steps: 10 });
+    await page.mouse.up();
+    await compact.locator("[data-filter='running']").waitFor();
+    for (let i = 0; i < 30 && !(await compact.getAttribute("class")).includes("dock-horizontal"); i++)
+      await new Promise(r => setTimeout(r, 50));
+    const top = await compact.boundingBox();
+    assert.equal(top.width, vertical.height); assert.equal(top.height, vertical.width); assert.equal(top.y, 8);
+    assert.equal(await compact.locator(".number").first().evaluate(el => getComputedStyle(el).fontSize), pillFont);
+    await compact.hover();
+    await panel.waitFor({ state: "visible" });
+    await compact.waitFor({ state: "hidden" });
+    assert.equal((await panel.boundingBox()).y, top.y);
+    assert.equal((await horizontal.boundingBox()).height, top.height);
+    assert.equal((await horizontal.boundingBox()).width, top.width);
+    // Restore the legacy location for the existing behavioral checks.
+    await worker.evaluate(() => chrome.storage.local.remove("tp-web-position"));
     await page.mouse.move(600, 400);
     await panel.waitFor({ state: "hidden" });
     await compact.hover();
@@ -316,6 +343,42 @@ async function trial() {
     assert.equal(await external2.locator("#underlying").textContent(), "clicked");
     assert.equal(await external2.evaluate(() => document.getElementById("taskpulse-global-host")?.shadowRoot === null), true);
     assert.equal(await external2.evaluate(() => document.body.innerText.includes("验证 Spark 分区更新")), false);
+    assert.equal(await frame2.evaluate(() => getComputedStyle(document.documentElement).backgroundColor), "rgba(0, 0, 0, 0)");
+    assert.equal(await frame2.evaluate(() => getComputedStyle(document.documentElement).colorScheme), "light");
+    const capsule2 = frame2.locator(root + " .compact");
+    const panel2 = frame2.locator(root + " .panel");
+    const headerCapsule = panel2.locator(".horizontal");
+    await capsule2.waitFor({ state: "hidden" });
+    assert.equal((await headerCapsule.boundingBox()).height, 28);
+    const rect2 = await panel2.locator(".header-blank").boundingBox();
+    const fromX = rect2.x + rect2.width / 2, fromY = rect2.y + rect2.height / 2;
+    await external2.mouse.move(fromX, fromY);
+    await external2.mouse.down();
+    // Let the cross-origin start message install its drag shield. This is
+    // normal pointer input, not synthetic dispatch into the extension.
+    await new Promise(r => setTimeout(r, 50));
+    for (let step = 1; step <= 12; step++) {
+      await external2.mouse.move(fromX + (700 - fromX) * step / 12, fromY + (5 - fromY) * step / 12);
+      await new Promise(r => setTimeout(r, 17));
+    }
+    await external2.mouse.up();
+    let dockPosition;
+    for (let i = 0; i < 50; i++) {
+      dockPosition = await worker.evaluate(async () => (await chrome.storage.local.get("tp-web-position"))["tp-web-position"]);
+      if (dockPosition?.edge === "top" && (await panel2.boundingBox())?.y === 8) break;
+      await new Promise(r => setTimeout(r, 50));
+    }
+    assert.equal(dockPosition?.edge, "top", JSON.stringify(dockPosition));
+    assert.equal((await panel2.boundingBox()).y, 8);
+    // Collapse at the new dock and verify the standalone rotated pill.
+    await panel2.locator(".close").click();
+    await capsule2.waitFor({ state: "visible" });
+    const docked = await capsule2.boundingBox();
+    assert.equal(docked.width, vertical.height); assert.equal(docked.height, vertical.width); assert.equal(docked.y, 8);
+    await capsule2.hover();
+    await panel2.waitFor({ state: "visible" });
+    await panel2.locator(".pin").click();
+    await worker.evaluate(value => chrome.storage.local.set({ "tp-web-position": value }), position);
     console.log("Global isolated capsule drag, persistence across tabs and ordinary page interaction passed");
 
     // The active collector is allowed to be hidden while the user works

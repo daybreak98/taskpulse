@@ -28,6 +28,8 @@
   const host = document.createElement("div");
   host.id = hostId;
   host.dataset.surface = native ? "native" : side ? "side" : frameMode;
+  host.style.setProperty("--pill-long", ui.pill.long + "px");
+  host.style.setProperty("--pill-short", ui.pill.short + "px");
   const root = host.attachShadow({ mode: "open" });
 
   function counter(layout) {
@@ -60,6 +62,7 @@
   const box = root.querySelector(".window");
   const compact = root.querySelector(".compact");
   const panel = root.querySelector(".panel");
+  const header = root.querySelector(".header"), footer = root.querySelector(".footer");
   const pin = root.querySelector(".pin");
   const note = root.querySelector(".note");
   const list = root.querySelector(".groups");
@@ -81,8 +84,8 @@
   let hoverTimer = null;
   let panelClock = null;
   let position, groupMode = "dataagent", tabGroups = {};
-  let viewport = { width: innerWidth, height: innerHeight };
-  let lastSize = "", drag = null, dragFrame = 0, suppressClickUntil = 0;
+  let viewport = { width: innerWidth, height: innerHeight }, frameGeometryReady = !frame;
+  let lastSize = "", drag = null, dragFrame = 0, suppressClickUntil = 0, gestureSerial = 0;
   let styled = false, prefsChanged = new Set(), toastLoaded = !toastOnly;
   const groupButtons = [...root.querySelectorAll("[data-mode]")];
 
@@ -345,14 +348,26 @@
       if (key !== lastSize) { lastSize = key; post({ type: "tp-frame-size", height }); }
       return;
     }
-    const rect = box.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
+    if (side || !frameGeometryReady) return;
+    const w = frame ? viewport.width : innerWidth, h = frame ? viewport.height : innerHeight;
+    // Measure natural row height, not the previously constrained scroll area.
+    // This lets the panel shrink on filter changes and prevents resize loops.
+    const naturalListHeight = 10 + [...list.children].reduce((sum, node, index) =>
+      sum + node.offsetHeight + (index && node.classList.contains("group") ? 4 : 0), 0);
+    const panelHeight = expanded ? header.offsetHeight + footer.offsetHeight + note.offsetHeight + naturalListHeight : 0;
+    const layout = ui.glassLayout(position, w, h, expanded, panelHeight);
+    compact.classList.toggle("dock-horizontal", layout.horizontal);
+    const setRect = (node, r) => {
+      if (r) Object.assign(node.style, { left: r.left + "px", top: r.top + "px",
+        width: r.width + "px", height: r.height + "px" });
+    };
+    setRect(compact, layout.capsule);
+    setRect(panel, layout.panel);
+    Object.assign(box.style, { left: (frame ? 0 : layout.left) + "px", top: (frame ? 0 : layout.top) + "px",
+      right: "auto", width: layout.width + "px", height: layout.height + "px" });
     if (frame) {
-      const key = rect.width + "/" + rect.height;
-      if (key !== lastSize) { lastSize = key; post({ type: "tp-frame-size", width: rect.width, height: rect.height }); }
-    } else if (native) {
-      const p = ui.place(position, innerWidth, innerHeight, rect.width, rect.height);
-      Object.assign(box.style, { left: p.left + "px", top: p.top + "px", right: "auto" });
+      const key = JSON.stringify([layout.width, layout.height, expanded, panelHeight]);
+      if (key !== lastSize) { lastSize = key; post({ type: "tp-frame-size", expanded, panelHeight }); }
     }
   }
 
@@ -379,7 +394,7 @@
       button.title = names[kind] + " · " + (view.stale ? "待更新" : value);
       button.setAttribute("aria-label", button.title);
     }
-    compact.hidden = expanded;
+    compact.hidden = side || expanded;
     panel.hidden = !expanded;
     for (const button of groupButtons) button.setAttribute("aria-pressed", String(button.dataset.mode === groupMode));
     pin.setAttribute("aria-pressed", String(pinned));
@@ -441,43 +456,59 @@
       hoverTimer = setTimeout(() => setExpanded(false), 150);
     }
   });
-  // Drag the compact capsule or the header's blank handle. Normal button
-  // clicks retain their existing filter/navigation semantics.
+  // The cross-origin iframe moves during a drag. Chromium may transfer
+  // pointer events to its parent when its clipped hit region changes. Start
+  // the parent gesture on pointerdown, so it can continue the same drag.
   box.addEventListener("pointerdown", event => {
-    if (side || toastOnly || event.button !== 0 || !event.target.closest(".compact,.header-blank")) return;
+    if (event.button !== 0) return;
+    // A new deliberate click is not the synthetic click from a prior drag.
+    suppressClickUntil = 0;
+    if (side || toastOnly || drag || !event.target.closest(".compact,.horizontal,.header-blank")) return;
     clearTimeout(hoverTimer);
-    drag = { pointer: event.pointerId, x: event.screenX, y: event.screenY,
-      start: ui.normalized(position), dx: 0, dy: 0, moved: false, sent: false };
+    drag = { pointer: event.pointerId, gesture: ++gestureSerial, x: event.screenX, y: event.screenY,
+      start: ui.normalized(position), dx: 0, dy: 0, moved: false, target: event.target };
+    if (frame) post({ type: "tp-frame-drag-start", gesture: drag.gesture, x: drag.x, y: drag.y });
     try { event.target.setPointerCapture(event.pointerId); } catch {}
   });
   function applyDrag(done = false) {
-    if (!drag?.moved) return;
+    if (!drag) return;
     if (frame) {
-      post({ type: "tp-frame-drag", dx: drag.dx, dy: drag.dy, start: !drag.sent, done });
-      drag.sent = true;
-    } else {
+      post({ type: "tp-frame-drag", gesture: drag.gesture,
+        x: drag.x + drag.dx, y: drag.y + drag.dy, done });
+    } else if (drag.moved) {
       position = ui.move(drag.start, drag.dx, drag.dy, innerWidth, innerHeight);
       layoutSurface();
       if (done) void chrome.storage.local.set({ [ui.keys.position]: position }).catch(() => {});
     }
   }
+  function measureDrag(event) {
+    drag.dx = event.screenX - drag.x; drag.dy = event.screenY - drag.y;
+    drag.moved ||= Math.hypot(drag.dx, drag.dy) >= 5;
+  }
+  function clearDrag(moved = false) {
+    if (dragFrame) cancelAnimationFrame(dragFrame);
+    dragFrame = 0;
+    if (moved || drag?.moved) suppressClickUntil = Date.now() + 350;
+    const previous = drag;
+    drag = null;
+    try {
+      if (previous?.target.hasPointerCapture(previous.pointer)) previous.target.releasePointerCapture(previous.pointer);
+    } catch {}
+  }
   box.addEventListener("pointermove", event => {
     if (!drag || event.pointerId !== drag.pointer) return;
-    drag.dx = event.screenX - drag.x; drag.dy = event.screenY - drag.y;
-    if (!drag.moved && Math.hypot(drag.dx, drag.dy) < 5) return;
-    drag.moved = true;
+    measureDrag(event);
+    if (!drag.moved) return;
     event.preventDefault();
     if (!dragFrame) dragFrame = requestAnimationFrame(() => { dragFrame = 0; applyDrag(); });
   });
   function endDrag(event) {
     if (!drag || event.pointerId !== drag.pointer) return;
+    if (event.type === "pointerup") measureDrag(event);
     if (dragFrame) cancelAnimationFrame(dragFrame);
     dragFrame = 0;
-    if (drag.moved) {
-      suppressClickUntil = Date.now() + 350;
-      applyDrag(true);
-    }
-    drag = null;
+    applyDrag(true);
+    clearDrag();
   }
   box.addEventListener("pointerup", endDrag);
   box.addEventListener("pointercancel", endDrag);
@@ -566,7 +597,7 @@
     }
     if (changes[ui.keys.position] || changes[ui.keys.grouping] || changes[ui.keys.tabGroups]) {
       for (const key of [ui.keys.position, ui.keys.grouping, ui.keys.tabGroups]) if (changes[key]) prefsChanged.add(key);
-      if (changes[ui.keys.position] && !drag) position = changes[ui.keys.position].newValue;
+      if (changes[ui.keys.position] && !drag && !frame) position = changes[ui.keys.position].newValue;
       if (changes[ui.keys.grouping]) {
         groupMode = changes[ui.keys.grouping].newValue === "tab" ? "tab" : "dataagent";
         choices.clear(); lastRows = "";
@@ -582,7 +613,7 @@
       pinned = items[pinKey] === true;
       if (pinned) expanded = true;
     }
-    if (!prefsChanged.has(ui.keys.position)) position = items[ui.keys.position];
+    if (!frame && !prefsChanged.has(ui.keys.position)) position = items[ui.keys.position];
     if (!prefsChanged.has(ui.keys.grouping)) groupMode = items[ui.keys.grouping] === "tab" ? "tab" : "dataagent";
     if (!prefsChanged.has(ui.keys.tabGroups)) tabGroups = items[ui.keys.tabGroups] || {};
     render();
@@ -631,19 +662,25 @@
   }
   if (frame) window.addEventListener("message", event => {
     if (event.source !== parent || event.origin !== attached.origin) return;
+    if (event.data?.type === "tp-host-drag-ended" && drag?.gesture === event.data.gesture)
+      clearDrag(event.data.moved === true);
     if (event.data?.type === "tp-host-open" && !toastOnly) setExpanded(!expanded);
     if (event.data?.type === "tp-host-refresh" && toastOnly) void refreshToasts();
     if (event.data?.type === "tp-host-viewport" && !toastOnly) {
       viewport = { width: Math.max(44, Math.min(10000, Number(event.data.width) || 240)),
         height: Math.max(84, Math.min(10000, Number(event.data.height) || 600)) };
-      host.style.setProperty("--tp-viewport-width", viewport.width + "px");
-      host.style.setProperty("--tp-viewport-height", viewport.height + "px");
+      position = ui.normalized(event.data.position);
+      frameGeometryReady = true;
       layoutSurface();
     }
   });
   document.addEventListener("visibilitychange", () => { if (alive()) render(); });
   window.addEventListener("resize", () => { if (expanded) updateTimes(Date.now(), true); layoutSurface(); });
-  if (!toastOnly) new ResizeObserver(layoutSurface).observe(box);
+  if (!toastOnly && !side) {
+    const observer = new ResizeObserver(layoutSurface);
+    observer.observe(list);
+    observer.observe(note);
+  }
   const clock = toastOnly ? null : setInterval(() => {
     if (!alive()) {
       clearInterval(clock);
