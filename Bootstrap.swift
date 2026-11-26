@@ -55,8 +55,7 @@ final class Bootstrap {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let uv = obj["uv"] as? String,
               fm.isExecutableFile(atPath: uv),
-              let poller = obj["poller"] as? String,
-              fm.fileExists(atPath: poller) else {
+              fm.fileExists(atPath: resources + "/poller.py") else {
             return false
         }
         return true

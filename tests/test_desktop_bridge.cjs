@@ -52,12 +52,12 @@ test("uncertain navigation retries reuse a pending tab and never create a duplic
 });
 test("a late WEB list response from a revoked lease cannot publish", async () => {
   let receive, resolveOld, requests = 0;
-  const reports = [];
+  const reports = [], visits = [], listeners = {};
   const respond = data => ({ok:true, json:async () => data});
   const cfg = {api:{prefix:"",conv:"/list",queue:"/q/{cid}",state:"state",pending:"pending",idle:["IDLE"]}};
   const list = id => ({data:{groups:[],ungrouped:{conversations:[{id,name:"test",updateTime:1}]}}});
   const ctx = {
-    window:{}, location:{href:target}, document:{hidden:false,hasFocus:()=>true,addEventListener:()=>{}},
+    window:{}, location:{href:target}, document:{hidden:false,hasFocus:()=>true,addEventListener:(kind, cb)=>{listeners[kind]=cb;}},
     crypto:{randomUUID}, AbortController, Date, setTimeout, clearTimeout,
     setInterval:()=>1, clearInterval:()=>{},
     chrome:{runtime:{
@@ -66,6 +66,7 @@ test("a late WEB list response from a revoked lease cannot publish", async () =>
         if(msg.kind==="get-config") cb(cfg);
         else if(msg.kind==="tp-role-ask") cb({leader:true,generation:"old-gen",lease:"old"});
         else if(msg.kind==="webstate"){reports.push(JSON.parse(JSON.stringify(msg.payload))); cb({ok:true});}
+        else if(msg.kind==="tp-user-visit"){visits.push({...msg}); cb({ok:true});}
       }
     }},
     fetch:async url=>{
@@ -91,6 +92,9 @@ test("a late WEB list response from a revoked lease cannot publish", async () =>
   assert.equal(reports.length,1);
   assert.equal(reports[0].generation,"new-gen");
   assert.equal(reports[0].conversations[0].id,2);
+  listeners.pointerdown({isTrusted:true});
+  assert.equal(visits.length,1);
+  assert.equal(visits[0].url,target);
 });
 
 test("an explicit visit cannot acknowledge a different SPA conversation", async () => {

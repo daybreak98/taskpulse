@@ -431,7 +431,8 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     return;
   }
   if (msg.kind === "tp-user-visit" && sender?.frameId === 0 && Number.isInteger(sender?.tab?.id)) {
-    void notifyActive(sender.tab.id, true, Number(msg.at) || 0, sender.url || "");
+    const observedUrl = typeof msg.url === "string" ? msg.url : sender.url || "";
+    if (isConversationTab(observedUrl)) void notifyActive(sender.tab.id, true, Number(msg.at) || 0, observedUrl);
     respond({ ok: true });
     return;
   }

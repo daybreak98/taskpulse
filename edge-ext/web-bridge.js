@@ -313,7 +313,7 @@
     const userVisit = event => {
       if (!event.isTrusted || document.hidden || !document.hasFocus() || now() - lastVisit < 1000) return;
       lastVisit = now();
-      try { chrome.runtime.sendMessage({ kind: "tp-user-visit", at: lastVisit }, () => void 0); } catch (_) {}
+      try { chrome.runtime.sendMessage({ kind: "tp-user-visit", at: lastVisit, url: location.href }, () => void 0); } catch (_) {}
     };
     document.addEventListener("pointerdown", userVisit, true);
     document.addEventListener("keydown", userVisit, true);

@@ -44,7 +44,11 @@ cp "$1" "$exe"
 chmod +x "$exe"
 # The mock HTTP backend already runs on the configured port. The fake uv only
 # serves dependency checks; no runtime or network install is performed.
-printf '#!/bin/bash\nexit 0\n' >"$home/.local/bin/uv"
+cat >"$home/.local/bin/uv" <<'UV'
+#!/bin/bash
+printf '%s\n' "$*" >>"$TP_HOME/uv-preparation.log"
+exit 0
+UV
 chmod +x "$home/.local/bin/uv"
 printf '# fixture backend\n' >"$res/poller.py"
 for name in background.js web-bridge.js manifest.template.json; do
@@ -135,7 +139,9 @@ stop_app
 echo "Fresh App launch uses the configured port and bridge."
 # Simulate an installed previous version: same directory, stale scripts,
 # stale generated configuration, and old runtime pointer/port.
-printf 'old poller\n' >"$tmp/old-poller.py"
+# An old bundle may already have been deleted. Do not require its backend to exist.
+test ! -e "$tmp/old-poller.py"
+cp "$home/uv-preparation.log" "$tmp/uv-before-restart"
 python3 - "$home/.taskpulse/runtime.json" "$tmp/old-poller.py" <<'PY'
 import json, sys
 p=sys.argv[1]
@@ -152,5 +158,6 @@ wait_startup
 assert_files
 cmp "$tmp/original-config" "$home/.taskpulse/config.json"
 cmp "$tmp/original-token" "$home/.taskpulse/token"
+cmp "$tmp/uv-before-restart" "$home/uv-preparation.log"
 stop_app
-echo "Initialized App restart refreshes stale bridge and runtime without losing settings."
+echo "Initialized App restart repairs missing old backend path and stale bridge without reinitializing uv."
