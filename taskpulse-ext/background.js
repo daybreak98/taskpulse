@@ -102,6 +102,10 @@ async function probe(tab) {
   }
 }
 
+// 采集权迁移的冷却：每次迁移都会清空采样缓存，太频繁反而更慢
+let lastHandover = 0;
+const HANDOVER_COOLDOWN = 3_000;
+
 async function syncLeader({ install = false, nudge = false } = {}) {
   const old = await getLeader();
   const candidates = (await pages()).filter(isReady);
@@ -119,6 +123,23 @@ async function syncLeader({ install = false, nudge = false } = {}) {
         const restored = await signal(old.tabId, { kind: "tp.role", pageId: old.pageId, lease: old.lease });
         if (restored?.pageId === old.pageId) return;
       } else {
+        // 前台优先：用户切到另一个 DataAgent 标签时，把采集权交给它。
+        // 后台标签的定时器会被 Chrome 节流到分钟级，采集权留在后台就只剩
+        // 30 秒一次的 alarm 唤醒——「在我发消息的页面等半天也不更新」就是这个原因。
+        if (Date.now() - lastHandover > HANDOVER_COOLDOWN) {
+          const front = await foregroundPage();
+          if (front && front.id !== current.id) {
+            const ready = await probe(front);
+            if (ready?.pageId) {
+              lastHandover = Date.now();
+              const next = { tabId: front.id, pageId: ready.pageId, lease: crypto.randomUUID() };
+              await chrome.storage.session.set({ [web.keys.leader]: next });
+              await signal(old.tabId, { kind: "tp.role", pageId: old.pageId, lease: "" });
+              const accepted = await signal(front.id, { kind: "tp.role", pageId: next.pageId, lease: next.lease });
+              if (accepted?.pageId === next.pageId) return;
+            }
+          }
+        }
         if (nudge) await signal(old.tabId, { kind: "tp.nudge", pageId: old.pageId });
         return;
       }
@@ -635,6 +656,9 @@ chrome.tabs.onRemoved.addListener(id => {
 });
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   focusEpoch++;
+  // 切标签后重新评估采集权：前台那个 DataAgent 标签应该接管采集，
+  // 否则采集权留在后台，只能靠 30 秒一次的 alarm 唤醒。
+  refreshLeader();
   void (async () => {
     await jumpReady;
     // A genuine switch away releases the previous tab's versioned protection.
@@ -648,6 +672,7 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
 });
 chrome.windows.onFocusChanged.addListener(windowId => {
   focusEpoch++;
+  if (windowId >= 0) refreshLeader();   // 切回浏览器窗口：让前台页接管采集
   const duringJump = opening.size > 0;
   void (async () => {
     await jumpReady;

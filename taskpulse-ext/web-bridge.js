@@ -228,6 +228,9 @@
           if (await pullQueue(row, sample, deadline) && token === lease && generation === leaseGeneration &&
               TaskPulseState.queueBusy(sample.queue) === false) {
             if (wasBusy && probes.has(row.id)) probes.get(row.id).nextAt = 0;
+            // 刚跑完的这一轮：列表里的 updateTime 通常一起变了，
+            // 立刻刷一次，别等下一个 15 秒周期——否则判不出「有新回复」。
+            if (wasBusy) nextListAt = 0;
             await pullLastMessage(row, deadline);
           }
         }
