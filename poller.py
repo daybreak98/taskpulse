@@ -1818,7 +1818,8 @@ def view(state: dict) -> dict:
                for s in ("running", "stuck")},
             # 待处理也要限定在覆盖范围内：掉出监控窗口的历史任务仍会列在列表里，
             # 但计入胶囊数字就会和「当前还有几件事等我」不符
-            "attention": sum(1 for r in rows if r["status"] == "attention" and r["covered"]),
+            "attention": sum(1 for r in rows if r["covered"] and (r["status"] == "attention" or
+                             r["status"] == "running" and r.get("reply_pending"))),
             **{s: sum(1 for r in rows if r["status"] == s) for s in ("done", "seen")},
         },
         "out_of_scope_count": sum(1 for r in rows if not r["covered"]),

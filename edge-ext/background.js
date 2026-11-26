@@ -31,6 +31,7 @@ const BROWSER = (() => {
 })();
 
 let collectorPromise = null;
+let modeActionScope = "";
 function collectorId() {
   if (!collectorPromise) {
     collectorPromise = (async () => {
@@ -481,7 +482,6 @@ let leaderId = -1;        // 当前负责采集的标签页
 let leaderReady = false;  // 是否已从 storage.session 读回上次的选主结果
 let pausedByApi = true;
 let modeGeneration = "";
-let modeActionScope = "";
 let roleLease = crypto.randomUUID();
 let leaderPageId = "";
 let roleSent = null;
