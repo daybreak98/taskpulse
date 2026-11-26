@@ -124,7 +124,7 @@
     return uncertain ? uncertain + " 个会话状态待确认" : "";
   }
 
-  const checkedTask = task => !!task.checkedRevision && !task.runAt && task.checkedRevision === rules.revision(task);
+  const checkedTask = task => !!task.checkedRevision && rules.canAcknowledge(task) && task.checkedRevision === rules.revision(task);
   const isLive = (task, kind) => !checkedTask(task) && task.status === kind && !task.uncertain;
 
   function taskStatus(task) {
@@ -171,7 +171,7 @@
     const revision = task.revision || rules.revision(task);
     try {
       const result = await chrome.runtime.sendMessage({ kind, id, revision, ...fields });
-      if (result?.ok) return true;
+      if (result?.ok) return result;
     } catch { /* A worker restart or tab navigation can invalidate a pending action. */ }
     actionError = kind === "tp.open" ? "暂时无法打开此会话，请重试" : "任务状态已变化，请重试";
     if (kind === "tp.open" && !expanded) setExpanded(true);
@@ -195,7 +195,7 @@
     time.setAttribute("aria-hidden", "true");
     link.append(element("i", "task-dot"), name, time);
     link.addEventListener("click", async () => {
-      if (await command("tp.open", task) && !pinned) setExpanded(false);
+      if (await command("tp.open", task, { intent: "row" }) && !pinned) setExpanded(false);
     });
 
     const check = element("button", "task-check");
@@ -205,7 +205,7 @@
     const checkLabel = done ? "取消本轮处理标记" : "标记本轮已处理";
     check.setAttribute("aria-label", checkLabel + " · " + title);
     check.title = checkLabel;
-    check.disabled = !done && Boolean(task.runAt || task.status === "running");
+    check.disabled = !done && (task.uncertain || !rules.canAcknowledge(task));
     check.addEventListener("click", async () => {
       await command("tp.check", task, { checked: !done });
     });
@@ -261,7 +261,7 @@
   function drawRows(tasks, unavailable) {
     const key = JSON.stringify([filter, [...choices], unavailable, tasks.map(task => [
       rules.revision(task), task.group, task.name, task.status, task.uncertain,
-      task.checkedRevision, task.uncertain ? task.observedAt : 0, task.runAt, task.phaseAt, task.failed
+      task.checkedRevision, task.uncertain ? task.observedAt : 0, task.runAt, task.phaseAt, task.failed, task.messageUncertain
     ])]);
     if (key === lastRows) return;
     lastRows = key;
@@ -406,7 +406,8 @@
     const body = element("span", "toast-body", title);
     button.append(element("span", "toast-title", "Agent 回话了"), body);
     button.addEventListener("click", async () => {
-      if (await command("tp.open", task)) {
+      const result = await command("tp.open", task, { intent: "notice" });
+      if (rules.mayDismissNotice(result)) {
         button.setAttribute("data-dismissing", "");
         setTimeout(() => removeToast(task.revision), 110);
       }
@@ -427,7 +428,7 @@
       state = changes[web.keys.state].newValue ?? rules.blank();
       for (const toast of [...toasts]) {
         const task = state.tasks[toast.id];
-        if (task && !task.pending) removeToast(toast.revision);
+        if (!task?.pending || rules.revision(task) !== toast.revision) removeToast(toast.revision);
       }
     }
     if (changes[pinKey]) {
@@ -452,10 +453,33 @@
       reply({ ok: true });
     }
     if (msg?.kind === "tp.replies" && !document.hidden && web.conversationPage(location.href)) {
-      for (const task of msg.tasks ?? []) showToast(task);
-      reply({ ok: true });
+      // Storage changes and worker messages can be delivered in either order.
+      // Revalidate the exact reply before displaying a delayed toast.
+      void chrome.storage.local.get(web.keys.state).then(items => {
+        if (document.hidden || !web.conversationPage(location.href)) return reply({ ok: false });
+        const saved = items[web.keys.state] ?? rules.blank();
+        for (const task of msg.tasks ?? []) {
+          const current = saved.tasks[task.id];
+          if (current?.pending && rules.revision(current) === task.revision) showToast(task);
+        }
+        reply({ ok: true });
+      }).catch(() => reply({ ok: false }));
+      return true;
     }
   });
+  // A real interaction with the DataAgent page (not the capsule) is an
+  // independent visit after an old notification landed on this conversation.
+  let lastVisitAt = 0;
+  function userVisit(event) {
+    if (!event.isTrusted || document.hidden || !document.hasFocus() ||
+        event.composedPath().includes(host) || Date.now() - lastVisitAt < 2_000) return;
+    const id = web.conversationId(location.href);
+    if (!id) return;
+    lastVisitAt = Date.now();
+    void chrome.runtime.sendMessage({ kind: "tp.visit", id, at: Date.now() }).catch(() => {});
+  }
+  document.addEventListener("pointerdown", userVisit, true);
+  document.addEventListener("keydown", userVisit, true);
   document.addEventListener("visibilitychange", () => { if (alive()) render(); });
   window.addEventListener("resize", () => { if (expanded) updateTimes(Date.now(), true); });
   const clock = setInterval(() => {

@@ -57,7 +57,7 @@ async function startFixture() {
   });
   return {
     server, requests, origin: "http://127.0.0.1:" + server.address().port,
-    releaseReply: () => { updated = Date.now() + 1; }
+    releaseReply: () => { updated = Date.now() + 1; return updated; }
   };
 }
 
@@ -165,6 +165,22 @@ async function trial() {
       (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]?.url), existing);
     assert.equal(context.pages().length, 2);
     console.log("Single collector, system notification and desktop-style toast jump passed");
+
+    // Normal current-version toast navigation must not suppress automatic
+    // reading of a later reply while the destination stays in the foreground.
+    const secondStamp = fixture.releaseReply();
+    let second;
+    for (let i = 0; i < 168; i++) {
+      second = (await worker.evaluate(async key => (await chrome.storage.local.get(key))[key], stateKey)).tasks["11"];
+      if (second?.replyKey === "message.m" + secondStamp && second.pending === false) break;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    assert.equal(second?.replyKey, "message.m" + secondStamp);
+    assert.equal(second.pending, false);
+    assert.equal(second.status, "seen");
+    assert.equal((await notifications()).length, 0);
+    assert.equal(await other.locator(root + " .toast").count(), 0);
+    console.log("Current-version jump releases its guard; subsequent foreground reply is silently read");
 
     await page.bringToFront();
     await toast.waitFor({ state: "hidden" });

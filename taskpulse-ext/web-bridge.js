@@ -22,10 +22,14 @@
   const samples = new Map();
   const messages = new Map();
   const probes = new Map();
+  let trackedTasks = {};
+  let leaseGeneration = 0;
+  let cacheGeneration = -1;
 
   async function fetchInfo(path, deadline, init = {}) {
     const remaining = deadline - Date.now();
-    if (remaining <= 0 || !lease) throw new Error("已暂停采集");
+    const token = lease, generation = leaseGeneration;
+    if (remaining <= 0 || !token) throw new Error("已暂停采集");
     const controller = new AbortController();
     request = controller;
     const timeout = setTimeout(() => controller.abort(), Math.min(remaining, timing.request));
@@ -36,6 +40,7 @@
       });
       if (!response.ok) throw new Error("HTTP " + response.status);
       const data = await response.json();
+      if (token !== lease || generation !== leaseGeneration) throw new Error("采集租约已变更");
       if (!data?.data || typeof data.data !== "object" || data.success === false || data.error_msg) {
         throw new Error("DataAgent 返回无效数据");
       }
@@ -71,7 +76,7 @@
     conversations = [...found.values()].sort((a, b) => (b.updateTime || 0) - (a.updateTime || 0));
     listAt = Date.now();
     dirty = true;
-    const watched = new Set(conversations.slice(0, timing.watch).map(row => row.id));
+    const watched = new Set(TaskPulseState.watchRows(conversations, samples, trackedTasks, Date.now()).map(row => row.id));
     for (const map of [samples, messages, probes]) {
       for (const id of map.keys()) if (!watched.has(id)) map.delete(id);
     }
@@ -112,7 +117,7 @@
     try {
       const data = await fetchInfo(api.prefix + api.messages.replace("{cid}", row.id), deadline);
       const latest = Array.isArray(data.list) && data.list[0];
-      if (typeof latest?.sender !== "string") return;
+      if (typeof latest?.sender !== "string") throw new Error("消息结构无效");
       const sender = latest.sender === "assistant" ? "assistant" : "other";
       const content = typeof latest.content === "string" ? latest.content : "";
       const failed = sender === "assistant" && api.marks.some(mark => content.includes(mark));
@@ -127,16 +132,21 @@
       };
       messages.set(row.id, message);
       probe.failures = 0;
+      probe.errorAt = 0;
       probe.nextAt = Date.now() + (sender === "assistant" ? 30_000 : 10_000);
       dirty = true;
     } catch {
-      // A slow or not-yet-visible reply is retried on a later bounded idle sample.
+      // Never reuse an older success as confirmation after a failed probe.
+      messages.delete(row.id);
+      probe.errorAt = Date.now();
+      dirty = true;
+      // Keep retrying this version with the existing bounded backoff.
     }
   }
 
-  async function report(token) {
+  async function report(token, generation) {
     const at = Date.now();
-    if (token !== lease || !alive() || at - reportAt < timing.report ||
+    if (token !== lease || generation !== leaseGeneration || !alive() || at - reportAt < timing.report ||
         (!dirty && at - reportAt < timing.list)) return;
     reportAt = at;
     const queues = {}, queueAt = {}, queueErrors = {};
@@ -149,14 +159,17 @@
     }
     const accepted = await chrome.runtime.sendMessage({
       kind: "tp.webstate", pageId, lease: token,
-      payload: { at, listAt, error, conversations, queues, queueAt, queueErrors,
-        lastMessages: Object.fromEntries(messages) }
+      payload: { at, listAt, error,
+        conversations: TaskPulseState.reportRows(conversations, trackedTasks, at),
+        queues, queueAt, queueErrors,
+        lastMessages: Object.fromEntries(messages),
+        messageErrors: Object.fromEntries([...probes].filter(([, probe]) => probe.errorAt).map(([id, probe]) => [id, probe.errorAt])) }
     });
-    if (accepted?.ok) dirty = false;
+    if (accepted?.ok && generation === leaseGeneration) dirty = false;
   }
 
   function dueAt(now) {
-    return conversations.slice(0, timing.watch).map(row => {
+    return TaskPulseState.watchRows(conversations, samples, trackedTasks, now).map(row => {
       let sample = samples.get(row.id);
       if (!sample) {
         sample = { checked: 0, version: 0, hotUntil: 0 };
@@ -167,18 +180,42 @@
         sample.hotUntil = now + timing.hotWindow;
       }
       return { row, sample };
-    }).filter(({ sample }) => {
-      const hot = TaskPulseState.queueBusy(sample.queue) === true || sample.hotUntil > now;
-      return now - sample.checked >= (hot ? timing.hot : timing.idle);
+    }).filter(({ row, sample }) => {
+      const task = trackedTasks[row.id];
+      const hot = TaskPulseState.queueBusy(sample.queue) === true || sample.hotUntil > now ||
+        Boolean(task?.awaitingReply || task?.runAt || task?.messageUncertain);
+      // An absent row with a failing endpoint may have been removed. Do not
+      // continuously spend the hot budget on it while waiting for recovery.
+      const interval = row.retained && sample.errorAt ? timing.idle : hot ? timing.hot : timing.idle;
+      return now - sample.checked >= interval;
     }).sort((a, b) => a.sample.checked - b.sample.checked).slice(0, timing.queueBudget);
   }
 
   async function tick() {
     if (collecting || !lease || !alive() || !web.conversationPage(location.href)) return;
     collecting = true;
-    const token = lease;
+    const token = lease, generation = leaseGeneration;
     const deadline = Date.now() + timing.round;
     try {
+      // A revoked/reacquired collector must not relabel old cached samples
+      // with its new lease. An in-flight prior tick finishes before this reset.
+      if (cacheGeneration !== generation) {
+        cacheGeneration = generation;
+        samples.clear();
+        messages.clear();
+        probes.clear();
+        conversations = [];
+        listAt = 0;
+        nextListAt = 0;
+        reportAt = 0;
+        error = "";
+        dirty = true;
+      }
+      // Read the durable monitoring set on every round, including after a
+      // collector handoff. Old active/uncertain tasks retain their queue slots.
+      const saved = await chrome.storage.local.get(web.keys.state).catch(() => null);
+      if (saved) trackedTasks = saved[web.keys.state]?.tasks || {};
+      if (token !== lease || generation !== leaseGeneration) return;
       if (Date.now() >= nextListAt) {
         nextListAt = Date.now() + timing.list;
         await pullList(deadline);
@@ -186,9 +223,11 @@
       }
       if (!error) {
         for (const { row, sample } of dueAt(Date.now())) {
-          if (token !== lease || deadline - Date.now() < 250) break;
-          if (await pullQueue(row, sample, deadline) && token === lease &&
+          if (token !== lease || generation !== leaseGeneration || deadline - Date.now() < 250) break;
+          const wasBusy = TaskPulseState.queueBusy(sample.queue) === true;
+          if (await pullQueue(row, sample, deadline) && token === lease && generation === leaseGeneration &&
               TaskPulseState.queueBusy(sample.queue) === false) {
+            if (wasBusy && probes.has(row.id)) probes.get(row.id).nextAt = 0;
             await pullLastMessage(row, deadline);
           }
         }
@@ -197,7 +236,7 @@
       if (error !== failure.message) dirty = true;
       error = failure.name === "AbortError" ? "会话列表请求超时" : String(failure.message).slice(0, 150);
     } finally {
-      try { await report(token); } catch { /* An extension reload can invalidate this page. */ }
+      try { await report(token, generation); } catch { /* An extension reload can invalidate this page. */ }
       collecting = false;
     }
   }
@@ -205,6 +244,7 @@
   function setRole(token) {
     if (token === lease) return;
     lease = token;
+    leaseGeneration++;
     if (timer !== null) clearInterval(timer);
     request?.abort();
     timer = null;
