@@ -1228,3 +1228,60 @@ test("P1 previously rejected old assistant ID cannot become new when its timesta
   assert.equal(replay.replies.length, 0);
   assert.equal(replay.task.replyKey, "message.A");
 });
+
+test("P2 same-time read history retries removal of older notifications without clearing new pending C", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  const a = "tp-reply:" + exactRevision(app);
+  await app.deliver(replyReport(now + 10_000, update, "B"));
+  const b = "tp-reply:" + exactRevision(app);
+  const clear = app.chrome.notifications.clear;
+  app.chrome.notifications.clear = async key => {
+    if (key === a) throw new Error("temporary old notice cleanup failure");
+    return clear(key);
+  };
+  await app.send({ kind: "tp.check", id, revision: exactRevision(app), checked: true });
+  assert.equal(app.notices.has(a), true);
+  assert.equal(app.notices.has(b), false);
+  app.chrome.notifications.clear = clear;
+  await app.deliver(replyReport(now + 15_000, update, "C"));
+  const c = "tp-reply:" + exactRevision(app);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(app.notices.has(a), false);
+  assert.equal(app.notices.has(c), true);
+  assert.equal(app.notices.size, 1);
+});
+
+test("P1 stale landing event snapshot cannot cancel a still-loading correct new tab", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, now + 1_000, "A"));
+  const create = app.chrome.tabs.create;
+  app.chrome.tabs.create = async args => {
+    const tab = await create(args);
+    Object.assign(tab, { url: "about:blank", pendingUrl: args.url, status: "loading" });
+    return tab;
+  };
+  const opening = app.send({ kind: "tp.open", id, revision: exactRevision(app), intent: "notice" });
+  await until(() => app.chrome.tabs.onUpdated.listeners.length >= 2);
+  const tab = app.tabs[1];
+  const stale = { ...tab, url: new URL("/login", web.page).href, status: "complete" };
+  delete stale.pendingUrl;
+  for (const listener of [...app.chrome.tabs.onUpdated.listeners]) listener(tab.id, { url: stale.url, status: "complete" }, stale);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  tab.url = tab.pendingUrl;
+  delete tab.pendingUrl;
+  tab.status = "complete";
+  for (const listener of [...app.chrome.tabs.onUpdated.listeners]) listener(tab.id, { url: tab.url, status: "complete" }, tab);
+  assert.equal((await opening).ok, true);
+  assert.equal(currentTask(app).pending, false);
+  assert.equal(app.notices.size, 0);
+});
+
+test("P2 webpage toast may dismiss only after the worker authorizes clearing that notice", () => {
+  assert.equal(rules.mayDismissNotice({ ok: true, clearNotice: false }), false);
+  assert.equal(rules.mayDismissNotice({ ok: false, clearNotice: true }), false);
+  assert.equal(rules.mayDismissNotice({ ok: true, clearNotice: true }), true);
+  assert.equal(rules.mayDismissNotice(null), false);
+});

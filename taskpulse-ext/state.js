@@ -22,9 +22,15 @@
   function acknowledge(task) {
     return {
       ...task, acked: Math.max(task.acked || 0, task.replyAt || task.replyUpdate || 0),
-      readRevision: revision(task), pending: false, phaseAt: 0,
+      readRevision: revision(task),
+      readKeys: [...new Set([...(task.readKeys || []), ...(task.replyKeys || []), task.replyKey].filter(Boolean))].slice(-64),
+      pending: false, phaseAt: 0,
       status: task.status === "attention" || (task.status === "stuck" && !task.runAt) ? "seen" : task.status
     };
+  }
+
+  function mayDismissNotice(result) {
+    return result?.ok === true && result.clearNotice !== false;
   }
 
   function latestMessage(report, task, stamp) {
@@ -288,5 +294,5 @@
     return { counts, tasks, stale, offline, error };
   }
 
-  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
+  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, mayDismissNotice, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
 })();

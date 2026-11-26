@@ -407,7 +407,7 @@
     button.append(element("span", "toast-title", "Agent 回话了"), body);
     button.addEventListener("click", async () => {
       const result = await command("tp.open", task, { intent: "notice" });
-      if (result && result.clearNotice !== false) {
+      if (rules.mayDismissNotice(result)) {
         button.setAttribute("data-dismissing", "");
         setTimeout(() => removeToast(task.revision), 110);
       }

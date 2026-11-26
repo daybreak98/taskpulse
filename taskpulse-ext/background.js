@@ -230,7 +230,7 @@ async function clearReadNotices(state) {
   await Promise.allSettled(Object.keys(existing).filter(key => {
     if (!key.startsWith(REPLY_NOTICE)) return false;
     const revision = key.slice(REPLY_NOTICE.length);
-    const [id, agentId, update] = revision.split("/");
+    const [id, agentId, update, replyKey] = revision.split("/");
     const task = state.tasks[id];
     if (!task || task.agentId !== agentId ||
         task.pending && rules.revision(task) === revision) return false;
@@ -243,7 +243,7 @@ async function clearReadNotices(state) {
     if (!readRevision) return false;
     // Exact read version, older update versions, or all superseded notices
     // when the *current* version is read. Never clear a newer pending version.
-    return revision === readRevision ||
+    return revision === readRevision || task.readKeys?.includes(replyKey) ||
       Number(update) < Number(readRevision.split("/")[2]) ||
       (!task.pending && currentRevision === readRevision);
   }).map(key => chrome.notifications.clear(key)));
@@ -380,7 +380,10 @@ async function focusTab(tab) {
 
 function waitForLanding(tabId, id) {
   return new Promise(resolve => {
+    let settled = false;
     const finish = tab => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       chrome.tabs.onUpdated.removeListener(updated);
       chrome.tabs.onRemoved.removeListener(removed);
@@ -392,7 +395,13 @@ function waitForLanding(tabId, id) {
           !tab.url || tab.url === "about:blank") return;
       finish(isReady(tab) && web.conversationId(tab.url) === id ? tab : null);
     };
-    const updated = (changedId, _change, tab) => { if (changedId === tabId) check(tab); };
+    const updated = changedId => {
+      if (changedId === tabId && !settled) {
+        // Browser event payloads can be delayed. Re-read the actual tab
+        // rather than treating a stale redirect snapshot as final landing.
+        void chrome.tabs.get(tabId).then(check, () => finish(null));
+      }
+    };
     const removed = changedId => { if (changedId === tabId) finish(null); };
     const timer = setTimeout(() => finish(null), 10_000);
     chrome.tabs.onUpdated.addListener(updated);
@@ -578,7 +587,7 @@ chrome.notifications.onClicked.addListener(id => {
   const navigation = openTask(revision.split("/")[0], revision, true);
   void recordDelivery(id).catch(info);
   void navigation.then(result => {
-    if (result.ok && result.clearNotice !== false) return chrome.notifications.clear(id);
+    if (rules.mayDismissNotice(result)) return chrome.notifications.clear(id);
   }).catch(info);
 });
 
