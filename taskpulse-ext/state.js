@@ -280,6 +280,7 @@
       task.replyActivityAt = task.replyAt || at;
       // Verification belongs to this exact reply, not its predecessor.
       task.replyVerifiedAt = 0;
+      task.replyVerifiedRevision = "";
       task.phaseAt = at;
       task.pending = true;
       task.failed = Boolean(message.failed);
@@ -327,6 +328,11 @@
     if (!listAt || listAt > at || listAt < previous.listAt || !Array.isArray(report.conversations)) {
       state.error = reportError || previous.error || "会话列表状态待确认";
       state.authBlocked = Boolean(previous.authBlocked || authError(state.error));
+      if (state.authBlocked) {
+        // A login boundary invalidates old-account confirmation evidence.
+        state.tasks = Object.fromEntries(Object.entries(state.tasks).map(([key, task]) =>
+          [key, { ...task, replyVerifiedAt: 0, replyVerifiedRevision: "" }]));
+      }
       state.revalidateAfter = Math.max(previous.revalidateAfter || 0, at);
       return { state, replies: [] };
     }
@@ -336,6 +342,11 @@
       listAt >= (previous.revalidateAfter || 0);
     state.error = reportError || (!recoveredList ? previous.error : "") || "";
     state.authBlocked = Boolean(authError(state.error) || previous.authBlocked && !recoveredList);
+    if (state.authBlocked) {
+      // A login boundary invalidates old-account confirmation evidence.
+      state.tasks = Object.fromEntries(Object.entries(state.tasks).map(([key, task]) =>
+        [key, { ...task, replyVerifiedAt: 0, replyVerifiedRevision: "" }]));
+    }
     state.sourceUnavailable = Boolean(previous.sourceUnavailable && !recoveredList);
     if (state.error) state.revalidateAfter = Math.max(previous.revalidateAfter || 0, at);
     const baseline = state.baselineAt ||= listAt;
@@ -355,8 +366,15 @@
       if (retained && (!old || !activeTask(old) || old.accessDeniedAt ||
           now - (old.realListedAt || old.listedAt) > HISTORY)) continue;
       if (old && update < old.update) {
-        // Keep the previous version visible but unconfirmable on a regressed row.
-        state.tasks[cid] = { ...old, listedAt: listAt, listUncertain: true };
+        // A per-conversation 401/403 is stronger than a regressed list row.
+        // Record it before retaining the old version so prior-account titles
+        // and notifications cannot remain visible.
+        const deniedAt = time(report.accessErrors?.[cid]);
+        const deniedSampleAt = time(report.queueAt?.[cid]);
+        const accessDeniedAt = deniedAt &&
+          deniedAt >= Math.max(deniedSampleAt, old.accessDeniedAt || 0) ? deniedAt : old.accessDeniedAt;
+        state.tasks[cid] = { ...old, listedAt: listAt, listUncertain: true,
+          ...(accessDeniedAt ? { accessDeniedAt } : {}) };
         continue;
       }
       let task = {
@@ -400,6 +418,7 @@
         // Record the last accepted confirmation of this pending revision.
         // The reply's creation timestamp is not a revalidation timestamp.
         task.replyVerifiedAt = Math.max(task.replyVerifiedAt || 0, task.observedAt);
+        task.replyVerifiedRevision = revision(task);
         if (cid === activeId && task.status === "attention") {
           // Auto-read must also apply to a reply that has already been notified.
           task = acknowledge(task);
@@ -432,11 +451,16 @@
       // evidence rather than server creation time after a recovery fence.
       // Legacy snapshots use the previous conservative fallback until the
       // next valid confirmation. Never inherit evidence across a new reply.
-      const replyEvidence = task.replyVerifiedAt ?? (task.replyAt || task.replyUpdate || 0);
+      const exactReplyVerified = task.replyVerifiedAt > 0 &&
+        task.replyVerifiedRevision === revision(task);
+      // Older persisted rows lack a reply-version key; retain their previous
+      // conservative fence until the same reply is freshly confirmed.
+      const legacyReplyVerified = task.replyVerifiedRevision === undefined &&
+        (task.replyVerifiedAt || task.replyAt || task.replyUpdate || 0) > 0 &&
+        (task.replyVerifiedAt || task.replyAt || task.replyUpdate || 0) >= evidenceFloor(state, task);
       const unread = task.pending === true && !task.listUncertain &&
         (task.status === "attention" || task.status === "stuck") && verifiedReply(task) &&
-        !task.runAt && !task.awaitingReply && replyEvidence > 0 &&
-        replyEvidence >= evidenceFloor(state, task);
+        !task.runAt && !task.awaitingReply && (exactReplyVerified || legacyReplyVerified);
       // One classification for counters, groups, filtering and row tint.
       // Unconfirmed running/blocked executions stay visible as uncertain,
       // but are not counted as verified active states.

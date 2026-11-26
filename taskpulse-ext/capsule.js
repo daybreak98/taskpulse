@@ -703,6 +703,7 @@
   if (native) {
     document.addEventListener("pointerdown", userVisit, true);
     document.addEventListener("keydown", userVisit, true);
+    document.addEventListener("wheel", userVisit, { capture: true, passive: true });
   }
   if (frame) window.addEventListener("message", event => {
     if (event.source !== parent || event.origin !== attached.origin) return;

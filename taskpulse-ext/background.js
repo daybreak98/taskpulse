@@ -375,13 +375,35 @@ async function updateBadge(state) {
 }
 
 async function persistForegroundRead(state) {
-  // Do not spend browser focus queries on reports without any eligible reply.
+  // A trusted page interaction is a durable read intent for one exact reply.
+  // It may finish after the user switches away, but never across a newer
+  // reply, active run, logout, or per-conversation access denial.
   await jumpReady;
+  const release = [];
+  let deferredRead = false;
+  for (const [tabId, guard] of jumpTabs) {
+    if (!guard?.deferredRead || !guard.visited) continue;
+    const task = state.tasks[guard.cid];
+    if (!task || state.authBlocked || rules.authError(state.error) ||
+        !rules.taskAccessible(state, task) || rules.revision(task) !== guard.revision ||
+        !task.pending || task.readRevision === guard.revision) {
+      release.push([tabId, guard.token]);
+      continue;
+    }
+    if (task.runAt || task.awaitingReply || task.status === "running") continue;
+    if (!canResumeNoticeRead(state, task, guard)) continue;
+    state.tasks[guard.cid] = { ...rules.acknowledge(task), jumpCommit: guard.token };
+    deferredRead = true;
+    release.push([tabId, guard.token]);
+  }
+  // Do not spend browser focus queries on reports without any eligible reply.
   const eligible = Object.values(state.tasks).some(task => canAutoRead(state, task)) ||
     [...jumpTabs.values()].some(guard => canResumeNoticeRead(state, state.tasks[guard.cid], guard));
   const read = eligible && await readForeground(state);
   const pruned = pruneOutbox(state);
-  if (read || pruned) await saveState(state);
+  if (deferredRead || read || pruned) await saveState(state);
+  // Release only after the corresponding read has been durably committed.
+  for (const [tabId, token] of release) await forgetJump(tabId, false, token);
 }
 
 async function deliverNotices(state) {
@@ -499,10 +521,11 @@ async function markVisited(tabId, windowId) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (isReady(tab)) refreshLeader();
   }
-  if (!await readForeground(state, tabId, windowId, true)) return;
+  if (!await readForeground(state, tabId, windowId, true)) return false;
   pruneOutbox(state);
   await saveState(state);
   await syncNotices(state);
+  return true;
 }
 
 async function raiseWindow(tab) {
@@ -696,6 +719,18 @@ async function userVisit(id, sender, visitAt) {
   const tab = await foregroundPage();
   if (tab?.id !== sender.tab.id || !matchesConversation(tab, id) || opening.has(id) ||
       jumpTabs.get(tab.id) !== guard) return { ok: false };
+  if (guard.deferredRead) {
+    const state = await getState(), task = state.tasks[id];
+    if (state.authBlocked || rules.authError(state.error) || !rules.taskAccessible(state, task) ||
+        rules.revision(task) !== guard.revision) {
+      await forgetJump(tab.id, false, guard.token);
+      return { ok: false };
+    }
+    await rememberJump(tab.id, { ...guard, visited: true, visitedAt: visitAt });
+    const read = await markVisited(tab.id, tab.windowId);
+    if (read) await forgetJump(tab.id, false, guard.token);
+    return { ok: true, deferred: !read };
+  }
   if (!await forgetJump(tab.id, true, guard.token)) return { ok: false };
   await markVisited(tab.id, tab.windowId);
   return { ok: true };
@@ -815,8 +850,10 @@ chrome.tabs.onUpdated.addListener((id, change) => {
       if (isPage(tab) || change.url) void signal(tab.id, { kind: "tp.route" }).catch(info);
       if (!isPage(tab)) surfaces.activate(id);
     }
-    if ((change.url || change.status === "complete") && jumpTabs.has(id) &&
-        jumpTabs.get(id)?.cid !== cid && tab.status === "complete" && tab.url !== "about:blank" &&
+    const currentGuard = jumpTabs.get(id);
+    if ((change.url || change.status === "complete") && currentGuard &&
+        !(currentGuard.deferredRead && currentGuard.visited) &&
+        currentGuard.cid !== cid && tab.status === "complete" && tab.url !== "about:blank" &&
         (!tab.pendingUrl || tab.pendingUrl === tab.url)) await forgetJump(id, true);
     if (isPage(tab)) {
       refreshLeader();
@@ -829,7 +866,8 @@ chrome.tabs.onUpdated.addListener((id, change) => {
 });
 chrome.tabs.onRemoved.addListener(id => {
   focusEpoch++;
-  void forgetJump(id);
+  const guard = jumpTabs.get(id);
+  if (!(guard?.deferredRead && guard.visited)) void forgetJump(id);
   void getLeader().then(leader => { if (leader?.tabId === id) refreshLeader(); }).catch(info);
 });
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
@@ -841,7 +879,9 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
     for (const id of [...jumpTabs.keys()]) {
       if (id === tabId) continue;
       const tab = await chrome.tabs.get(id).catch(() => null);
-      if (!tab || tab.windowId === windowId && !tab.active) await forgetJump(id, true);
+      const guard = jumpTabs.get(id);
+      if (!(guard?.deferredRead && guard.visited) &&
+          (!tab || tab.windowId === windowId && !tab.active)) await forgetJump(id, true);
     }
     await serialize(() => markVisited(tabId, windowId));
   })().catch(info);
@@ -859,7 +899,9 @@ chrome.windows.onFocusChanged.addListener(windowId => {
       if (eventStillCurrent) {
         for (const id of [...jumpTabs.keys()]) {
           const tab = await chrome.tabs.get(id).catch(() => null);
-          if (!tab || tab.windowId !== windowId) await forgetJump(id, true);
+          const guard = jumpTabs.get(id);
+          if (!(guard?.deferredRead && guard.visited) &&
+              (!tab || tab.windowId !== windowId)) await forgetJump(id, true);
         }
       }
     }
