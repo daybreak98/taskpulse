@@ -35,16 +35,37 @@
   let lastReportAt = 0;
   let busy = false;
   let lastError = "";     // 最近一次采集失败的原因，随上报带出
-  let roleWanted = false;   // 后台是否把采集权给了这一页；没给就不该开定时器
+  let roleWanted = false;
+  let roleGeneration = "";
+  let roleLease = "";
+  let roleChange = 0;
+  let requestController = null;
+  const pageId = crypto.randomUUID();
   let timer = null;
-
   const now = () => Date.now();
 
-  // 后台只在选主结果变化时发消息，稳定状态下这里不会被打扰
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (!msg || msg.kind !== "tp-role") return;
-    roleWanted = !!msg.leader;
+  function owns(lease) { return roleWanted && lease === roleLease && !!roleGeneration; }
+  function acceptRole(msg) {
+    const wanted = !!msg?.leader && typeof msg.generation === "string" && !!msg.generation &&
+      typeof msg.lease === "string" && !!msg.lease;
+    if (wanted === roleWanted && msg?.lease === roleLease && msg?.generation === roleGeneration) return;
+    roleChange += 1;
+    roleWanted = wanted;
+    roleLease = msg?.lease || "";
+    roleGeneration = msg?.generation || "";
+    requestController?.abort();
+    convs = [];
+    lastListAt = lastReportAt = 0;
+    lastError = "";
+    for (const cache of [queues, queueAt, queueErrors, lastMessages, lastQueueAt, seenUpdate, hotUntil, lastMsgAt]) {
+      for (const key of Object.keys(cache)) delete cache[key];
+    }
     sync();
+  }
+  chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
+    if (!msg || msg.kind !== "tp-role") return;
+    acceptRole(msg);
+    respond({ pageId });
   });
 
   function askConfig() {
@@ -57,37 +78,41 @@
   function askRole() {
     return new Promise((resolve) => {
       try {
-        chrome.runtime.sendMessage({ kind: "tp-role-ask" }, (r) => resolve(r || null));
+        chrome.runtime.sendMessage({ kind: "tp-role-ask", pageId }, (r) => resolve(r || null));
       } catch (_) {
         resolve(null);
       }
     });
   }
 
-  async function jfetch(path, init) {
+  async function jfetch(path, init, lease) {
+    if (!owns(lease)) throw new Error("采集权已变更");
     const controller = new AbortController();
+    requestController = controller;
     const timeout = setTimeout(() => controller.abort(), 4000);
     try {
       const opts = Object.assign({ credentials: "include", cache: "no-store", signal: controller.signal }, init || {});
       const r = await fetch(path, opts);
       if (!r.ok) throw new Error("HTTP " + r.status);
       const data = await r.json();
+      if (!owns(lease)) throw new Error("采集权已变更");
       if (!data || data.success === false || data.error_msg || !data.data || typeof data.data !== "object") {
         throw new Error("接口返回无效数据");
       }
       return data;
     } finally {
       clearTimeout(timeout);
+      if (requestController === controller) requestController = null;
     }
   }
 
-  async function pullList() {
+  async function pullList(lease) {
     const body = (CFG.api && CFG.api.body) || {};
     const data = await jfetch(CFG.api.prefix + CFG.api.conv, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
-    });
+    }, lease);
     // 和 API 侧同一套契约：业务失败（success:false / result 非 0）要报错，
     // 不能当成「空列表」发布出去——那会把当前状态刷成 0 个会话
     if (!data || !data.data || typeof data.data !== "object") {
@@ -117,9 +142,9 @@
     }
   }
 
-  async function pullQueue(cid) {
+  async function pullQueue(cid, lease) {
     try {
-      const data = await jfetch(CFG.api.prefix + CFG.api.queue.replace("{cid}", cid));
+      const data = await jfetch(CFG.api.prefix + CFG.api.queue.replace("{cid}", cid), {}, lease);
       const d = data.data;
       const state = d[CFG.api.state || "state"];
       if ((typeof state !== "string" && typeof state !== "number") || state === "") {
@@ -130,15 +155,15 @@
       delete queueErrors[cid];
       return true;
     } catch (_) {
-      queueErrors[cid] = now();
+      if (owns(lease)) queueErrors[cid] = now();
       return false;
     } finally {
-      lastQueueAt[cid] = now();
+      if (owns(lease)) lastQueueAt[cid] = now();
     }
   }
 
   // 只在「有新回复」时拉一次最后一条消息，供限流识别使用
-  async function pullLastMessage(cid, updateTime) {
+  async function pullLastMessage(cid, updateTime, lease) {
     const previous = lastMsgAt[cid];
     if (previous?.version === updateTime && now() < previous.nextAt) return;
     lastMsgAt[cid] = { version: updateTime, nextAt: now() + 10000 };
@@ -146,7 +171,7 @@
     try {
       const path = (CFG.api.messages || "/conversations/{cid}/messages?pageNo=1&pageSize=1")
         .replace("{cid}", cid);
-      const data = await jfetch(CFG.api.prefix + path);
+      const data = await jfetch(CFG.api.prefix + path, {}, lease);
       const list = ((data && data.data) || {}).list || [];
       const m = list[0];
       if (!m) return;
@@ -172,8 +197,8 @@
     return (Array.isArray(pending) ? pending.length > 0 : Boolean(pending)) || idle.indexOf(st) < 0;
   }
 
-  function report() {
-    if (!roleWanted || now() - lastReportAt < 4000) return;
+  function report(lease) {
+    if (!owns(lease) || now() - lastReportAt < 4000) return;
     lastReportAt = now();
     // 分好组的会话往往不活跃、updateTime 靠后，按时间截断会把它们整批丢掉；
     // 所以先把所有带分组的挑出来，再补上最近的未分组会话。
@@ -185,6 +210,7 @@
     }));
     const payload = {
       at: now(),
+      generation: roleGeneration,
       listAt: lastListAt,
       url: location.href,
       error: lastError || undefined,
@@ -194,14 +220,16 @@
       queueErrors: queueErrors,
       lastMessages: lastMessages
     };
-    chrome.runtime.sendMessage({ kind: "webstate", payload }, () => void 0);
+    chrome.runtime.sendMessage({ kind: "webstate", payload, pageId, lease }, () => void 0);
   }
 
   async function tick() {
     if (busy || !CFG || !roleWanted) return;
     busy = true;
+    const lease = roleLease;
     try {
-      if (!lastListAt || now() - lastListAt > 30000) await pullList();
+      if (!lastListAt || now() - lastListAt > 30000) await pullList(lease);
+      if (!owns(lease)) return;
 
       const watch = convs.filter((c, index) => index < 24 || isBusy(String(c.id)) === true);
       const due = [];
@@ -223,18 +251,20 @@
       due.sort((a, b) => (lastQueueAt[String(a.id)] || 0) - (lastQueueAt[String(b.id)] || 0));
       const deadline = now() + 10000;
       for (const c of due.slice(0, 6)) {
-        if (!roleWanted || now() >= deadline) break;
+        if (!owns(lease) || now() >= deadline) break;
         const cid = String(c.id);
-        if (await pullQueue(cid) && roleWanted && isBusy(cid) === false && c.updateTime && now() < deadline) {
-          await pullLastMessage(cid, c.updateTime);
+        if (await pullQueue(cid, lease) && owns(lease) && isBusy(cid) === false && c.updateTime && now() < deadline) {
+          await pullLastMessage(cid, c.updateTime, lease);
         }
       }
-      report();
+      report(lease);
     } catch (exc) {
       // 页面切走/登录失效都很常见，但这轮失败要带出去：否则后端只看到
       // 「页面没上报」，分不清是没注入、没登录，还是解析挂了
-      lastError = String((exc && exc.message) || exc || "").slice(0, 120);
-      report();
+      if (owns(lease)) {
+        lastError = String((exc && exc.message) || exc || "").slice(0, 120);
+        report(lease);
+      }
     } finally {
       busy = false;
     }
@@ -258,8 +288,9 @@
     // 后台在页面被节流时靠这个口子来敲门；没采集权就不该被敲动
     window.__tpWebBridgeTick = () => { if (roleWanted) tick(); };
     // 先问一句「这一页要不要采集」，默认不采：判断权在后台，页面自己不开火
+    const before = roleChange;
     const r = await askRole();
-    roleWanted = !!(r && r.leader);
+    if (before === roleChange) acceptRole(r);
     sync();
     document.addEventListener("visibilitychange", () => { if (!document.hidden && timer) tick(); });
   })();

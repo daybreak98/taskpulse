@@ -710,6 +710,9 @@ class PollingTests(unittest.TestCase):
                         "browser": browser, "conversations": [], "queues": {}
                     }, timeout=2).json()
                 self.assertTrue(report("chrome-a", "chrome")["ok"])
+                mode = self.auth().get(url + "/mode", timeout=2).json()
+                self.assertEqual(mode["collector"], "chrome-a")
+                self.assertEqual(mode["generation"], first_gen)
                 poller.save_state({"tasks": {"chrome": {"name": "Chrome"}}})
                 self.stamp += 1000
                 self.assertEqual(report("edge-b", "edge").get("ignored"), "other collector")

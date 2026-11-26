@@ -2324,7 +2324,9 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 mode = source_mode()
                 generation = web_generation()
-            self._json({"ok": True, "source": mode, "generation": generation})
+                snapshot = read_web_snapshot()
+                owner = snapshot.get("collector") if now_ms() - int(snapshot.get("at") or 0) <= WEB_STALE_SECONDS * 1000 else None
+            self._json({"ok": True, "source": mode, "generation": generation, "collector": owner})
         elif path in ("/", "/index.html"):
             # 令牌随页面一起下发（同源）：看板不必再走一次单独取密钥的接口，
             # 也不需要在服务端为它开一个免鉴权的口子。json.dumps 负责转义。
