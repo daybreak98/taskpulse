@@ -85,29 +85,42 @@
   let hoverTimer = null;
   let panelClock = null;
   let position, groupMode = "dataagent", tabGroups = {};
-  let viewport = { width: innerWidth, height: innerHeight }, frameGeometryReady = !frame;
+  let viewport = ui.viewportSize(window), frameGeometryReady = !frame;
   let lastSize = "", drag = null, dragFrame = 0, suppressClickUntil = 0, gestureSerial = 0;
   let styled = false, prefsChanged = new Set(), toastLoaded = !toastOnly;
   const groupButtons = [...root.querySelectorAll("[data-mode]")];
 
   document.documentElement.append(host);
-  fetch(chrome.runtime.getURL("capsule.css")).then(response => {
-    if (!response.ok) throw new Error("无法读取胶囊样式");
-    return response.text();
-  }).then(css => {
-    const style = new CSSStyleSheet();
-    style.replaceSync(css);
-    root.adoptedStyleSheets = [style];
-    styled = true;
-    box.hidden = toastOnly;
-    stack.hidden = frame && !toastOnly || side;
-    render();
-    if (frame) {
-      post({ type: "tp-frame-ready" });
-      layoutSurface();
-      if (toastOnly) void refreshToasts();
-    }
-  }).catch(error => console.warn("TaskPulse:", error.message));
+  let styleLoading = null;
+  function ensureStyle() {
+    if (styled || styleLoading || !alive()) return;
+    styleLoading = (async () => {
+      // A transient resource failure must not permanently hide a new page.
+      for (const delay of [0, 250, 750]) {
+        if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+        if (!alive()) return;
+        try {
+          const response = await fetch(chrome.runtime.getURL("capsule.css"));
+          if (!response.ok) throw new Error("无法读取胶囊样式");
+          const style = new CSSStyleSheet();
+          style.replaceSync(await response.text());
+          root.adoptedStyleSheets = [style];
+          styled = true;
+          box.hidden = toastOnly;
+          stack.hidden = frame && !toastOnly || side;
+          render();
+          if (frame) {
+            post({ type: "tp-frame-ready" });
+            layoutSurface();
+            if (toastOnly) void refreshToasts();
+          }
+          return;
+        } catch {}
+      }
+      console.warn("TaskPulse: 无法读取胶囊样式");
+    })().finally(() => { styleLoading = null; });
+  }
+  ensureStyle();
 
   function element(tag, className, value) {
     const node = document.createElement(tag);
@@ -350,7 +363,7 @@
       return;
     }
     if (side || !frameGeometryReady) return;
-    const w = frame ? viewport.width : innerWidth, h = frame ? viewport.height : innerHeight;
+    const { width: w, height: h } = frame ? viewport : ui.viewportSize(window);
     // Measure natural row height, not the previously constrained scroll area.
     // This lets the panel shrink on filter changes and prevents resize loops.
     const naturalListHeight = 10 + [...list.children].reduce((sum, node, index) =>
@@ -373,6 +386,8 @@
   }
 
   function render() {
+    if (native && !document.hidden && web.conversationPage(location.href) && !host.isConnected)
+      document.documentElement.append(host);
     host.hidden = native && !web.conversationPage(location.href);
     if (toastOnly) { layoutSurface(); return; }
     if (document.hidden || host.hidden) {
@@ -479,7 +494,8 @@
       post({ type: "tp-frame-drag", gesture: drag.gesture,
         x: drag.x + drag.dx, y: drag.y + drag.dy, done });
     } else if (drag.moved) {
-      position = ui.move(drag.start, drag.dx, drag.dy, innerWidth, innerHeight);
+      const { width, height } = ui.viewportSize(window);
+      position = ui.move(drag.start, drag.dx, drag.dy, width, height);
       layoutSurface();
       if (done) void chrome.storage.local.set({ [ui.keys.position]: position }).catch(() => {});
     }
@@ -623,11 +639,13 @@
   }).catch(() => {});
   chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     if (native && msg?.kind === "tp.route") {
+      ensureStyle();
       render();
       reply({ ok: true });
       return false;
     }
     if (native && msg?.kind === "tp.show") {
+      ensureStyle();
       if (expanded) closePanel();
       else setExpanded(true);
       reply({ ok: true });
@@ -670,19 +688,26 @@
     if (event.data?.type === "tp-host-open" && !toastOnly) setExpanded(!expanded);
     if (event.data?.type === "tp-host-refresh" && toastOnly) void refreshToasts();
     if (event.data?.type === "tp-host-viewport" && !toastOnly) {
-      viewport = { width: Math.max(44, Math.min(10000, Number(event.data.width) || 240)),
-        height: Math.max(84, Math.min(10000, Number(event.data.height) || 600)) };
+      viewport = { width: Math.max(1, Math.min(10000, Number(event.data.width) || 240)),
+        height: Math.max(1, Math.min(10000, Number(event.data.height) || 600)) };
       position = ui.normalized(event.data.position);
       frameGeometryReady = true;
       layoutSurface();
     }
   });
-  document.addEventListener("visibilitychange", () => { if (alive()) render(); });
+  function resumeSurface() {
+    if (!alive() || document.hidden) return;
+    ensureStyle();
+    render();
+  }
+  document.addEventListener("visibilitychange", resumeSurface);
+  window.addEventListener("pageshow", resumeSurface);
   window.addEventListener("resize", () => { if (expanded) updateTimes(Date.now(), true); layoutSurface(); });
   if (!toastOnly && !side) {
     const observer = new ResizeObserver(layoutSurface);
     observer.observe(list);
     observer.observe(note);
+    if (native) observer.observe(document.compatMode === "BackCompat" ? document.body : document.documentElement);
   }
   const clock = toastOnly ? null : setInterval(() => {
     if (!alive()) {

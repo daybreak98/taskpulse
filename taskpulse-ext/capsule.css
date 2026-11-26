@@ -4,7 +4,7 @@
   color-scheme: normal; color: #eef6fb;
   font: 500 12px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
   --ink: #eef6fb; --secondary: #a8ccdf; --running: #61b4df; --attention: #e7b961;
-  --stuck: #dc9098; --seen: #90adbd; --done: #77bcac;
+  --stuck: #ee9385; --seen: #90adbd; --done: #77bcac;
   --line: rgb(141 192 216 / .26); --glass-edge: rgb(146 196 219 / .28);
   --glass-tint: rgb(29 65 86 / .84); --radius: 12px;
   --pill-long: 96px; --pill-short: 28px;
@@ -46,8 +46,8 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
   --live-base: 194 150 61; --live-light: 255 219 123; --select-light: 255 232 160;
 }
 .number[data-filter="stuck"] {
-  --rest-base: 86 117 137; --rest-light: 114 145 162;
-  --live-base: 111 154 177; --live-light: 187 220 239; --select-light: 207 234 248;
+  --rest-base: 155 84 85; --rest-light: 215 126 118;
+  --live-base: 203 105 94; --live-light: 255 181 165; --select-light: 255 206 190;
 }
 .number:not(.zero) { --base: var(--live-base); --light: var(--live-light); --glow: 1; }
 .number[aria-pressed="true"] {
@@ -93,11 +93,11 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
 .group + .group { margin-top: 4px; }
 .group-head { position: relative; width: 100%; height: 26px; display: flex; align-items: center; gap: 5px; padding: 0 5px 0 14px; text-align: left; }
 .group-head:hover { background: rgb(160 208 232 / .07); border-radius: 5px; }
-.group-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--secondary); font-size: 11px; font-weight: 550; }
+.group-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: 11px; font-weight: 550; }
 .group-count { flex: none; white-space: nowrap; color: rgb(168 204 223 / .65); font-size: 9px; font-weight: 400; }
 .group-open { flex: none; display: flex; align-items: center; gap: 3px; margin-left: auto; color: var(--accent); line-height: 1; font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .group-open::before { content: ""; width: 4px; height: 4px; background: currentColor; border-radius: 50%; }
-.group.quiet .group-name, .group.quiet .group-open { opacity: .55; }
+.group.quiet .group-open { opacity: .55; }
 .chevron { position: absolute; left: 4px; top: 10px; width: 5px; height: 5px; border-top: 1.2px solid var(--secondary); border-right: 1.2px solid var(--secondary); transform: rotate(45deg); }
 .group-head[aria-expanded="true"] .chevron { top: 11px; transform: rotate(-45deg); }
 .group-line { position: absolute; inset: auto 3px 0; height: 1px; background: rgb(141 192 216 / .10); pointer-events: none; }
@@ -106,7 +106,7 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
 .row { --row-tint: rgb(112 154 177 / .17); --row-glow: 145 194 219; --content-alpha: .8; position: relative; height: 28px; }
 .row.running { --row-tint: rgb(97 159 190 / .23); --row-glow: 144 209 237; --content-alpha: 1; }
 .row.attention { --row-tint: rgb(200 164 96 / .31); --row-glow: 235 202 141; --content-alpha: 1; }
-.row.stuck { --row-tint: rgb(197 111 128 / .29); --row-glow: 235 172 184; --content-alpha: 1; }
+.row.stuck { --row-tint: rgb(206 112 100 / .29); --row-glow: 247 170 155; --content-alpha: 1; }
 .row.done { --row-tint: rgb(90 159 148 / .18); }
 .row-plate { position: absolute; inset: 1px 0 2px; border-radius: 6px; pointer-events: none; overflow: hidden; background: var(--row-tint); }
 .row-plate::before { position: absolute; content: ""; inset: 0 auto 0 0; width: var(--progress, 0%); background: linear-gradient(90deg, rgb(var(--row-glow) / .06), rgb(var(--row-glow) / .13) 80%, transparent); }
@@ -124,7 +124,7 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
 .footer { flex: 0 0 22px; display: flex; justify-content: space-between; align-items: center; height: 22px; padding: 0 11px; color: rgb(168 204 223 / .62); font-size: 9.5px; border-top: 1px solid rgb(141 192 216 / .13); }
 .settings { font-size: 10px; color: var(--secondary); }
 .settings:hover { color: var(--ink); }
-.toast-stack { position: fixed; top: 14px; right: 14px; width: min(288px, calc(100vw - 28px)); z-index: 3; pointer-events: none; }
+.toast-stack { position: fixed; top: 14px; right: 14px; width: min(288px, calc(100% - 28px)); z-index: 3; pointer-events: none; }
 .toast { --accent: var(--attention); position: absolute; inset: calc(var(--index, 0) * 44px) 0 auto; height: 64px; text-align: left; pointer-events: auto; animation: toast-in .12s ease-out; transition: opacity .11s ease-out, transform .11s ease-out; }
 .toast.stuck { --accent: var(--stuck); }
 .toast[data-dismissing] { opacity: 0; transform: scale(.92); pointer-events: none; }

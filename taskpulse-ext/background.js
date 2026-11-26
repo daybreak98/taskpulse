@@ -757,8 +757,9 @@ chrome.tabs.onUpdated.addListener((id, change) => {
     const tab = await chrome.tabs.get(id).catch(() => null);
     if (!tab) return;
     const cid = web.conversationId(tab.url);
-    if (change.url && tab.active) {
-      void signal(tab.id, { kind: "tp.route" }).catch(info);
+    if (tab.active && (change.url || change.status === "complete" ||
+        change.discarded === false || change.frozen === false)) {
+      if (isPage(tab) || change.url) void signal(tab.id, { kind: "tp.route" }).catch(info);
       if (!isPage(tab)) surfaces.activate(id);
     }
     if ((change.url || change.status === "complete") && jumpTabs.has(id) &&

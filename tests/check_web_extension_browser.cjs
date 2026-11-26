@@ -22,9 +22,14 @@ async function startFixture() {
 
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
+    if (url.pathname === "/viewport-scroll.css") {
+      response.writeHead(200, { "content-type": "text/css" });
+      response.end("html.fixture-scroll { overflow: scroll; } html.fixture-scroll::-webkit-scrollbar { width:20px;height:18px; } html.fixture-scroll body::after { content:''; display:block; width:200vw; height:200vh; }");
+      return;
+    }
     if (url.pathname === "/workbench") {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      response.end('<!doctype html><meta charset="utf-8"><title>Ordinary website fixture</title><button id="underlying" onclick="this.textContent=\'clicked\'">Underlying page</button>');
+      response.end('<!doctype html><meta charset="utf-8"><title>Ordinary website fixture</title><link rel="stylesheet" href="/viewport-scroll.css"><button id="underlying" onclick="this.textContent=\'clicked\'">Underlying page</button>');
       return;
     }
     if (url.pathname === "/ai/data-agent") {
@@ -32,7 +37,7 @@ async function startFixture() {
         "content-type": "text/html; charset=utf-8",
         "content-security-policy": "style-src 'self'; connect-src 'self'"
       });
-      response.end('<!doctype html><meta charset="utf-8"><title>DataAgent fixture</title><h1>会话验收</h1>');
+      response.end('<!doctype html><meta charset="utf-8"><title>DataAgent fixture</title><link rel="stylesheet" href="/viewport-scroll.css"><h1>会话验收</h1>');
       return;
     }
     if (!url.pathname.startsWith("/rest/flow/api/v1/conversations/")) {
@@ -115,9 +120,25 @@ async function trial() {
   const pageErrors = [];
   try {
     const extension = await installFixtureCopy(dir, origin);
+    // Fault injection is confined to this disposable extension copy.
+    // First registration is rejected; first authenticated frame never
+    // completes rendering. The next mount must recover on its own.
+    const hostPath = path.join(extension, "surface-host.js");
+    const hostSource = await fs.readFile(hostPath, "utf8");
+    const regAnchor = 'const result = await chrome.runtime.sendMessage({ kind: "tp.surface.register" }).catch(() => null);';
+    const sizeAnchor = 'else if (msg.type === "tp-frame-size") sizePanel(msg.expanded, msg.panelHeight);';
+    assert.ok(hostSource.includes(regAnchor) && hostSource.includes(sizeAnchor));
+    await fs.writeFile(hostPath, hostSource.replace(regAnchor,
+      'const fault = new URL(location.href).searchParams.has("fixture-recover");' +
+      'const attempt = fault ? Number(document.documentElement.dataset.fixtureMountAttempts || 0) + 1 : 0;' +
+      'if (fault) document.documentElement.dataset.fixtureMountAttempts = String(attempt);' +
+      'const result = attempt === 1 ? null : await chrome.runtime.sendMessage({ kind: "tp.surface.register" }).catch(() => null);')
+      .replace(sizeAnchor, 'else if (msg.type === "tp-frame-size") {' +
+      'if (new URL(location.href).searchParams.has("fixture-recover") && document.documentElement.dataset.fixtureMountAttempts === "2") return;' +
+      'sizePanel(msg.expanded, msg.panelHeight); }'));
     context = await chromium.launchPersistentContext(path.join(dir, "profile"), {
       channel: "chromium", headless: true, viewport: { width: 1400, height: 880 },
-      ignoreDefaultArgs: ["--disable-extensions", "--disable-background-timer-throttling", "--disable-renderer-backgrounding"],
+      ignoreDefaultArgs: ["--disable-extensions", "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--hide-scrollbars"],
       args: ["--disable-extensions-except=" + extension, "--load-extension=" + extension, "--no-proxy-server"]
     });
     const monitor = page => {
@@ -172,8 +193,8 @@ async function trial() {
         return { zero, active, selected, selectedZero };
       } finally { clone.remove(); }
     });
-    assert.deepEqual(palette.zero.map(p => p.base), ["59 119 156", "148 126 83", "86 117 137"]);
-    assert.deepEqual(palette.active.map(p => p.base), ["65 151 204", "194 150 61", "111 154 177"]);
+    assert.deepEqual(palette.zero.map(p => p.base), ["59 119 156", "148 126 83", "155 84 85"]);
+    assert.deepEqual(palette.active.map(p => p.base), ["65 151 204", "194 150 61", "203 105 94"]);
     assert.equal(new Set(palette.zero.map(p => p.base)).size, 3);
     const brightness = color => color.split(" ").map(Number).reduce((sum, channel, i) => sum + channel * [0.2126, 0.7152, 0.0722][i], 0);
     for (let i = 0; i < 3; i++) {
@@ -193,6 +214,40 @@ async function trial() {
     assert.deepEqual(vertical, { x: 1372, y: 22, width: 28, height: 96 });
     const pillFont = await compact.locator(".number").first().evaluate(el => getComputedStyle(el).fontSize);
     assert.equal(pillFont, "16px");
+    async function assertFitsContentViewport(page, locator) {
+      let bounds, size;
+      for (let i = 0; i < 60; i++) {
+        size = await page.evaluate(() => ({ width: document.documentElement.clientWidth,
+          height: document.documentElement.clientHeight, innerWidth, innerHeight }));
+        bounds = await locator.boundingBox();
+        if (bounds && bounds.x >= 0 && bounds.y >= 0 &&
+            bounds.x + bounds.width <= size.width + .5 && bounds.y + bounds.height <= size.height + .5) break;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      assert.ok(size.width < size.innerWidth && size.height < size.innerHeight, "fixture must have classic scrollbars");
+      assert.ok(bounds && bounds.x >= 0 && bounds.y >= 0 &&
+        bounds.x + bounds.width <= size.width + .5 && bounds.y + bounds.height <= size.height + .5,
+        JSON.stringify({ bounds, size }));
+      return bounds;
+    }
+    await page.evaluate(() => document.documentElement.classList.add("fixture-scroll"));
+    await worker.evaluate(() => chrome.storage.local.set({ "tp-web-position": { x: 1, y: 1 } }));
+    const atScrollEdge = await assertFitsContentViewport(page, compact);
+    assert.equal(atScrollEdge.width, 28); assert.equal(atScrollEdge.height, 96);
+    await compact.hover();
+    await panel.waitFor({ state: "visible" });
+    await assertFitsContentViewport(page, panel);
+    await page.mouse.move(500, 300);
+    await panel.waitFor({ state: "hidden" });
+    await worker.evaluate(() => chrome.storage.local.remove("tp-web-position"));
+    await page.evaluate(() => document.documentElement.classList.remove("fixture-scroll"));
+    for (let i = 0; i < 60; i++) {
+      const box = await compact.boundingBox();
+      if (box?.x === vertical.x && box?.y === vertical.y) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.deepEqual(await compact.boundingBox(), vertical);
+    console.log("Native capsule and expanded panel remain inside classic scrollbars");
     await compact.hover();
     await panel.waitFor({ state: "visible" });
     await compact.waitFor({ state: "hidden" });
@@ -243,6 +298,10 @@ async function trial() {
     const group = panel.locator(".group-head").filter({ hasText: "数据质量" });
     await group.click();
     assert.equal((await group.boundingBox()).height, 26);
+    const groupText = () => group.locator(".group-name").evaluate(el => ({
+      color: getComputedStyle(el).color, opacity: getComputedStyle(el).opacity
+    }));
+    assert.deepEqual(await groupText(), { color: "rgb(238, 246, 251)", opacity: "1" });
     const first = panel.locator("[data-cid='11'] .task-name");
     await first.waitFor();
     assert.equal((await panel.locator(".row.running").boundingBox()).height, 28);
@@ -307,6 +366,8 @@ async function trial() {
     assert.equal(await opacityOf(horizontal), "0.75");
     assert.equal(await opacityOf(compact), "0.75");
     assert.equal(await opacityOf(panel), "1", "the surrounding panel must not fade");
+    assert.deepEqual(await groupText(), { color: "rgb(238, 246, 251)", opacity: "1" },
+      "idle group titles remain white");
     assert.deepEqual((await readPalette(horizontal)).map(p => p.base), palette.zero.map(p => p.base));
     await attention.click();
     assert.equal(await attention.getAttribute("aria-pressed"), "true");
@@ -505,6 +566,59 @@ async function trial() {
     await created.locator(root + " [data-cid='11']").waitFor({ state: "hidden" });
     assert.deepEqual(pageErrors, []);
     console.log("Synthetic account switch hides and stops retaining inaccessible prior-account tasks");
+
+    // A new tab can activate before it has a real URL. Remove dynamic
+    // registration to force the actual onUpdated completion recovery.
+    const registrations = await worker.evaluate(() => chrome.scripting.getRegisteredContentScripts({ ids: ["taskpulse-global-surface"] }));
+    assert.equal(registrations.length, 1);
+    await worker.evaluate(() => chrome.scripting.unregisterContentScripts({ ids: ["taskpulse-global-surface"] }));
+    const recovering = monitor(await context.newPage());
+    await recovering.goto(externalUrl + "?fixture-recover=1");
+    await recovering.bringToFront();
+    let recoveredFrame;
+    for (let i = 0; i < 120; i++) {
+      const attempts = await recovering.evaluate(() => Number(document.documentElement.dataset.fixtureMountAttempts || 0));
+      recoveredFrame = recovering.frames().find(f => f.url().includes("surface.html#panel/"));
+      if (attempts >= 3 && recoveredFrame) {
+        const ready = await recoveredFrame.locator(root + " .window").isVisible().catch(() => false);
+        if (ready) break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.equal(await recovering.evaluate(() => Number(document.documentElement.dataset.fixtureMountAttempts || 0)), 3);
+    const recoveredPanel = recoveredFrame.locator(root + " .panel");
+    const recoveredCompact = recoveredFrame.locator(root + " .compact");
+    await recoveredPanel.waitFor({ state: "visible", timeout: 8_000 });
+    const probeSurface = () => worker.evaluate(async url => {
+      const tab = (await chrome.tabs.query({})).find(t => t.url === url);
+      return chrome.tabs.sendMessage(tab.id, { kind: "tp.surface-probe" }, { frameId: 0 });
+    }, recovering.url());
+    assert.equal((await probeSurface()).ok, true);
+    await recovering.evaluate(() => document.getElementById("taskpulse-global-host").remove());
+    const lost = await probeSurface();
+    assert.deepEqual(lost, { ok: false, installed: true });
+    for (let i = 0; i < 60; i++) {
+      const result = await probeSurface().catch(() => null);
+      if (result?.ok) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.equal((await probeSurface()).ok, true);
+    assert.equal(await recovering.locator("#taskpulse-global-host").count(), 1);
+    const frameAfter = await waitFrame(recovering, "panel");
+    await recovering.evaluate(() => document.documentElement.classList.add("fixture-scroll"));
+    await worker.evaluate(() => chrome.storage.local.set({ "tp-web-position": { x: 1, y: 1 } }));
+    const boundedPanel = frameAfter.locator(root + " .panel");
+    await boundedPanel.waitFor({ state: "visible" });
+    await assertFitsContentViewport(recovering, boundedPanel);
+    await boundedPanel.locator(".close").click();
+    const boundedCompact = frameAfter.locator(root + " .compact");
+    await boundedCompact.waitFor({ state: "visible" });
+    const bounds = await assertFitsContentViewport(recovering, boundedCompact);
+    assert.equal(bounds.width, 28); assert.equal(bounds.height, 96);
+    await worker.evaluate(() => chrome.storage.local.remove("tp-web-position"));
+    await recovering.close();
+    await worker.evaluate(value => chrome.scripting.registerContentScripts(value), registrations);
+    console.log("New-tab completion, bounded failed-register/frame recovery, detached-host repair and isolated scrollbar geometry passed");
     await options.bringToFront();
     await options.locator("#global").click();
     await options.locator("#global").filter({ hasText: "启用全网页显示" }).waitFor();

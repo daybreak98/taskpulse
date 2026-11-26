@@ -1687,3 +1687,59 @@ test("top and side pills are exact rotations; expansion replaces the capsule wit
   assert.ok(clamped.left >= 0 && clamped.top >= 0 && clamped.left + clamped.width <= 320 && clamped.top + clamped.height <= 180);
   assert.deepEqual(ui.glassLayout(top, 1400, 880), a);
 });
+
+test("surface geometry uses content viewport without classic scrollbars", () => {
+  const win = { innerWidth: 1400, innerHeight: 880, document: {
+    compatMode: "CSS1Compat", documentElement: { clientWidth: 1380, clientHeight: 862 }
+  } };
+  const v = ui.viewportSize(win);
+  assert.deepEqual(v, { width: 1380, height: 862 });
+  const right = ui.glassLayout({ x: 1, y: 1 }, v.width, v.height);
+  assert.deepEqual({ left: right.left, top: right.top, width: right.width, height: right.height },
+    { left: 1352, top: 766, width: 28, height: 96 });
+  const top = ui.glassLayout({ x: 1, y: 0, edge: "top" }, v.width, v.height);
+  assert.equal(top.left + top.width, 1380);
+  const panel = ui.glassLayout({ x: 1, y: 1 }, v.width, v.height, true, 350);
+  assert.equal(panel.left + panel.width, 1380);
+  assert.equal(panel.top + panel.height, 862);
+  win.document.compatMode = "BackCompat";
+  win.document.body = { clientWidth: 1376, clientHeight: 860 };
+  assert.deepEqual(ui.viewportSize(win), { width: 1376, height: 860 });
+});
+
+test("new-tab completion retries the real document after early activation and transient injection failure", async () => {
+  const app = worker();
+  app.local.data[ui.keys.enabled] = true;
+  app.chrome.permissions = { contains: async () => true };
+  app.tabs[0].active = false;
+  const tab = { id: 9, windowId: 1, url: "chrome://newtab/", status: "loading", active: true };
+  app.tabs.push(tab);
+  let attempts = 0, probes = 0, installed = false;
+  app.chrome.scripting = { executeScript: async ({ target }) => {
+    assert.equal(target.tabId, tab.id);
+    if (++attempts === 1) throw new Error("transient injection rejection");
+    installed = true;
+  } };
+  app.chrome.tabs.sendMessage = async (tabId, msg) => {
+    if (tabId === tab.id && msg.kind === "tp.surface-probe") {
+      probes++;
+      return installed ? { ok: false, installed: true } : null;
+    }
+    return null;
+  };
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: tab.id, windowId: 1 });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(attempts, 0);
+  tab.url = "https://example.com/work";
+  tab.status = "complete";
+  app.chrome.tabs.onUpdated.listeners[0](tab.id, { status: "complete" }, tab);
+  for (let i = 0; i < 100 && !installed; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(attempts, 2);
+  assert.ok(installed);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const before = probes;
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: tab.id, windowId: 1 });
+  for (let i = 0; i < 50 && probes === before; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(probes > before);
+  assert.equal(attempts, 2, "installed but not ready host handles its own recovery");
+});

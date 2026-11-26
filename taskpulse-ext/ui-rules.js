@@ -7,6 +7,17 @@
     toast: tabId => "tp-web-toast:" + tabId
   };
   const origins = ["http://*/*", "https://*/*"];
+  // innerWidth/Height include classic scrollbars; fixed overlay geometry
+  // must use the drawable content viewport, including in quirks mode.
+  function viewportSize(win) {
+    const doc = win.document;
+    const root = doc?.compatMode === "BackCompat" ? doc.body : doc?.documentElement;
+    const dimension = (client, inner) => Math.max(1, Math.floor(
+      Number.isFinite(client) && client > 0 ? Math.min(client, Number.isFinite(inner) && inner > 0 ? inner : client) :
+        Number.isFinite(inner) && inner > 0 ? inner : 1));
+    return { width: dimension(root?.clientWidth, win.innerWidth),
+      height: dimension(root?.clientHeight, win.innerHeight) };
+  }
   const clamp = (value, lo, hi) => Math.min(Math.max(value, lo), Math.max(lo, hi));
   const normalized = value => ({
     x: Number.isFinite(value?.x) ? clamp(value.x, 0, 1) : 1,
@@ -108,5 +119,5 @@
     if (match && (!match.agentId || match.agentId === task.agentId)) return match;
     return { key: "closed:" + platform, name: "未打开 · " + platform, color: "" };
   }
-  globalThis.TaskPulseUI = { keys, origins, normalized, place, move, pill, glassLayout, glassClip, ordinary, buildGroups, groupFor };
+  globalThis.TaskPulseUI = { keys, origins, viewportSize, normalized, place, move, pill, glassLayout, glassClip, ordinary, buildGroups, groupFor };
 })();

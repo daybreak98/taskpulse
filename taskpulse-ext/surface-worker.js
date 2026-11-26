@@ -7,6 +7,7 @@
     const sideUrl = chrome.runtime.getURL("sidepanel.html");
     let groupTimer = null, groupLane = Promise.resolve(), permissionLane = Promise.resolve();
     let surfaceEnabled = null;
+    const ensuring = new Map();
 
     async function authorized(tab) {
       const url = ui.ordinary(tab?.url);
@@ -74,12 +75,43 @@
       return { ok: true, tasks, remaining: Math.max(0, 15_000 - (Date.now() - notice.at)) };
     }
     async function ensure(tab) {
-      if (!await authorized(tab) || !tab.active) return false;
-      if ((await signal(tab.id, { kind: "tp.surface-probe" }))?.ok) return true;
-      try {
-        await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["config.js", "ui-rules.js", "surface-host.js"] });
-        return true;
-      } catch { return false; }
+      if (!Number.isInteger(tab?.id)) return false;
+      const actual = await actualTab(tab.id);
+      // onActivated can run against the initial blank/loading document.
+      // Do not let such an attempt block a subsequent completion event.
+      if (!actual?.active || actual.status !== "complete" ||
+          actual.pendingUrl && actual.pendingUrl !== actual.url || !await authorized(actual)) return false;
+      const key = actual.id + "/" + actual.url;
+      if (ensuring.has(key)) return ensuring.get(key);
+      const work = (async () => {
+        const probe = await signal(actual.id, { kind: "tp.surface-probe" });
+        if (probe?.ok) return true;
+        // A host that is installed but not rendered recovers locally on
+        // probe. Do not inject duplicate scripts or rotate its frame token.
+        if (probe?.installed) return true;
+        // A transient injection failure gets one bounded retry, after
+        // checking the actual page/permission again. No periodic polling.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (attempt) await new Promise(resolve => setTimeout(resolve, 250));
+          const current = await actualTab(actual.id);
+          if (!current?.active || current.url !== actual.url || current.status !== "complete" ||
+              current.pendingUrl && current.pendingUrl !== current.url || !await authorized(current)) return false;
+          try {
+            if (attempt) {
+              const existing = await signal(current.id, { kind: "tp.surface-probe" });
+              if (existing?.ok || existing?.installed) return true;
+            }
+            await chrome.scripting.executeScript({ target: { tabId: current.id }, files: ["config.js", "ui-rules.js", "surface-host.js"] });
+            const after = await signal(current.id, { kind: "tp.surface-probe" });
+            // Host can accept pending notices; probe.ok itself is reserved
+            // for the completed rendering handshake.
+            if (after?.ok || after?.installed) return true;
+          } catch {}
+        }
+        return false;
+      })().finally(() => ensuring.delete(key));
+      ensuring.set(key, work);
+      return work;
     }
     async function notify(tab, tasks) {
       if (!tasks.length || !await authorized(tab)) return false;
