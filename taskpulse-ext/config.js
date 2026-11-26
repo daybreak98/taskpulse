@@ -52,7 +52,7 @@
       marks: ["当前服务繁忙", "tpm limit"]
     },
     timing: {
-      tick: 2_000, report: 4_000, list: 30_000, hot: 5_000, idle: 60_000,
+      tick: 2_000, report: 4_000, list: 15_000, hot: 5_000, idle: 60_000,
       hotWindow: 120_000, queueBudget: 6, watch: 24, round: 10_000, request: 4_000,
       queueStale: 120_000, sourceStale: 180_000
     },

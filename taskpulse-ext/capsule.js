@@ -334,8 +334,18 @@
       panelClock = setInterval(() => updateTimes(Date.now()), 1_000);
     }
     if (!expanded) return;
-    note.textContent = warning;
-    note.hidden = !warning;
+    // 数据龄只写进面板：切到后台时 Chrome 会把定时器节流到分钟级，
+    // 采集靠 30 秒一次的 alarm 唤醒。告诉用户「不是卡住」，但不要
+    // 让胶囊变成告警色——那是故障才该有的样子。
+    let panelNote = warning;
+    if (!panelNote) {
+      const age = Date.now() - (state.at || 0);
+      if (age > 12_000) {
+        panelNote = `数据 ${Math.round(age / 1000)} 秒前（页面在后台时 Chrome 会限流，最多约 30 秒一次）`;
+      }
+    }
+    note.textContent = panelNote;
+    note.hidden = !panelNote;
     drawRows(view.tasks, view.stale);
     updateTimes(now);
   }
