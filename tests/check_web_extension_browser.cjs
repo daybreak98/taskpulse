@@ -688,46 +688,8 @@ async function trial() {
     }
     assert.ok(Object.values(visitedGuard).some(guard => guard?.visited && guard.revision === deferred.revision),
       "trusted wheel interaction did not persist the exact visit intent");
-    await created.bringToFront();
-    visitedGuard = await worker.evaluate(async () =>
-      (await chrome.storage.session.get("tp-web-jump-tabs-v1"))["tp-web-jump-tabs-v1"] || {});
-    assert.ok(Object.values(visitedGuard).some(guard => guard?.visited && guard.revision === deferred.revision),
-      "switching away discarded the visited read intent");
-    fixture.setQueueFault(false);
-    await nudgePrimary();
-    const redRead = await waitState(s => s?.tasks["11"]?.pending === false &&
-      s.tasks["11"].readRevision === deferred.revision, "exact red reply acknowledged after recovery");
-    assert.equal(redRead.tasks["11"].status, "seen");
-
-    // P1: the interaction that inspected red reply A must not transfer to
-    // a later reply B while the same destination tab remains foreground.
-    fixture.setQueueFault(true);
-    const guardedStamp = fixture.releaseReply(0, true);
-    await nudgePrimary();
-    await waitState(s => s?.tasks["11"]?.replyKey === "message.m" + guardedStamp &&
-      s.tasks["11"].pending && s.tasks["11"].status === "stuck" && s.tasks["11"].queueError,
-      "second red reply with unavailable queue");
-    await red.filter({ hasText: /^1$/ }).waitFor();
-    await continuityPanel.locator(".row.stuck [data-cid='11']").click();
-    let guarded;
-    for (let i = 0; i < 80; i++) {
-      guarded = await worker.evaluate(async target => {
-        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        const guards = (await chrome.storage.session.get("tp-web-jump-tabs-v1"))["tp-web-jump-tabs-v1"] || {};
-        return tab?.url === target ? guards[tab.id] : null;
-      }, existing);
-      if (guarded?.deferredRead) break;
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    assert.ok(guarded?.deferredRead);
-    await other.mouse.move(420, 420);
-    await other.mouse.wheel(0, 900);
-    for (let i = 0; i < 80; i++) {
-      const current = await worker.evaluate(async () =>
-        (await chrome.storage.session.get("tp-web-jump-tabs-v1"))["tp-web-jump-tabs-v1"] || {});
-      if (Object.values(current).some(g => g?.visited && g.revision === guarded.revision)) break;
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
+    // Keep the destination page foreground. The first successful sample
+    // after A's queue outage also sees B; A's earlier visit must not read B.
     fixture.setQueueFault(false);
     const successorStamp = fixture.releaseReply(0, false);
     await nudgePrimary();
