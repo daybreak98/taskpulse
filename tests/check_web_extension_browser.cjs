@@ -18,6 +18,7 @@ async function startFixture() {
   const requests = [];
   let updated = seed, working = true, lastReply = seed, pendingReply = seed, replyReadyAt = 0;
   let lastFailed = false, pendingFailed = false, queueFault = false, listFault = false;
+  let queueDenied = false, listRegression = false;
   let account = "a";
   const alternate = { id: 21, agentId: 515, name: "合成账号 B 的会话" };
   const expired = { id: 22, agentId: 515, name: "25 小时前的会话" };
@@ -54,6 +55,9 @@ async function startFixture() {
       response.writeHead(account === "logout" ? 401 : 403).end();
       return;
     }
+    if (account === "a" && queueDenied && url.pathname.endsWith("/11/queue")) {
+      response.writeHead(403).end(); return;
+    }
     if (account === "a" && (listFault && url.pathname.endsWith("/list") ||
         queueFault && url.pathname.endsWith("/11/queue"))) {
       response.writeHead(503).end(); return;
@@ -70,7 +74,7 @@ async function startFixture() {
       ] }], ungrouped: { conversations: [] } };
     } else if (url.pathname.endsWith("/list")) {
       data = { groups: [{ name: "数据质量", conversations: [
-        { ...task, updateTime: updated, createTime: seed },
+        { ...task, updateTime: listRegression ? seed - 1 : updated, createTime: seed },
         { ...unopened, updateTime: seed, createTime: seed },
         { id: 13, agentId: 515, name: "未打开的近期会话", updateTime: seed, createTime: seed }
       ] }], ungrouped: { conversations: [] } };
@@ -102,6 +106,8 @@ async function startFixture() {
     startRun: () => { working = true; updated = Date.now() + 1; return updated; },
     setQueueFault: value => { queueFault = value; },
     setListFault: value => { listFault = value; },
+    setQueueDenied: value => { queueDenied = value; },
+    setListRegression: value => { listRegression = value; },
     setAccount: value => { account = value; }
   };
 }
@@ -603,11 +609,19 @@ async function trial() {
     await nudgePrimary();
     await waitState(s => s?.error === "HTTP 503" && s.tasks["11"]?.pending, "list outage for unread");
     fixture.setListFault(false);
+    fixture.setQueueFault(true);
     await nudgePrimary();
-    await waitState(s => !s?.error && !s?.sourceUnavailable && s?.tasks["11"]?.pending &&
-      s.tasks["11"].observedAt >= s.revalidateAfter && !s.tasks["11"].messageUncertain &&
-      !s.tasks["11"].queueError, "unread revalidated after list outage");
-    await yellow.filter({ hasText: /^1$/ }).waitFor();
+    const partialRecovery = await waitState(s => !s?.error && !s?.sourceUnavailable &&
+      s?.tasks["11"]?.pending && s.tasks["11"].queueError,
+      "list recovered while the conversation queue remains unavailable");
+    assert.equal(partialRecovery.tasks["11"].replyKey, "message.m" + continuityStamp);
+    await yellow.filter({ hasText: /^1$/ }).waitFor({ timeout: 8_000 });
+    assert.equal(await continuityGroup.locator(".group-open").textContent(), "1");
+    console.log("Partial list recovery keeps the previously verified yellow reply visible");
+    fixture.setQueueFault(false);
+    await nudgePrimary();
+    await waitState(s => s?.tasks["11"]?.pending && !s.tasks["11"].queueError,
+      "queue revalidated after partial recovery");
     fixture.setQueueFault(true);
     await nudgePrimary();
     const uncertainUnread = await waitState(s => s?.tasks["11"]?.queueError &&
@@ -657,11 +671,54 @@ async function trial() {
     }
     assert.ok(deferred, "red row did not retain exact landed deferred read");
     assert.ok(deferred.revision.endsWith("message.m" + redStamp));
+    // A real trusted wheel event records that the user inspected the
+    // conversation. Switching away must preserve this exact read intent.
+    await other.mouse.move(420, 420);
+    await other.mouse.wheel(0, 900);
+    let visitedGuard;
+    for (let i = 0; i < 80; i++) {
+      visitedGuard = await worker.evaluate(async () =>
+        (await chrome.storage.session.get("tp-web-jump-tabs-v1"))["tp-web-jump-tabs-v1"] || {});
+      if (Object.values(visitedGuard).some(guard => guard?.visited && guard.revision === deferred.revision)) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(Object.values(visitedGuard).some(guard => guard?.visited && guard.revision === deferred.revision),
+      "trusted wheel interaction did not persist the exact visit intent");
+    await created.bringToFront();
+    visitedGuard = await worker.evaluate(async () =>
+      (await chrome.storage.session.get("tp-web-jump-tabs-v1"))["tp-web-jump-tabs-v1"] || {});
+    assert.ok(Object.values(visitedGuard).some(guard => guard?.visited && guard.revision === deferred.revision),
+      "switching away discarded the visited read intent");
     fixture.setQueueFault(false);
     await nudgePrimary();
     const redRead = await waitState(s => s?.tasks["11"]?.pending === false &&
       s.tasks["11"].readRevision === deferred.revision, "exact red reply acknowledged after recovery");
     assert.equal(redRead.tasks["11"].status, "seen");
+
+    // A per-conversation 403 must win over a regressed list row, hide the
+    // prior-account title and withdraw its notification.
+    const deniedStamp = fixture.releaseReply(0, true);
+    await nudgePrimary();
+    await waitState(s => s?.tasks["11"]?.replyKey === "message.m" + deniedStamp &&
+      s.tasks["11"].pending && s.tasks["11"].status === "stuck", "reply before per-conversation denial");
+    await red.filter({ hasText: /^1$/ }).waitFor();
+    fixture.setListRegression(true);
+    fixture.setQueueDenied(true);
+    await nudgePrimary();
+    const denied = await waitState(s => s?.tasks["11"]?.accessDeniedAt &&
+      s.tasks["11"].listUncertain, "403 combined with a regressed list");
+    assert.equal(denied.tasks["11"].pending, true);
+    assert.equal((await notifications()).length, 0);
+    await continuityPanel.locator("[data-cid='11']").waitFor({ state: "hidden" });
+    fixture.setQueueDenied(false);
+    fixture.setListRegression(false);
+    await nudgePrimary();
+    await waitState(s => s?.tasks["11"]?.pending && !s.tasks["11"].accessDeniedAt &&
+      !s.tasks["11"].listUncertain, "per-conversation access restored with fresh queue evidence");
+    await red.filter({ hasText: /^1$/ }).waitFor();
+    await continuityPanel.locator(".row.stuck [data-cid='11']").click();
+    await waitState(s => s?.tasks["11"]?.pending === false, "red reply acknowledged after access recovery");
+
     await created.bringToFront();
     // The selected red filter has no match. Manually opening a quiet group
     // must not leak nonmatching historical/seen rows into filter results.

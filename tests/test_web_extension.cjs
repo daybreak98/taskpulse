@@ -2145,6 +2145,7 @@ test("P1 DA and TAB counters, actual group badges and filter membership agree du
   state.tasks["44"] = { ...unread, id: "44", status: "stuck", runAt: now, awaitingReply: true,
     pending: false, replyKey: undefined, replyAt: 0 };
   state.tasks["45"] = { ...unread, id: "45", status: "stuck", failed: true };
+  state.tasks["45"].replyVerifiedRevision = rules.revision(state.tasks["45"]);
   state.tasks["46"] = { ...unread, id: "46", status: "running", runAt: now, awaitingReply: true,
     queueError: false, observedAt: at, pending: false, replyKey: undefined, replyAt: 0 };
   const tabs = [id, "43", "44", "46"].map((cid, i) => ({
@@ -2232,4 +2233,125 @@ test("P2 running and stuck row fills have distinct visible tint while capsule pa
     const match = css.match(new RegExp("\\.row\\." + kind + "\\s*\\{[^}]*--row-tint:\\s*rgb\\([^/]+/\\s*([.\\d]+)\\)"));
     assert.ok(match && Number(match[1]) >= minimum, kind + " row tint is too faint");
   }
+});
+
+
+async function landRedReplyForVisit(app, replyId = "A") {
+  const update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, replyId, { failed: true }));
+  const revision = exactRevision(app);
+  await app.deliver(report(now + 10_000, row(update), { busy: null, queueError: true }));
+  const target = { id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete", active: false };
+  app.tabs.push(target);
+  const opened = await app.send({ kind: "tp.open", id, revision, intent: "row" });
+  assert.equal(opened.ok, true);
+  assert.equal(currentTask(app).pending, true);
+  return { target, revision, update };
+}
+
+async function markVisitedAndSwitchAway(app, target, at = now + 11_000) {
+  const sender = { id: "unit", frameId: 0, tab: target, url: target.url };
+  const visit = await app.send({ kind: "tp.visit", id, at }, sender);
+  assert.equal(visit.ok, true);
+  const guards = () => app.session.data["tp-web-jump-tabs-v1"] || {};
+  const visited = guards()["9"];
+  target.active = false;
+  app.tabs[0].active = true;
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: 7, windowId: 1 });
+  await new Promise(resolve => setTimeout(resolve, 15));
+  return { visit, guard: guards()["9"], visited };
+}
+
+test("P1 verified unread survives partial list recovery while its queue still fails", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  const revision = exactRevision(app);
+  await app.deliver(report(now + 10_000, row(update), { busy: null, error: "HTTP 503" }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 10_000).stale, true);
+  await app.deliver(report(now + 15_000, row(update), { busy: null, queueError: true }));
+  const state = app.local.data[web.keys.state], view = rules.view(state, now + 15_000);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(currentTask(app).replyKey, "message.A");
+  assert.equal(view.stale, false, "list has recovered");
+  assert.equal(view.tasks[0].uncertain, true, "queue is still unconfirmed");
+  assert.equal(view.counts.attention, 1, "confirmed unread must not turn into zero");
+  assert.equal(panelGroups(view, "attention").groups.reduce((n, g) => n + g.matched.length, 0), 1);
+  assert.equal(app.notices.size, 1, "no duplicate or premature notification removal");
+  await app.deliver(report(now + 20_000, row(update), { busy: null, queueError: true }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 20_000).counts.attention, 1);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(exactRevision(app), revision);
+});
+
+test("P1 per-conversation access denial is applied even when the list row regresses", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  assert.equal(app.notices.size, 1);
+  await app.deliver(report(now + 10_000, row(old), { busy: null, accessError: true }));
+  const state = app.local.data[web.keys.state], task = currentTask(app);
+  assert.ok(task.accessDeniedAt, "403 evidence must not be skipped by the list-regression branch");
+  assert.equal(rules.taskAccessible(state, task), false);
+  assert.equal(rules.view(state, now + 10_000).tasks.length, 0);
+  assert.equal(app.notices.size, 0, "inaccessible prior-account notification must be withdrawn");
+  assert.equal(task.pending, true, "access denial hides; it does not fake a read");
+});
+
+test("P1 trusted visit survives switching away and acknowledges only the exact red reply after recovery", async () => {
+  const app = worker();
+  const { target, revision, update } = await landRedReplyForVisit(app, "A");
+  const result = await markVisitedAndSwitchAway(app, target);
+  assert.equal(result.visited?.deferredRead, true);
+  assert.equal(result.visited?.visited, true, "trusted page interaction must persist the visit intent");
+  assert.equal(result.guard?.token, result.visited.token, "switching away must retain the exact read intent");
+  assert.equal(currentTask(app).pending, true);
+  await app.deliver(replyReport(now + 15_000, update, "A", { failed: true }));
+  assert.equal(currentTask(app).pending, false);
+  assert.equal(currentTask(app).readRevision, revision);
+  assert.equal(currentTask(app).replyKey, "message.A");
+  assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"], undefined,
+    "successful durable read must release its guard");
+});
+
+test("P1 visited red reply intent cannot clear a later reply or an active run", async () => {
+  for (const mode of ["newer", "running"]) {
+    const app = worker();
+    const { target, revision, update } = await landRedReplyForVisit(app, "A");
+    const result = await markVisitedAndSwitchAway(app, target);
+    assert.equal(result.guard?.visited, true);
+    if (mode === "running") {
+      await app.deliver(report(now + 15_000, row(update), { busy: true }));
+      assert.equal(currentTask(app).pending, true);
+      assert.ok(currentTask(app).runAt);
+      assert.equal(currentTask(app).readRevision, undefined);
+      assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"]?.token, result.guard.token);
+    } else {
+      await app.deliver(replyReport(now + 15_000, now + 14_000, "B", { failed: true }));
+      assert.equal(currentTask(app).pending, true);
+      assert.equal(currentTask(app).replyKey, "message.B");
+      assert.notEqual(exactRevision(app), revision);
+      assert.equal(currentTask(app).readRevision, undefined);
+      assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"], undefined,
+        "the stale A intent must be discarded, not applied to B");
+      assert.ok([...app.notices.keys()].some(key => key.endsWith("message.B")));
+    }
+  }
+});
+
+test("P1 account authorization loss invalidates a visited red-read intent without acknowledging it", async () => {
+  const app = worker();
+  const { target } = await landRedReplyForVisit(app, "A");
+  const result = await markVisitedAndSwitchAway(app, target);
+  assert.equal(result.guard?.visited, true);
+  await app.deliver(report(now + 15_000, row(now + 14_000), { busy: null, error: "HTTP 401" }));
+  assert.equal(app.local.data[web.keys.state].authBlocked, true);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(currentTask(app).readRevision, undefined);
+  assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"], undefined,
+    "account authorization loss must invalidate the prior account's read intent");
+  await app.deliver(report(now + 20_000, row(now + 14_000)));
+  assert.equal(currentTask(app).pending, true, "reauthentication must not replay the old visit intent");
+  assert.equal(currentTask(app).readRevision, undefined);
 });
