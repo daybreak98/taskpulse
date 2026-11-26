@@ -134,32 +134,39 @@
     return message;
   }
 
-  function replyIdentity(task, message) {
+  function replyIdentity(_task, message) {
     if (message?.sender !== "assistant") return "";
     if (message.messageId) return "message." + encodeURIComponent(String(message.messageId).toWellFormed());
     const at = time(message.atMessage);
-    return at ? "time." + at : "update." + task.update;
+    // A conversation-list watermark schedules a probe; it is not a reply identity.
+    return at ? "time." + at : "";
   }
 
   function newReply(task, message, key) {
     if (!key || key === task.replyKey || task.replyKeys?.includes(key) ||
         message.messageId && message.messageId === task.lastAssistant) return false;
+    const activeRun = Boolean(task.awaitingReply || task.runAt);
+    const runStart = task.runCycleAt || task.runAt || task.lastBusyAt || 0;
     const at = time(message.atMessage);
     if (at) {
-      if (at > Math.max(task.acked || 0, task.replyAt || 0, task.historyAt || 0)) return true;
+      const floor = Math.max(task.acked || 0, task.replyAt || 0, task.historyAt || 0,
+        activeRun ? runStart : 0);
+      if (at > floor) return true;
+      if (activeRun) return false;
       return Boolean(message.messageId && task.lastAssistant && at === task.replyAt &&
         at >= (task.acked || 0) && at > (task.historyAt || 0));
     }
-    // A changed server ID from the latest-message endpoint is independent
-    // evidence even if the list clock has not advanced. Require an observed
-    // predecessor or a new list version; the first historical probe is silent.
+    // A changed server ID remains usable when creation time is omitted.
+    // The identity-less case is rejected above, before any list-time fallback.
     if (message.messageId && (task.lastAssistant || task.lastUserMessage) &&
         message.at > (task.messageObservedAt || 0) &&
         (task.replyKey || task.awaitingReply || task.update > Math.max(task.historyAt || 0, task.created || 0) ||
          task.lastUserMessage && task.messageUpdate > (task.historyAt || 0))) return true;
-    return task.update > Math.max(task.acked || 0, task.created || 0, task.replyUpdate || 0, task.historyAt || 0);
+    // The list watermark may support a probe only when the latest assistant
+    // message has its own server ID; it cannot manufacture an identity.
+    return Boolean(message.messageId &&
+      task.update > Math.max(task.acked || 0, task.created || 0, task.replyUpdate || 0, task.historyAt || 0));
   }
-
   function isNewReply(task, message) {
     return !!task && newReply(task, message, replyIdentity(task, message));
   }
@@ -178,7 +185,7 @@
   }
 
   function verifiedReply(task) {
-    return /^(message|time|update)\./.test(task.replyKey || "");
+    return /^(message|time)\./.test(task.replyKey || "");
   }
 
   function canAcknowledge(task) {
@@ -229,7 +236,8 @@
     task.observedAt = at;
 
     if (busy) {
-      task.runCycleAt = task.runAt ? (task.runCycleAt || task.runAt) : at;
+      // Keep the first observation of this run stable across later BUSY polls.
+      task.runCycleAt = started ? (task.runCycleAt || started) : at;
       task.runAt = started || at;
       task.awaitingReply = true;
       task.lastBusyAt = at;
@@ -239,8 +247,6 @@
       return;
     }
 
-    // A cached pre-run message is not evidence about the current run.
-    if (message && task.awaitingReply && message.at < (task.lastBusyAt || started)) message = null;
     const waiting = Boolean(task.awaitingReply || started);
     const needsEvidence = waiting || task.messageUncertain || messageError ||
       task.update > Math.max(task.acked || 0, task.replyUpdate || 0, task.messageUpdate || 0);
@@ -258,7 +264,8 @@
     if (message) {
       task.messageUpdate = task.update;
       task.messageObservedAt = message.at;
-      task.messageUncertain = false;
+      task.messageUncertain = message.sender === "assistant" &&
+        (!key || waiting && !time(message.atMessage) && !changed);
       if (message.sender === "other") {
         const stamp = time(message.atMessage);
         // A user message needs its own server timestamp, newer than both
@@ -290,9 +297,9 @@
                time(message.atMessage) <= Math.max(task.acked || 0, task.historyAt || 0) &&
                (!started || time(message.atMessage) || !message.atMessage)) {
       rememberAssistant(task, key, message);
-    } else if (key && message.messageId) {
-      // A previously rejected (older) server ID remains rejected if a later
-      // response omits its timestamp. Do not advance the current assistant.
+    } else if (key && message.messageId && time(message.atMessage)) {
+      // Remember timestamped older IDs so they cannot become new if a later
+      // response omits the timestamp. Keep timestamp-less candidates retryable.
       rememberAssistant(task, key, message, false);
     }
 
@@ -446,7 +453,8 @@
     for (const task of Object.values(state.tasks)) {
       if (task.listedAt !== state.listAt || !taskAccessible(state, task) ||
           !recentActivity(task, now) || isDismissed(task) || !include(task)) continue;
-      const uncertain = !taskFresh(state, task, now) || task.messageUncertain;
+      const uncertain = !taskFresh(state, task, now) || task.messageUncertain ||
+        task.pending && !verifiedReply(task);
       // Keep DS's confirmed-unread presentation, but use confirmation
       // evidence rather than server creation time after a recovery fence.
       // Legacy snapshots use the previous conservative fallback until the

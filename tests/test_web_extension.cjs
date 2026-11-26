@@ -930,6 +930,122 @@ test("P1 message failure after a user-only success on the same list version rema
   assert.equal(app.notices.size, 1);
 });
 
+test("P1 list watermark alone cannot turn an identity-less assistant sample into a reply", () => {
+  const tracker = timeline();
+  tracker.next(report(now, row(), {
+    message: message(old, now, "A", { atMessage: old })
+  }));
+  tracker.next(report(now + 5_000, row(), { busy: true }));
+  tracker.next(report(now + 8_000, row(), { busy: true }));
+  const update = now + 10_000;
+  const stale = tracker.next(report(now + 15_000, row(update), {
+    message: message(update, now + 15_000, "", { atMessage: 0 })
+  }));
+  assert.equal(stale.task.runAt, now + 5_000);
+  assert.equal(stale.task.runCycleAt, now + 5_000);
+  assert.equal(stale.task.awaitingReply, true);
+  assert.equal(stale.task.status, "running");
+  assert.equal(Boolean(stale.task.pending), false);
+  assert.equal(stale.task.messageUncertain, true);
+  assert.equal(stale.task.replyKey, undefined);
+  assert.equal(stale.replies.length, 0);
+  assert.equal(rules.canAcknowledge(stale.task), false);
+});
+
+test("P1 server timestamp rejects a pre-run assistant even when sampled after BUSY; reply time uses run start", () => {
+  const tracker = timeline();
+  tracker.next(report(now, row(), {
+    message: message(old, now, "prior", { atMessage: old })
+  }));
+  tracker.next(report(now + 5_000, row(), { busy: true }));
+  tracker.next(report(now + 8_000, row(), { busy: true }));
+  const update = now + 10_000;
+  const stale = tracker.next(report(now + 15_000, row(update), {
+    message: message(update, now + 15_000, "stale-A", { atMessage: now + 4_000 })
+  }));
+  assert.equal(stale.task.awaitingReply, true);
+  assert.equal(Boolean(stale.task.pending), false);
+  assert.equal(stale.replies.length, 0);
+  const fresh = tracker.next(report(now + 16_000, row(update), {
+    // B was created after the run started, even though it predates the last BUSY poll.
+    message: message(update, now + 16_000, "B", { atMessage: now + 7_000 })
+  }));
+  assert.equal(fresh.task.awaitingReply, false);
+  assert.equal(fresh.task.status, "attention");
+  assert.equal(fresh.task.pending, true);
+  assert.equal(fresh.task.replyKey, "message.B");
+  assert.equal(fresh.replies.length, 1);
+});
+
+test("P1 a server message ID remains usable without creation time; a missing identity does not", () => {
+  const tracker = timeline();
+  tracker.next(report(now, row(), {
+    message: message(old, now, "A")
+  }));
+  tracker.next(report(now + 5_000, row(), { busy: true }));
+  const update = now + 9_000;
+  const result = tracker.next(report(now + 10_000, row(update), {
+    message: message(update, now + 10_000, "B")
+  }));
+  assert.equal(result.task.awaitingReply, false);
+  assert.equal(result.task.pending, true);
+  assert.equal(result.task.messageUncertain, false);
+  assert.equal(result.task.replyKey, "message.B");
+  assert.equal(result.replies.length, 1);
+});
+
+
+test("P1 assistant without ID and server time stays unconfirmed even when BUSY was not sampled", () => {
+  const tracker = timeline();
+  tracker.next(report(now, row(), {
+    message: message(old, now, "prior", { atMessage: old })
+  }));
+  const update = now + 4_000;
+  const result = tracker.next(report(now + 5_000, row(update), {
+    message: message(update, now + 5_000, "", { atMessage: 0 })
+  }));
+  assert.equal(Boolean(result.task.pending), false);
+  assert.equal(result.task.messageUncertain, true);
+  assert.equal(result.replies.length, 0);
+  const view = rules.view(result.state, now + 5_000);
+  assert.equal(view.counts.attention, 0);
+  assert.equal(view.tasks[0].uncertain, true);
+});
+
+test("legacy update-only pending revisions are unverified, not acknowledgeable, and their old OS notice is withdrawn", async () => {
+  const update = now + 1_000;
+  const state = rules.blank();
+  state.at = now;
+  state.listAt = now;
+  state.baselineAt = old;
+  const task = {
+    id, agentId: agent, name: "旧版无证据提醒", created: old, update,
+    listedAt: now, realListedAt: now, observedAt: now,
+    status: "attention", pending: true, acked: old, replyUpdate: update,
+    replyAt: 0, replyActivityAt: update, replyKey: "update." + update,
+    replyVerifiedAt: now, replyKeys: [], messageUpdate: update,
+    messageObservedAt: now, queueError: false, listUncertain: false
+  };
+  task.replyVerifiedRevision = rules.revision(task);
+  const revision = rules.revision(task);
+  state.tasks[id] = task;
+  state.outbox = { [revision]: { name: task.name, retryAt: 0, at: now } };
+  const noticeId = "tp-reply:" + revision;
+  const app = worker({
+    local: { [web.keys.state]: state },
+    notices: [[noticeId, { title: "TaskPulse", message: task.name }]]
+  });
+  assert.equal(rules.verifiedReply(task), false);
+  assert.equal(rules.canAcknowledge(task), false);
+  await app.deliver(report(now + 5_000, row(update), { busy: false }));
+  const saved = app.local.data[web.keys.state];
+  assert.equal(saved.tasks[id].pending, true);
+  assert.equal(rules.view(saved, now + 5_000).counts.attention, 0);
+  assert.equal(rules.view(saved, now + 5_000).tasks[0].uncertain, true);
+  assert.equal(app.notices.has(noticeId), false);
+  assert.equal(Object.hasOwn(saved.outbox || {}, revision), false);
+});
+
 test("P1 unread A cannot terminate B while latest message still returns A", async () => {
   const app = worker();
   await app.deliver(report(now, row()));
