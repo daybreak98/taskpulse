@@ -70,7 +70,7 @@
         const task = state.tasks[revision.split("/")[0]];
         if (task?.pending && rules.taskFresh(state, task, Date.now()) &&
             rules.canAcknowledge(task) && !rules.isDismissed(task) &&
-            rules.recentActivity(task, Date.now()) && rules.revision(task) === revision)
+            rules.recentNoticeActivity(task, Date.now()) && rules.revision(task) === revision)
           tasks.push({ id: task.id, name: task.name, revision, failed: task.failed });
       }
       return { ok: true, tasks, remaining: Math.max(0, 15_000 - (Date.now() - notice.at)) };
@@ -153,7 +153,11 @@
       if (!chrome.tabGroups?.get) return Promise.resolve();
       const work = async () => {
         const prefs = await chrome.storage.local.get([ui.keys.grouping, ui.keys.tabGroups]);
-        if (prefs[ui.keys.grouping] !== "tab") return;
+        if (prefs[ui.keys.grouping] !== "tab") {
+          if (Object.keys(prefs[ui.keys.tabGroups] || {}).length)
+            await chrome.storage.local.set({ [ui.keys.tabGroups]: {} });
+          return;
+        }
         const tabs = await chrome.tabs.query({ url: web.match });
         const ids = [...new Set(tabs.filter(t => web.conversationId(t.url) && t.groupId >= 0).map(t => t.groupId))];
         const groups = (await Promise.all(ids.map(id => chrome.tabGroups.get(id).catch(() => null)))).filter(Boolean);
@@ -201,6 +205,7 @@
     chrome.permissions?.onRemoved?.addListener(() => void reconcile().catch(() => {}));
     for (const event of ["onCreated", "onUpdated", "onMoved", "onRemoved"])
       chrome.tabGroups?.[event]?.addListener(scheduleGroups);
+    chrome.tabs.onCreated?.addListener(scheduleGroups);
     chrome.tabs.onAttached?.addListener(scheduleGroups);
     chrome.tabs.onDetached?.addListener(scheduleGroups);
     chrome.tabs.onRemoved?.addListener(tabId => {

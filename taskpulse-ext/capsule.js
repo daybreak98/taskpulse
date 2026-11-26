@@ -275,6 +275,7 @@
     for (const task of [...tasks].sort((a, b) =>
       severity[taskStatus(b)] - severity[taskStatus(a)] || b.update - a.update)) {
       const identity = ui.groupFor(task, groupMode, tabGroups);
+      if (!identity) continue;
       if (!buckets.has(identity.key)) buckets.set(identity.key, { ...identity, tasks: [], active: 0, worst: "seen", matched: [] });
       const group = buckets.get(identity.key);
       group.tasks.push(task);
@@ -406,7 +407,8 @@
       return;
     }
     const now = Date.now();
-    const view = rules.view(state, now);
+    const view = rules.view(state, now, groupMode === "tab"
+      ? task => Boolean(ui.groupFor(task, groupMode, tabGroups)) : undefined);
     const warning = explain(view);
     compact.classList.toggle("alerting", Boolean(warning));
     const allZero = !view.stale && kinds.every(kind => view.counts[kind] === 0);
@@ -618,7 +620,7 @@
       for (const toast of [...toasts]) {
         const task = state.tasks[toast.id];
         if (!task?.pending || !rules.taskAccessible(state, task) || rules.isDismissed(task) ||
-            !rules.recentActivity(task, Date.now()) || rules.revision(task) !== toast.revision) removeToast(toast.revision);
+            !rules.recentNoticeActivity(task, Date.now()) || rules.revision(task) !== toast.revision) removeToast(toast.revision);
       }
     }
     if (changes[pinKey]) {
@@ -671,7 +673,7 @@
         for (const task of msg.tasks ?? []) {
           const current = saved.tasks[task.id];
           if (current?.pending && rules.taskFresh(saved, current, Date.now()) && rules.canAcknowledge(current) &&
-              !rules.isDismissed(current) && rules.recentActivity(current, Date.now()) &&
+              !rules.isDismissed(current) && rules.recentNoticeActivity(current, Date.now()) &&
               rules.revision(current) === task.revision) showToast(task);
         }
         reply({ ok: true });

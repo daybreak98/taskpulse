@@ -19,7 +19,7 @@ async function startFixture() {
   let updated = seed, working = true, lastReply = seed, pendingReply = seed, replyReadyAt = 0;
   let account = "a";
   const alternate = { id: 21, agentId: 515, name: "合成账号 B 的会话" };
-  const expired = { id: 22, agentId: 515, name: "49 小时前的会话" };
+  const expired = { id: 22, agentId: 515, name: "25 小时前的会话" };
   const completed = { id: 23, agentId: 515, name: "已查看的近期会话" };
 
   const server = http.createServer((request, response) => {
@@ -61,12 +61,13 @@ async function startFixture() {
       data = { groups: [{ name: "账号 B", conversations: [
         { ...alternate, updateTime: seed, createTime: seed },
         { ...completed, updateTime: seed - 1, createTime: seed - 1 },
-        { ...expired, updateTime: seed - 49 * 60 * 60_000, createTime: seed - 49 * 60 * 60_000 }
+        { ...expired, updateTime: seed - 25 * 60 * 60_000, createTime: seed - 25 * 60 * 60_000 }
       ] }], ungrouped: { conversations: [] } };
     } else if (url.pathname.endsWith("/list")) {
       data = { groups: [{ name: "数据质量", conversations: [
         { ...task, updateTime: updated, createTime: seed },
-        { ...unopened, updateTime: seed, createTime: seed }
+        { ...unopened, updateTime: seed, createTime: seed },
+        { id: 13, agentId: 515, name: "未打开的近期会话", updateTime: seed, createTime: seed }
       ] }], ungrouped: { conversations: [] } };
     } else if (url.pathname.endsWith("/queue")) {
       data = { sessionState: url.pathname.includes("/11/") && working ? "BUSY" : "IDLE", pending: [] };
@@ -456,6 +457,16 @@ async function trial() {
     await worker.evaluate(id => chrome.tabGroups.update(id, { title: "项目改名", color: "green" }), nativeGroup);
     await globalPanel.locator(".group-head").filter({ hasText: "项目改名" }).waitFor();
     assert.equal(await globalPanel.locator("[data-mode='tab']").getAttribute("aria-pressed"), "true");
+    await globalPanel.locator(".group-head").filter({ hasText: "未分组标签页" }).waitFor();
+    assert.equal(await globalPanel.locator(".group-head").count(), 2);
+    assert.equal(await globalPanel.locator(".group-head").filter({ hasText: "数据质量" }).count(), 0);
+    assert.equal(await globalPanel.locator(".group-head").filter({ hasText: "未打开" }).count(), 0);
+    for (const group of await globalPanel.locator(".group-head").all()) {
+      if (await group.getAttribute("aria-expanded") === "false") await group.click();
+    }
+    assert.equal(await globalPanel.locator("[data-cid='11']").count(), 1);
+    assert.equal(await globalPanel.locator("[data-cid='12']").count(), 1);
+    assert.equal(await globalPanel.locator("[data-cid='13']").count(), 0);
     await globalPanel.locator("[data-mode='dataagent']").click();
     await globalPanel.locator(".group-head").filter({ hasText: "数据质量" }).waitFor();
     console.log("Native tab-group mode, live rename and DataAgent switch passed");
@@ -656,7 +667,7 @@ async function trial() {
     await known.click();
     await boundedPanel.locator("[data-cid='23']").waitFor({ state: "detached" });
     assert.equal(await boundedPanel.locator(".task-open").count(), 0);
-    console.log("Uncertain and verified checkbox dismissal removes rows, keeps evidence, and excludes 49-hour history");
+    console.log("Uncertain and verified checkbox dismissal removes rows, keeps evidence, and excludes 25-hour history");
     await recovering.close();
     const asyncRecovering = monitor(await context.newPage());
     await asyncRecovering.goto(externalUrl + "?fixture-recover=1&fixture-async=1");

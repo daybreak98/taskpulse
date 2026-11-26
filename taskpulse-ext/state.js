@@ -4,7 +4,9 @@
   const STUCK = 30 * 60_000;
   const SETTLE = 90_000;
   const HISTORY = 7 * 24 * 60 * 60_000;
-  const DISPLAY_HISTORY = 48 * 60 * 60_000;
+  const DISPLAY_HISTORY = 24 * 60 * 60_000;
+  // Keep delivery reliability independent from the display preference.
+  const NOTICE_HISTORY = 48 * 60 * 60_000;
   const order = { attention: 0, stuck: 1, running: 2, seen: 3 };
   const time = value => {
     const number = Number(value);
@@ -44,11 +46,20 @@
       !task.runAt && !task.awaitingReply && (!task.replyUpdate || task.update <= task.replyUpdate));
   }
 
-  function recentActivity(task, now) {
-    // Never use listAt, observedAt or the latest polling timestamp as activity.
-    const activity = Math.max(task.created || 0, task.update || 0, task.replyAt || 0,
+  function lastActivity(task) {
+    // Polling timestamps are not conversation activity.
+    return Math.max(task.created || 0, task.update || 0, task.replyAt || 0,
       task.runCycleAt || task.runAt || 0, task.replyActivityAt || 0, task.userActivityAt || 0);
+  }
+
+  function recentActivity(task, now) {
+    const activity = lastActivity(task);
     return activity > 0 && now - activity <= DISPLAY_HISTORY;
+  }
+
+  function recentNoticeActivity(task, now) {
+    const activity = lastActivity(task);
+    return activity > 0 && now - activity <= NOTICE_HISTORY;
   }
 
   function canDismiss(state, task, now) {
@@ -365,7 +376,7 @@
         if (cid === activeId && task.status === "attention") {
           // Auto-read must also apply to a reply that has already been notified.
           task = acknowledge(task);
-        } else if (!isDismissed(task) && recentActivity(task, now) && task.notified !== task.replyKey) {
+        } else if (!isDismissed(task) && recentNoticeActivity(task, now) && task.notified !== task.replyKey) {
           task.notified = task.replyKey;
           replies.push(task);
         }
@@ -379,7 +390,7 @@
     return { state, replies };
   }
 
-  function view(state, now) {
+  function view(state, now, include = () => true) {
     const offline = !state.at || now - state.at > timing.sourceStale;
     const error = state.error || "";
     const stale = offline || !!error || !!state.sourceUnavailable || !!state.authBlocked ||
@@ -388,7 +399,7 @@
     const tasks = [];
     for (const task of Object.values(state.tasks)) {
       if (task.listedAt !== state.listAt || !taskAccessible(state, task) ||
-          !recentActivity(task, now) || isDismissed(task)) continue;
+          !recentActivity(task, now) || isDismissed(task) || !include(task)) continue;
       const uncertain = !taskFresh(state, task, now) || task.messageUncertain;
       if (!uncertain && Object.hasOwn(counts, task.status)) counts[task.status]++;
       tasks.push({ ...task, uncertain });
@@ -397,5 +408,5 @@
     return { counts, tasks, stale, offline, error };
   }
 
-  globalThis.TaskPulseState = { blank, absorb, view, revision, displayVersion, isDismissed, recentActivity, canDismiss, dismiss, acknowledge, mayDismissNotice, authError, taskAccessible, taskFresh, isNewReply, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
+  globalThis.TaskPulseState = { blank, absorb, view, revision, displayVersion, isDismissed, recentActivity, recentNoticeActivity, canDismiss, dismiss, acknowledge, mayDismissNotice, authError, taskAccessible, taskFresh, isNewReply, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
 })();

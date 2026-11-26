@@ -1012,6 +1012,8 @@ test("P2 current pending outbox survives a 24-hour permission outage", async () 
   const at = now + 24 * 60 * 60_000 + 10_000;
   await app.deliver(replyReport(at, update, "A"));
   assert.equal(app.notices.size, 1);
+  assert.equal(rules.view(app.local.data[web.keys.state], at).tasks.length, 0,
+    "the 24-hour display preference must not expose the old pending row");
   await app.deliver(replyReport(at + 5_000, update, "A"));
   assert.equal(app.notices.size, 1);
 });
@@ -1470,23 +1472,29 @@ test("idle report does not perform foreground-only browser queries when no reply
   assert.deepEqual({ windowReads, tabQueries, tabReads }, { windowReads: 0, tabQueries: 0, tabReads: 1 });
 });
 
-test("group mode resolves real tab groups, duplicate tabs, unopened rows and wrong agent IDs", () => {
+test("TAB mode exclusively uses real browser groups and opened conversation membership", () => {
   const tabs = [
     { id: 3, groupId: 8, url: web.conversationUrl(id, agent), active: false },
     { id: 2, groupId: -1, url: web.conversationUrl(id, agent), active: true },
     { id: 4, groupId: 9, url: web.conversationUrl("43", agent) },
-    { id: 5, groupId: 8, url: "https://example.com/" }
+    { id: 5, groupId: 8, url: "https://example.com/" },
+    { id: 6, groupId: -1, url: web.conversationUrl("45", agent) },
+    { id: 8, groupId: 10, url: web.conversationUrl("46", agent) }
   ];
   const mapping = ui.buildGroups(tabs, [{ id: 8, title: "项目 A", color: "blue" },
     { id: 9, title: "项目 A", color: "green" }], web);
-  assert.equal(Object.keys(mapping).length, 2);
+  assert.equal(Object.keys(mapping).length, 4);
   const task = { id, agentId: agent, group: "数据质量" };
   assert.equal(ui.groupFor(task, "dataagent", mapping).name, "数据质量");
   assert.equal(ui.groupFor(task, "tab", mapping).key, "tab:8");
   assert.equal(ui.groupFor(task, "tab", mapping).color, "#78a6db");
   assert.equal(ui.groupFor({ ...task, id: "43" }, "tab", mapping).key, "tab:9");
-  assert.equal(ui.groupFor({ ...task, id: "44" }, "tab", mapping).name, "未打开 · 数据质量");
-  assert.equal(ui.groupFor({ ...task, agentId: "2528" }, "tab", mapping).key, "closed:数据质量");
+  assert.equal(ui.groupFor({ ...task, id: "44" }, "tab", mapping), null);
+  assert.equal(ui.groupFor({ ...task, agentId: "2528" }, "tab", mapping), null);
+  assert.equal(ui.groupFor({ ...task, id: "45" }, "tab", mapping).name, "未分组标签页");
+  assert.equal(ui.groupFor({ ...task, id: "46" }, "tab", mapping).key, "tab:10");
+  assert.equal(ui.groupFor({ ...task, id: "46" }, "tab", mapping).name, "标签组名称待更新");
+  assert.equal(ui.groupFor(task, "tab", { [id]: { key: "closed:数据质量" } }), null);
 });
 
 test("drag position preserves original default and clamps across viewport and panel sizes", () => {
@@ -1807,9 +1815,9 @@ test("a dismissed uncertain pending reply cancels delayed delivery without marki
   assert.equal(rules.view(app.local.data[web.keys.state], now + 15_000).tasks.length, 0);
 });
 
-test("48-hour display window uses activity rather than polling; older tasks remain in collector tracking", () => {
+test("24-hour display window uses activity rather than polling; older tasks remain in collector tracking", () => {
   const tracker = timeline();
-  const age = 48 * 60 * 60_000;
+  const age = 24 * 60 * 60_000;
   const older = now - age - 1, edge = now - age;
   const oldRow = { ...row(older, older), id: "43" };
   const edgeRow = { ...row(edge, edge), id: "44" };
@@ -1889,4 +1897,65 @@ test("legacy dismissal ticket is preserved when its only change is a hydrated us
   assert.equal(rules.isDismissed({ ...task, runCycleAt: now }), false);
   assert.equal(rules.isDismissed({ ...task, replyKey: "message.new" }), false);
   assert.equal(rules.isDismissed({ ...task, update: now }), false);
+});
+
+
+test("P1 landed exact notice waits for fresh evidence, then reads after worker restart", async () => {
+  const app = worker(), update = now + 1000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5000, update, "A"));
+  const revision = exactRevision(app);
+  await app.deliver(report(now + 10000, row(update), { busy: null, queueError: true }));
+  app.tabs.push({ id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete", active: false });
+  const opened = await app.send({ kind: "tp.open", id, revision, intent: "notice" });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.clearNotice, false);
+  assert.equal(currentTask(app).pending, true);
+  const guard = app.session.data["tp-web-jump-tabs-v1"]["9"];
+  assert.equal(guard.deferredRead, true);
+  const restarted = worker({ local: app.local.data, session: app.session.data, notices: [...app.notices] });
+  restarted.tabs.splice(0, restarted.tabs.length, ...structuredClone(app.tabs));
+  await restarted.deliver(replyReport(now + 15000, update, "A"));
+  assert.equal(currentTask(restarted).pending, false);
+  assert.equal(currentTask(restarted).jumpCommit, guard.token);
+  assert.equal(restarted.notices.size, 0);
+});
+
+test("P1 deferred notice must not acknowledge newer reply or a background tab", async () => {
+  for (const next of ["newer", "background", "stuck"]) {
+    const app = worker(), update = now + 1000;
+    await app.deliver(report(now, row()));
+    await app.deliver(replyReport(now + 5000, update, "A", { failed: next === "stuck" }));
+    const revision = exactRevision(app);
+    await app.deliver(report(now + 10000, row(update), { busy: null, queueError: true }));
+    app.tabs.push({ id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete", active: false });
+    const opened = await app.send({ kind: "tp.open", id, revision, intent: "notice" });
+    assert.equal(opened.ok, true);
+    assert.equal(opened.clearNotice, false);
+    if (next === "background") {
+      app.tabs.find(tab => tab.id === 9).active = false;
+      app.tabs[0].active = true;
+    }
+    await app.deliver(replyReport(now + 15000, next === "newer" ? now + 12000 : update,
+      next === "newer" ? "B" : "A", { failed: next === "stuck" }));
+    assert.equal(currentTask(app).pending, next !== "stuck");
+    if (next === "newer") assert.notEqual(exactRevision(app), revision);
+  }
+});
+
+test("TAB display counts and rows use the same opened-tab membership", () => {
+  const { state } = timeline().next(report(now, row(), { busy: true }));
+  const original = state.tasks[id];
+  state.tasks["43"] = { ...original, id: "43", status: "attention" };
+  state.tasks["44"] = { ...original, id: "44", status: "stuck" };
+  const tabs = [{ id: 9, groupId: 8, url: web.conversationUrl(id, agent) },
+    { id: 10, groupId: -1, url: web.conversationUrl("43", agent) }];
+  const mapping = ui.buildGroups(tabs, [{ id: 8, title: "浏览器分组", color: "blue" }], web);
+  const v = rules.view(state, now, task => Boolean(ui.groupFor(task, "tab", mapping)));
+  assert.deepEqual(v.counts, { running: 1, attention: 1, stuck: 0 });
+  assert.deepEqual(v.tasks.map(task => task.id).sort(), ["42", "43"]);
+  assert.equal(rules.view(state, now).tasks.length, 3);
+  const closed = ui.buildGroups(tabs.slice(0, 1), [{ id: 8, title: "浏览器分组", color: "blue" }], web);
+  assert.deepEqual(rules.view(state, now, task => Boolean(ui.groupFor(task, "tab", closed))).counts,
+    { running: 1, attention: 0, stuck: 0 });
 });

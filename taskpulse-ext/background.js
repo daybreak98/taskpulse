@@ -291,10 +291,26 @@ function canAutoRead(state, task, manual = false) {
     rules.verifiedReply(task) && rules.canAcknowledge(task);
 }
 
+// Only an exact notice that successfully landed may defer its read.
+function canResumeNoticeRead(state, task, guard) {
+  return Boolean(guard?.deferredRead && guard.token && task &&
+    task.jumpCommit !== guard.token && guard.revision === rules.revision(task) &&
+    canAutoRead(state, task, true));
+}
+
 async function readForeground(state, tabId, windowId, manual = false) {
   await jumpReady;
   const tab = await foregroundPage();
   if (!tab || tabId !== undefined && tab.id !== tabId || windowId !== undefined && tab.windowId !== windowId) return false;
+  const cid = web.conversationId(tab.url), guard = jumpTabs.get(tab.id);
+  const deferred = state.tasks[cid];
+  if (!opening.has(cid) && guard?.cid === cid &&
+      matchesConversation(tab, cid, deferred?.agentId) && canResumeNoticeRead(state, deferred, guard)) {
+    // Persist the operation token and read together. Keep the guard until
+    // the write succeeds, and never consume a different reply version.
+    state.tasks[cid] = { ...rules.acknowledge(deferred), jumpCommit: guard.token };
+    return true;
+  }
   const task = state.tasks[activeConversation(state, tab)];
   if (!canAutoRead(state, task, manual)) return false;
   state.tasks[task.id] = rules.acknowledge(task);
@@ -305,7 +321,7 @@ function noticeTask(state, revision) {
   const [id, agentId] = revision.split("/");
   const task = state.tasks[id];
   return task?.agentId === agentId && task.pending && rules.revision(task) === revision &&
-    !rules.isDismissed(task) && rules.recentActivity(task, Date.now()) ? task : null;
+    !rules.isDismissed(task) && rules.recentNoticeActivity(task, Date.now()) ? task : null;
 }
 
 function pruneOutbox(state) {
@@ -333,7 +349,7 @@ async function clearReadNotices(state) {
     if (task && !rules.taskAccessible(state, task)) return true;
     if (!task || task.agentId !== agentId) return false;
     if (rules.isDismissed(task) && rules.revision(task) === revision ||
-        !rules.recentActivity(task, Date.now())) return true;
+        !rules.recentNoticeActivity(task, Date.now())) return true;
     // Do not clear the newly pending version of a previously dismissed row.
     if (task.pending && rules.revision(task) === revision) return false;
     if (task.dismissedNoticeRevision === revision) return true;
@@ -360,7 +376,9 @@ async function updateBadge(state) {
 
 async function persistForegroundRead(state) {
   // Do not spend browser focus queries on reports without any eligible reply.
-  const eligible = Object.values(state.tasks).some(task => canAutoRead(state, task));
+  await jumpReady;
+  const eligible = Object.values(state.tasks).some(task => canAutoRead(state, task)) ||
+    [...jumpTabs.values()].some(guard => canResumeNoticeRead(state, state.tasks[guard.cid], guard));
   const read = eligible && await readForeground(state);
   const pruned = pruneOutbox(state);
   if (read || pruned) await saveState(state);
@@ -609,8 +627,12 @@ async function openTask(id, revision, allowSavedId = false, intent = "row") {
           await forgetJump(tabId, false, guard.token);
           return { ok: true, clearNotice: !current.pending };
         }
-        // A replayed notice for an already read revision is still an old
-        // notice, not a normal row visit. Keep its landing guard.
+        if (current.pending) {
+          // Exact current notice landed, but evidence is temporarily uncertain.
+          // Resume this version only when a later sample confirms it.
+          await rememberJump(tabId, { ...guard, deferredRead: true });
+        }
+        // A replayed notice for an already read revision remains protected.
         return { ok: true, clearNotice: !current.pending };
       }
       // Obsolete or unknown ticket: navigate, but keep the guard and dismiss
