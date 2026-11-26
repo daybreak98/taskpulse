@@ -291,10 +291,45 @@ function canAutoRead(state, task, manual = false) {
     rules.verifiedReply(task) && rules.canAcknowledge(task);
 }
 
+// Only an exact notice or completed red reply row that successfully landed may defer its read.
+function canResumeNoticeRead(state, task, guard) {
+  return Boolean(guard?.deferredRead && guard.token && task &&
+    task.jumpCommit !== guard.token && guard.revision === rules.revision(task) &&
+    canAutoRead(state, task, true));
+}
+
+async function rebindDeferredRead(tabId, guard, state, at = Date.now()) {
+  const task = state.tasks[guard?.cid];
+  if (!task || state.authBlocked || rules.authError(state.error) ||
+      !rules.taskAccessible(state, task) || !task.pending) {
+    await forgetJump(tabId, false, guard?.token);
+    return null;
+  }
+  if (rules.revision(task) === guard.revision) return guard;
+  // A prior visit cannot cross an intervening run or be inherited by an
+  // unverified future reply. Keep the barrier until a completed reply exists.
+  if (task.runAt || task.awaitingReply || task.status === "running" || !rules.verifiedReply(task))
+    return guard;
+  // This is a genuinely newer pending reply. A fresh user interaction or
+  // tab activation may rebind the visit to this exact version.
+  const next = { ...guard, revision: rules.revision(task), visited: true, visitedAt: at };
+  await rememberJump(tabId, next);
+  return next;
+}
+
 async function readForeground(state, tabId, windowId, manual = false) {
   await jumpReady;
   const tab = await foregroundPage();
   if (!tab || tabId !== undefined && tab.id !== tabId || windowId !== undefined && tab.windowId !== windowId) return false;
+  const cid = web.conversationId(tab.url), guard = jumpTabs.get(tab.id);
+  const deferred = state.tasks[cid];
+  if (!opening.has(cid) && guard?.cid === cid &&
+      matchesConversation(tab, cid, deferred?.agentId) && canResumeNoticeRead(state, deferred, guard)) {
+    // Persist the operation token and read together. Keep the guard until
+    // the write succeeds, and never consume a different reply version.
+    state.tasks[cid] = { ...rules.acknowledge(deferred), jumpCommit: guard.token };
+    return true;
+  }
   const task = state.tasks[activeConversation(state, tab)];
   if (!canAutoRead(state, task, manual)) return false;
   state.tasks[task.id] = rules.acknowledge(task);
@@ -304,7 +339,8 @@ async function readForeground(state, tabId, windowId, manual = false) {
 function noticeTask(state, revision) {
   const [id, agentId] = revision.split("/");
   const task = state.tasks[id];
-  return task?.agentId === agentId && task.pending && rules.revision(task) === revision ? task : null;
+  return task?.agentId === agentId && task.pending && rules.revision(task) === revision &&
+    !rules.isDismissed(task) && rules.recentNoticeActivity(task, Date.now()) ? task : null;
 }
 
 function pruneOutbox(state) {
@@ -330,8 +366,12 @@ async function clearReadNotices(state) {
     // pending watermark/outbox; do not mark the task read.
     if (state.authBlocked || rules.authError(state.error)) return true;
     if (task && !rules.taskAccessible(state, task)) return true;
-    if (!task || task.agentId !== agentId ||
-        task.pending && rules.revision(task) === revision) return false;
+    if (!task || task.agentId !== agentId) return false;
+    if (rules.isDismissed(task) && rules.revision(task) === revision ||
+        !rules.recentNoticeActivity(task, Date.now())) return true;
+    // Do not clear the newly pending version of a previously dismissed row.
+    if (task.pending && rules.revision(task) === revision) return false;
+    if (task.dismissedNoticeRevision === revision) return true;
     // Existing 2.1.1 storage may have a confirmed read watermark but no
     // readRevision yet. Clean up those old notifications on the first sync.
     const currentRevision = rules.revision(task);
@@ -354,11 +394,41 @@ async function updateBadge(state) {
 }
 
 async function persistForegroundRead(state) {
+  // A trusted page interaction is a durable read intent for one exact reply.
+  // It may finish after the user switches away, but never across a newer
+  // reply, active run, logout, or per-conversation access denial.
+  await jumpReady;
+  const release = [];
+  let deferredRead = false;
+  for (const [tabId, guard] of jumpTabs) {
+    if (!guard?.deferredRead || !guard.visited) continue;
+    const task = state.tasks[guard.cid];
+    if (!task || state.authBlocked || rules.authError(state.error) ||
+        !rules.taskAccessible(state, task) || !task.pending) {
+      release.push([tabId, guard.token]);
+      continue;
+    }
+    // A superseded visit is a barrier, not permission to read the successor.
+    // Retain it until the user visits the newer reply or reactivates the tab.
+    if (rules.revision(task) !== guard.revision) continue;
+    if (task.readRevision === guard.revision) {
+      release.push([tabId, guard.token]);
+      continue;
+    }
+    if (task.runAt || task.awaitingReply || task.status === "running") continue;
+    if (!canResumeNoticeRead(state, task, guard)) continue;
+    state.tasks[guard.cid] = { ...rules.acknowledge(task), jumpCommit: guard.token };
+    deferredRead = true;
+    release.push([tabId, guard.token]);
+  }
   // Do not spend browser focus queries on reports without any eligible reply.
-  const eligible = Object.values(state.tasks).some(task => canAutoRead(state, task));
+  const eligible = Object.values(state.tasks).some(task => canAutoRead(state, task)) ||
+    [...jumpTabs.values()].some(guard => canResumeNoticeRead(state, state.tasks[guard.cid], guard));
   const read = eligible && await readForeground(state);
   const pruned = pruneOutbox(state);
-  if (read || pruned) await saveState(state);
+  if (deferredRead || read || pruned) await saveState(state);
+  // Release only after the corresponding read has been durably committed.
+  for (const [tabId, token] of release) await forgetJump(tabId, false, token);
 }
 
 async function deliverNotices(state) {
@@ -421,7 +491,7 @@ async function acknowledge(state, task, checked = false, jumpToken = "") {
   const revision = rules.revision(task);
   state.tasks[task.id] = rules.acknowledge(task);
   if (jumpToken) state.tasks[task.id].jumpCommit = jumpToken;
-  if (checked) state.tasks[task.id].checkedRevision = revision;
+  if (checked) state.tasks[task.id] = { ...rules.dismiss(state.tasks[task.id]), checkedRevision: revision };
   pruneOutbox(state);
   await saveState(state);
   await syncNotices(state);
@@ -476,10 +546,11 @@ async function markVisited(tabId, windowId) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (isReady(tab)) refreshLeader();
   }
-  if (!await readForeground(state, tabId, windowId, true)) return;
+  if (!await readForeground(state, tabId, windowId, true)) return false;
   pruneOutbox(state);
   await saveState(state);
   await syncNotices(state);
+  return true;
 }
 
 async function raiseWindow(tab) {
@@ -595,6 +666,15 @@ async function openTask(id, revision, allowSavedId = false, intent = "row") {
           await forgetJump(tabId, false, guard.token);
           return { ok: true, clearNotice: true };
         }
+        if (current.pending && (fromNotice ||
+            current.status === "stuck" && rules.verifiedReply(current) &&
+              !current.runAt && !current.awaitingReply)) {
+          // An exact notice or completed red reply row has successfully
+          // landed but is temporarily unconfirmable. Preserve the existing
+          // version/foreground fence until this reply can be acknowledged.
+          await rememberJump(tabId, { ...guard, deferredRead: true });
+          return { ok: true, clearNotice: false };
+        }
         if (!fromNotice) {
           // A direct row visit is intentional even while a run is incomplete.
           // Permit later verified foreground replies without acknowledging
@@ -604,8 +684,7 @@ async function openTask(id, revision, allowSavedId = false, intent = "row") {
           await forgetJump(tabId, false, guard.token);
           return { ok: true, clearNotice: !current.pending };
         }
-        // A replayed notice for an already read revision is still an old
-        // notice, not a normal row visit. Keep its landing guard.
+        // A replayed notice for an already read revision remains protected.
         return { ok: true, clearNotice: !current.pending };
       }
       // Obsolete or unknown ticket: navigate, but keep the guard and dismiss
@@ -633,9 +712,29 @@ async function markChecked(id, revision, checked) {
     await acknowledge(state, task, true);
   } else if (task.checkedRevision === revision) {
     delete task.checkedRevision;
+    delete task.dismissedVersion;
+    delete task.dismissedNoticeRevision;
+    delete task.dismissedAt;
     await saveState(state);
   }
   return { ok: true };
+}
+
+async function dismissTask(id, version) {
+  if (!web.id(id) || typeof version !== "string" || version.length > 4096) return { ok: false };
+  const state = await getState();
+  const task = state.tasks[id], now = Date.now();
+  if (!task || rules.displayVersion(task) !== version) return { ok: false };
+  if (rules.isDismissed(task)) return { ok: true, dismissedAt: task.dismissedAt || 0 };
+  if (!rules.canDismiss(state, task, now)) return { ok: false };
+  // Verified replies may be acknowledged. An uncertain row is only
+  // dismissed from the presentation, without advancing any read watermark.
+  const confirmed = freshTask(state, task, now) && rules.canAcknowledge(task);
+  state.tasks[id] = rules.dismiss(confirmed ? rules.acknowledge(task) : task, now);
+  pruneOutbox(state);
+  await saveState(state);
+  await syncNotices(state);
+  return { ok: true, dismissedAt: now };
 }
 
 async function userVisit(id, sender, visitAt) {
@@ -645,6 +744,15 @@ async function userVisit(id, sender, visitAt) {
   const tab = await foregroundPage();
   if (tab?.id !== sender.tab.id || !matchesConversation(tab, id) || opening.has(id) ||
       jumpTabs.get(tab.id) !== guard) return { ok: false };
+  if (guard.deferredRead) {
+    const state = await getState();
+    const current = await rebindDeferredRead(tab.id, guard, state, visitAt);
+    if (!current) return { ok: false };
+    await rememberJump(tab.id, { ...current, visited: true, visitedAt: visitAt });
+    const read = await markVisited(tab.id, tab.windowId);
+    if (read) await forgetJump(tab.id, false, guard.token);
+    return { ok: true, deferred: !read };
+  }
   if (!await forgetJump(tab.id, true, guard.token)) return { ok: false };
   await markVisited(tab.id, tab.windowId);
   return { ok: true };
@@ -663,11 +771,12 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   else if (surfaces.candidate(sender)) {
     if (msg.kind === "tp.surface.attach") reply = surfaces.attach(sender, msg.token);
     else if (msg.kind === "tp.surface.toasts") reply = surfaces.toastData(sender, msg.token);
-    else if (["tp.open", "tp.check", "tp.settings"].includes(msg.kind)) {
+    else if (["tp.open", "tp.check", "tp.dismiss", "tp.settings"].includes(msg.kind)) {
       reply = surfaces.validate(sender, msg.token).then(allowed => {
-        if (!allowed) return { ok: false };
+        if (!allowed) return { ok: false, surfaceInvalid: true };
         if (msg.kind === "tp.open") return openTask(msg.id, msg.revision, false, msg.intent);
         if (msg.kind === "tp.check") return serialize(() => markChecked(msg.id, msg.revision, msg.checked));
+        if (msg.kind === "tp.dismiss") return serialize(() => dismissTask(msg.id, msg.version));
         return chrome.runtime.openOptionsPage().then(() => ({ ok: true }));
       });
     }
@@ -688,6 +797,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg.kind === "tp.settings") reply = chrome.runtime.openOptionsPage().then(() => ({ ok: true }));
   if (msg.kind === "tp.open") reply = openTask(msg.id, msg.revision, false, msg.intent);
   if (msg.kind === "tp.check") reply = serialize(() => markChecked(msg.id, msg.revision, msg.checked));
+  if (msg.kind === "tp.dismiss") reply = serialize(() => dismissTask(msg.id, msg.version));
   if (msg.kind === "tp.visit" && !opening.has(msg.id)) {
     const visitAt = Number(msg.at) || Date.now();
     reply = serialize(() => userVisit(msg.id, sender, visitAt));
@@ -757,12 +867,15 @@ chrome.tabs.onUpdated.addListener((id, change) => {
     const tab = await chrome.tabs.get(id).catch(() => null);
     if (!tab) return;
     const cid = web.conversationId(tab.url);
-    if (change.url && tab.active) {
-      void signal(tab.id, { kind: "tp.route" }).catch(info);
+    if (tab.active && (change.url || change.status === "complete" ||
+        change.discarded === false || change.frozen === false)) {
+      if (isPage(tab) || change.url) void signal(tab.id, { kind: "tp.route" }).catch(info);
       if (!isPage(tab)) surfaces.activate(id);
     }
-    if ((change.url || change.status === "complete") && jumpTabs.has(id) &&
-        jumpTabs.get(id)?.cid !== cid && tab.status === "complete" && tab.url !== "about:blank" &&
+    const currentGuard = jumpTabs.get(id);
+    if ((change.url || change.status === "complete") && currentGuard &&
+        !(currentGuard.deferredRead && currentGuard.visited) &&
+        currentGuard.cid !== cid && tab.status === "complete" && tab.url !== "about:blank" &&
         (!tab.pendingUrl || tab.pendingUrl === tab.url)) await forgetJump(id, true);
     if (isPage(tab)) {
       refreshLeader();
@@ -775,7 +888,8 @@ chrome.tabs.onUpdated.addListener((id, change) => {
 });
 chrome.tabs.onRemoved.addListener(id => {
   focusEpoch++;
-  void forgetJump(id);
+  const guard = jumpTabs.get(id);
+  if (!(guard?.deferredRead && guard.visited)) void forgetJump(id);
   void getLeader().then(leader => { if (leader?.tabId === id) refreshLeader(); }).catch(info);
 });
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
@@ -783,11 +897,17 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   surfaces.activate(tabId);
   void (async () => {
     await jumpReady;
+    const activeGuard = jumpTabs.get(tabId);
+    if (activeGuard?.deferredRead) {
+      await rebindDeferredRead(tabId, activeGuard, await getState(), Date.now());
+    }
     // A genuine switch away releases the previous tab's versioned protection.
     for (const id of [...jumpTabs.keys()]) {
       if (id === tabId) continue;
       const tab = await chrome.tabs.get(id).catch(() => null);
-      if (!tab || tab.windowId === windowId && !tab.active) await forgetJump(id, true);
+      const guard = jumpTabs.get(id);
+      if (!(guard?.deferredRead && guard.visited) &&
+          (!tab || tab.windowId === windowId && !tab.active)) await forgetJump(id, true);
     }
     await serialize(() => markVisited(tabId, windowId));
   })().catch(info);
@@ -803,9 +923,16 @@ chrome.windows.onFocusChanged.addListener(windowId => {
       // reported window still matches the real foreground before releasing.
       const eventStillCurrent = win && (windowId >= 0 ? win.focused && win.id === windowId : !win.focused);
       if (eventStillCurrent) {
+        const active = await foregroundTab();
+        const activeGuard = active && jumpTabs.get(active.id);
+        if (activeGuard?.deferredRead) {
+          await rebindDeferredRead(active.id, activeGuard, await getState(), Date.now());
+        }
         for (const id of [...jumpTabs.keys()]) {
           const tab = await chrome.tabs.get(id).catch(() => null);
-          if (!tab || tab.windowId !== windowId) await forgetJump(id, true);
+          const guard = jumpTabs.get(id);
+          if (!(guard?.deferredRead && guard.visited) &&
+              (!tab || tab.windowId !== windowId)) await forgetJump(id, true);
         }
       }
     }

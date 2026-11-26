@@ -4,6 +4,9 @@
   const STUCK = 30 * 60_000;
   const SETTLE = 90_000;
   const HISTORY = 7 * 24 * 60 * 60_000;
+  const DISPLAY_HISTORY = 24 * 60 * 60_000;
+  // Keep delivery reliability independent from the display preference.
+  const NOTICE_HISTORY = 48 * 60 * 60_000;
   const order = { attention: 0, stuck: 1, running: 2, seen: 3 };
   const time = value => {
     const number = Number(value);
@@ -17,6 +20,73 @@
 
   function revision(task) {
     return [task.id, task.agentId, task.replyUpdate || task.update, task.replyKey || "-"].join("/");
+  }
+
+  // A reply may arrive before the list endpoint catches up. Its own
+  // timestamp (or observation time for an undated verified reply) already
+  // covers that activity. The later list watermark is not a second event.
+  function displayUpdate(task) {
+    return Math.max(task.update || 0, task.userActivityAt || 0,
+      task.replyKey ? (task.replyAt || task.replyActivityAt || 0) : 0);
+  }
+
+  // Raw lastUserMessage is a collector watermark, not proof of new activity.
+  function displayVersion(task) {
+    return JSON.stringify([task.id, task.agentId, task.created || 0, displayUpdate(task),
+      task.replyKey || "", task.runCycleAt || task.runAt || 0, task.userActivityAt || 0]);
+  }
+
+  function isDismissed(task) {
+    if (task.dismissedVersion) {
+      const current = displayVersion(task);
+      if (task.dismissedVersion === current) return true;
+      // Upgrade old display tickets without reopening an already covered
+      // list watermark or changing any reply, run or user-activity identity.
+      try {
+        const old = JSON.parse(task.dismissedVersion);
+        if (!Array.isArray(old) || old.length !== 7) return false;
+        if (typeof old[6] === "string") {
+          if (task.userActivityAt) return false;
+          old[6] = 0;
+        }
+        const covered = Math.max(task.userActivityAt || 0,
+          task.replyKey ? (task.replyAt || task.replyActivityAt || 0) : 0);
+        if (old[3] <= covered && task.update <= covered) old[3] = covered;
+        return JSON.stringify(old) === current;
+      } catch { return false; }
+    }
+    // Migrate the old checkbox's persistent marker without hiding a new run.
+    return Boolean(task.checkedRevision && task.checkedRevision === revision(task) &&
+      !task.runAt && !task.awaitingReply && (!task.replyUpdate ||
+        task.update <= Math.max(task.replyUpdate, task.replyAt || 0, task.replyActivityAt || 0)));
+  }
+
+  function lastActivity(task) {
+    // Polling timestamps are not conversation activity.
+    return Math.max(task.created || 0, task.update || 0, task.replyAt || 0,
+      task.runCycleAt || task.runAt || 0, task.replyActivityAt || 0, task.userActivityAt || 0);
+  }
+
+  function recentActivity(task, now) {
+    const activity = lastActivity(task);
+    return activity > 0 && now - activity <= DISPLAY_HISTORY;
+  }
+
+  function recentNoticeActivity(task, now) {
+    const activity = lastActivity(task);
+    return activity > 0 && now - activity <= NOTICE_HISTORY;
+  }
+
+  function canDismiss(state, task, now) {
+    if (!taskAccessible(state, task) || task.listedAt !== state.listAt ||
+        !recentActivity(task, now) || isDismissed(task)) return false;
+    const uncertain = !taskFresh(state, task, now) || task.messageUncertain;
+    return Boolean(uncertain || (!task.runAt && !task.awaitingReply && task.status !== "running"));
+  }
+
+  function dismiss(task, now = Date.now()) {
+    return { ...task, dismissedVersion: displayVersion(task),
+      dismissedNoticeRevision: revision(task), dismissedAt: now };
   }
 
   function acknowledge(task) {
@@ -136,13 +206,20 @@
     return [...rows, ...retained];
   }
 
-  function watchRows(rows, samples, tasks, now) {
+  function watchRows(rows, samples, tasks, now, opened = new Set(), hints = new Map()) {
     return reportRows(rows, tasks, now).filter((row, index) => {
       const sample = samples.get(row.id);
-      const task = tasks?.[row.id];
-      return row.retained || index < timing.watch || queueBusy(sample?.queue) === true ||
-        sample?.hotUntil > now || Boolean(task && task.agentId === (id(row.agentId) ||
-          String(globalThis.TaskPulseWeb.api.body.agentIdList[0])) && activeTask(task));
+      const known = tasks?.[row.id];
+      const task = known?.agentId === (id(row.agentId) ||
+        String(globalThis.TaskPulseWeb.api.body.agentIdList[0])) ? known : null;
+      const recent = recentActivity({ created: time(row.createTime), update: time(row.updateTime) }, now) ||
+        Boolean(task && recentActivity(task, now));
+      // The old 24-row discovery floor is retained, but it is no longer
+      // a ceiling. All recent rows and explicit browser activity enter
+      // the existing bounded scheduler; no extra list/API pagination.
+      return row.retained || index < timing.watch || recent || opened.has(row.id) ||
+        (hints.get(row.id) || 0) > now || queueBusy(sample?.queue) === true ||
+        sample?.hotUntil > now || activeTask(task);
     });
   }
 
@@ -152,6 +229,7 @@
     task.observedAt = at;
 
     if (busy) {
+      task.runCycleAt = task.runAt ? (task.runCycleAt || task.runAt) : at;
       task.runAt = started || at;
       task.awaitingReply = true;
       task.lastBusyAt = at;
@@ -181,13 +259,28 @@
       task.messageUpdate = task.update;
       task.messageObservedAt = message.at;
       task.messageUncertain = false;
-      if (message.sender === "other" && message.messageId) task.lastUserMessage = message.messageId;
+      if (message.sender === "other") {
+        const stamp = time(message.atMessage);
+        // A user message needs its own server timestamp, newer than both
+        // known activity and the dismissal. Merely observing an ID later
+        // does not prove that the user actually sent a new message.
+        const floor = Math.max(task.created || 0, task.update || 0, task.replyAt || 0,
+          task.replyActivityAt || 0, task.runCycleAt || task.runAt || 0,
+          task.userActivityAt || 0, task.dismissedAt || 0);
+        if (stamp > floor && stamp <= message.at + 5_000 &&
+            (!message.messageId || message.messageId !== task.lastUserMessage)) task.userActivityAt = stamp;
+        if (message.messageId) task.lastUserMessage = message.messageId;
+      }
     }
     if (changed) {
       rememberAssistant(task, key, message);
       task.replyKey = key;
       task.replyUpdate = task.update;
       task.replyAt = time(message.atMessage);
+      task.replyActivityAt = task.replyAt || at;
+      // Verification belongs to this exact reply, not its predecessor.
+      task.replyVerifiedAt = 0;
+      task.replyVerifiedRevision = "";
       task.phaseAt = at;
       task.pending = true;
       task.failed = Boolean(message.failed);
@@ -235,6 +328,11 @@
     if (!listAt || listAt > at || listAt < previous.listAt || !Array.isArray(report.conversations)) {
       state.error = reportError || previous.error || "会话列表状态待确认";
       state.authBlocked = Boolean(previous.authBlocked || authError(state.error));
+      if (state.authBlocked) {
+        // A login boundary invalidates old-account confirmation evidence.
+        state.tasks = Object.fromEntries(Object.entries(state.tasks).map(([key, task]) =>
+          [key, { ...task, replyVerifiedAt: 0, replyVerifiedRevision: "" }]));
+      }
       state.revalidateAfter = Math.max(previous.revalidateAfter || 0, at);
       return { state, replies: [] };
     }
@@ -244,6 +342,11 @@
       listAt >= (previous.revalidateAfter || 0);
     state.error = reportError || (!recoveredList ? previous.error : "") || "";
     state.authBlocked = Boolean(authError(state.error) || previous.authBlocked && !recoveredList);
+    if (state.authBlocked) {
+      // A login boundary invalidates old-account confirmation evidence.
+      state.tasks = Object.fromEntries(Object.entries(state.tasks).map(([key, task]) =>
+        [key, { ...task, replyVerifiedAt: 0, replyVerifiedRevision: "" }]));
+    }
     state.sourceUnavailable = Boolean(previous.sourceUnavailable && !recoveredList);
     if (state.error) state.revalidateAfter = Math.max(previous.revalidateAfter || 0, at);
     const baseline = state.baselineAt ||= listAt;
@@ -263,8 +366,15 @@
       if (retained && (!old || !activeTask(old) || old.accessDeniedAt ||
           now - (old.realListedAt || old.listedAt) > HISTORY)) continue;
       if (old && update < old.update) {
-        // Keep the previous version visible but unconfirmable on a regressed row.
-        state.tasks[cid] = { ...old, listedAt: listAt, listUncertain: true };
+        // A per-conversation 401/403 is stronger than a regressed list row.
+        // Record it before retaining the old version so prior-account titles
+        // and notifications cannot remain visible.
+        const deniedAt = time(report.accessErrors?.[cid]);
+        const deniedSampleAt = time(report.queueAt?.[cid]);
+        const accessDeniedAt = deniedAt &&
+          deniedAt >= Math.max(deniedSampleAt, old.accessDeniedAt || 0) ? deniedAt : old.accessDeniedAt;
+        state.tasks[cid] = { ...old, listedAt: listAt, listUncertain: true,
+          ...(accessDeniedAt ? { accessDeniedAt } : {}) };
         continue;
       }
       let task = {
@@ -305,10 +415,14 @@
       if (errorAt > task.observedAt) task.queueError = true;
       const confirmed = taskFresh(state, task, now);
       if (task.pending && verifiedReply(task) && confirmed && canAcknowledge(task)) {
+        // Record the last accepted confirmation of this pending revision.
+        // The reply's creation timestamp is not a revalidation timestamp.
+        task.replyVerifiedAt = Math.max(task.replyVerifiedAt || 0, task.observedAt);
+        task.replyVerifiedRevision = revision(task);
         if (cid === activeId && task.status === "attention") {
           // Auto-read must also apply to a reply that has already been notified.
           task = acknowledge(task);
-        } else if (task.notified !== task.replyKey) {
+        } else if (!isDismissed(task) && recentNoticeActivity(task, now) && task.notified !== task.replyKey) {
           task.notified = task.replyKey;
           replies.push(task);
         }
@@ -322,7 +436,7 @@
     return { state, replies };
   }
 
-  function view(state, now) {
+  function view(state, now, include = () => true) {
     const offline = !state.at || now - state.at > timing.sourceStale;
     const error = state.error || "";
     const stale = offline || !!error || !!state.sourceUnavailable || !!state.authBlocked ||
@@ -330,14 +444,34 @@
     const counts = { running: 0, attention: 0, stuck: 0 };
     const tasks = [];
     for (const task of Object.values(state.tasks)) {
-      if (task.listedAt !== state.listAt || !taskAccessible(state, task)) continue;
+      if (task.listedAt !== state.listAt || !taskAccessible(state, task) ||
+          !recentActivity(task, now) || isDismissed(task) || !include(task)) continue;
       const uncertain = !taskFresh(state, task, now) || task.messageUncertain;
-      if (!uncertain && Object.hasOwn(counts, task.status)) counts[task.status]++;
-      tasks.push({ ...task, uncertain });
+      // Keep DS's confirmed-unread presentation, but use confirmation
+      // evidence rather than server creation time after a recovery fence.
+      // Legacy snapshots use the previous conservative fallback until the
+      // next valid confirmation. Never inherit evidence across a new reply.
+      const exactReplyVerified = task.replyVerifiedAt > 0 &&
+        task.replyVerifiedRevision === revision(task);
+      // Older persisted rows lack a reply-version key; retain their previous
+      // conservative fence until the same reply is freshly confirmed.
+      const legacyReplyVerified = task.replyVerifiedRevision === undefined &&
+        (task.replyVerifiedAt || task.replyAt || task.replyUpdate || 0) > 0 &&
+        (task.replyVerifiedAt || task.replyAt || task.replyUpdate || 0) >= evidenceFloor(state, task);
+      const unread = task.pending === true && !task.listUncertain &&
+        (task.status === "attention" || task.status === "stuck") && verifiedReply(task) &&
+        !task.runAt && !task.awaitingReply && (exactReplyVerified || legacyReplyVerified);
+      // One classification for counters, groups, filtering and row tint.
+      // Unconfirmed running/blocked executions stay visible as uncertain,
+      // but are not counted as verified active states.
+      const displayStatus = (unread || !uncertain) && Object.hasOwn(counts, task.status)
+        ? task.status : "seen";
+      if (Object.hasOwn(counts, displayStatus)) counts[displayStatus]++;
+      tasks.push({ ...task, uncertain, displayStatus });
     }
     tasks.sort((a, b) => order[a.status] - order[b.status] || b.update - a.update);
     return { counts, tasks, stale, offline, error };
   }
 
-  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, mayDismissNotice, authError, taskAccessible, taskFresh, isNewReply, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
+  globalThis.TaskPulseState = { blank, absorb, view, revision, displayVersion, isDismissed, recentActivity, recentNoticeActivity, canDismiss, dismiss, acknowledge, mayDismissNotice, authError, taskAccessible, taskFresh, isNewReply, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
 })();

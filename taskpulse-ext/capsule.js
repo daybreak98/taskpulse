@@ -19,7 +19,11 @@
     if (!attached?.ok) return;
   }
   const post = message => { if (frame) parent.postMessage(message, attached.origin); };
-  const request = (kind, fields = {}) => chrome.runtime.sendMessage({ kind, ...fields, ...(frame ? { token } : {}) });
+  const request = async (kind, fields = {}) => {
+    const result = await chrome.runtime.sendMessage({ kind, ...fields, ...(frame ? { token } : {}) });
+    if (frame && result?.surfaceInvalid) post({ type: "tp-frame-invalid", token });
+    return result;
+  };
 
   const names = { running: "运行中", attention: "待处理", stuck: "疑似卡住", seen: "已查看", done: "已处理" };
   const kinds = ["running", "attention", "stuck"];
@@ -85,29 +89,42 @@
   let hoverTimer = null;
   let panelClock = null;
   let position, groupMode = "dataagent", tabGroups = {};
-  let viewport = { width: innerWidth, height: innerHeight }, frameGeometryReady = !frame;
+  let viewport = ui.viewportSize(window), frameGeometryReady = !frame;
   let lastSize = "", drag = null, dragFrame = 0, suppressClickUntil = 0, gestureSerial = 0;
   let styled = false, prefsChanged = new Set(), toastLoaded = !toastOnly;
   const groupButtons = [...root.querySelectorAll("[data-mode]")];
 
   document.documentElement.append(host);
-  fetch(chrome.runtime.getURL("capsule.css")).then(response => {
-    if (!response.ok) throw new Error("无法读取胶囊样式");
-    return response.text();
-  }).then(css => {
-    const style = new CSSStyleSheet();
-    style.replaceSync(css);
-    root.adoptedStyleSheets = [style];
-    styled = true;
-    box.hidden = toastOnly;
-    stack.hidden = frame && !toastOnly || side;
-    render();
-    if (frame) {
-      post({ type: "tp-frame-ready" });
-      layoutSurface();
-      if (toastOnly) void refreshToasts();
-    }
-  }).catch(error => console.warn("TaskPulse:", error.message));
+  let styleLoading = null;
+  function ensureStyle() {
+    if (styled || styleLoading || !alive()) return;
+    styleLoading = (async () => {
+      // A transient resource failure must not permanently hide a new page.
+      for (const delay of [0, 250, 750]) {
+        if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+        if (!alive()) return;
+        try {
+          const response = await fetch(chrome.runtime.getURL("capsule.css"));
+          if (!response.ok) throw new Error("无法读取胶囊样式");
+          const style = new CSSStyleSheet();
+          style.replaceSync(await response.text());
+          root.adoptedStyleSheets = [style];
+          styled = true;
+          box.hidden = toastOnly;
+          stack.hidden = frame && !toastOnly || side;
+          render();
+          if (frame) {
+            post({ type: "tp-frame-ready" });
+            layoutSurface();
+            if (toastOnly) void refreshToasts();
+          }
+          return;
+        } catch {}
+      }
+      console.warn("TaskPulse: 无法读取胶囊样式");
+    })().finally(() => { styleLoading = null; });
+  }
+  ensureStyle();
 
   function element(tag, className, value) {
     const node = document.createElement(tag);
@@ -155,11 +172,14 @@
     return uncertain ? uncertain + " 个会话状态待确认" : "";
   }
 
-  const checkedTask = task => !!task.checkedRevision && rules.canAcknowledge(task) && task.checkedRevision === rules.revision(task);
-  const isLive = (task, kind) => !checkedTask(task) && task.status === kind && !task.uncertain;
+  const checkedTask = task => task.displayStatus === "seen" && !!task.checkedRevision &&
+    rules.canAcknowledge(task) && task.checkedRevision === rules.revision(task);
+  // Consume the same projection as the counter; uncertainty alone is not
+  // a reason to hide a confirmed unread reply.
+  const isLive = (task, kind) => task.displayStatus === kind;
 
   function taskStatus(task) {
-    return checkedTask(task) ? "done" : task.status;
+    return checkedTask(task) ? "done" : task.displayStatus;
   }
   function progress(task, now) {
     if (checkedTask(task)) return 1;
@@ -213,7 +233,7 @@
 
   function taskRow(task) {
     const done = checkedTask(task);
-    const tint = done ? "done" : task.uncertain || (filter && !isLive(task, filter)) ? "seen" : task.status;
+    const tint = taskStatus(task);
     const row = element("div", "row " + tint);
     const plate = element("i", "row-plate");
     const link = element("button", "task-open");
@@ -234,12 +254,23 @@
     check.type = "button";
     check.dataset.check = task.id;
     check.setAttribute("aria-pressed", String(done));
-    const checkLabel = done ? "取消本轮处理标记" : "标记本轮已处理";
+    const checkLabel = task.uncertain ? "移除此待确认会话" : "标记本轮已处理并移除";
     check.setAttribute("aria-label", checkLabel + " · " + title);
     check.title = checkLabel;
-    check.disabled = !done && (task.uncertain || !rules.canAcknowledge(task));
+    check.disabled = !rules.canDismiss(state, task, Date.now());
     check.addEventListener("click", async () => {
-      await command("tp.check", task, { checked: !done });
+      check.disabled = true;
+      const version = rules.displayVersion(task);
+      const result = await command("tp.dismiss", task, { version });
+      // Storage broadcasts can lag the acknowledgment: hide the exact
+      // version immediately, never a newer version already in local state.
+      if (result?.ok && state.tasks[task.id] &&
+          rules.displayVersion(state.tasks[task.id]) === version) {
+        if (!rules.isDismissed(state.tasks[task.id]))
+          state = { ...state, tasks: { ...state.tasks, [task.id]:
+            rules.dismiss(state.tasks[task.id], result.dismissedAt) } };
+        render();
+      } else if (!result?.ok) check.disabled = false;
     });
     row.append(plate, link, check);
     rowViews.push({ task, plate, name, time, title });
@@ -251,12 +282,14 @@
     for (const task of [...tasks].sort((a, b) =>
       severity[taskStatus(b)] - severity[taskStatus(a)] || b.update - a.update)) {
       const identity = ui.groupFor(task, groupMode, tabGroups);
+      if (!identity) continue;
       if (!buckets.has(identity.key)) buckets.set(identity.key, { ...identity, tasks: [], active: 0, worst: "seen", matched: [] });
       const group = buckets.get(identity.key);
       group.tasks.push(task);
-      if (task.uncertain || !severity[taskStatus(task)]) continue;
+      const status = taskStatus(task);
+      if (!severity[status]) continue;
       group.active++;
-      if (severity[task.status] > severity[group.worst]) group.worst = task.status;
+      if (severity[status] > severity[group.worst]) group.worst = status;
       if (filter && isLive(task, filter)) group.matched.push(task);
     }
     return [...buckets.values()].sort((a, b) => severity[b.worst] - severity[a.worst] || a.name.localeCompare(b.name));
@@ -288,7 +321,7 @@
     box.append(button);
     groupViews.push({ group, line });
     if (open) {
-      const tasks = filter && group.matched.length ? group.matched : group.tasks;
+      const tasks = filter ? group.matched : group.tasks;
       for (const task of tasks) box.append(taskRow(task));
     }
     return box;
@@ -296,7 +329,7 @@
 
   function drawRows(tasks, unavailable) {
     const key = JSON.stringify([filter, groupMode, [...choices], unavailable, tasks.map(task => [
-      rules.revision(task), ui.groupFor(task, groupMode, tabGroups), task.name, task.status, task.uncertain,
+      rules.displayVersion(task), ui.groupFor(task, groupMode, tabGroups), task.name, task.status, task.displayStatus, task.uncertain,
       task.checkedRevision, task.uncertain ? task.observedAt : 0, task.runAt, task.phaseAt, task.failed, task.messageUncertain
     ])]);
     if (key === lastRows) return;
@@ -308,11 +341,11 @@
     groups = makeGroups(tasks);
     const content = document.createDocumentFragment();
     if (groupMode === "dataagent" && groups.length === 1 && groups[0].name === "未分组") {
-      for (const task of groups[0].tasks) content.append(taskRow(task));
+      for (const task of filter ? groups[0].matched : groups[0].tasks) content.append(taskRow(task));
     } else {
       for (const group of groups) content.append(groupRow(group));
     }
-    if (!groups.length && !unavailable) {
+    if ((!groups.length || filter && !groups.some(group => group.matched.length)) && !unavailable) {
       content.append(element("p", "empty", filter ? "没有" + names[filter] + "的任务" : "没有正在跑的任务"));
     }
     list.replaceChildren(content);
@@ -350,7 +383,7 @@
       return;
     }
     if (side || !frameGeometryReady) return;
-    const w = frame ? viewport.width : innerWidth, h = frame ? viewport.height : innerHeight;
+    const { width: w, height: h } = frame ? viewport : ui.viewportSize(window);
     // Measure natural row height, not the previously constrained scroll area.
     // This lets the panel shrink on filter changes and prevents resize loops.
     const naturalListHeight = 10 + [...list.children].reduce((sum, node, index) =>
@@ -373,6 +406,8 @@
   }
 
   function render() {
+    if (native && !document.hidden && web.conversationPage(location.href) && !host.isConnected)
+      document.documentElement.append(host);
     host.hidden = native && !web.conversationPage(location.href);
     if (toastOnly) { layoutSurface(); return; }
     if (document.hidden || host.hidden) {
@@ -380,7 +415,8 @@
       return;
     }
     const now = Date.now();
-    const view = rules.view(state, now);
+    const view = rules.view(state, now, groupMode === "tab"
+      ? task => Boolean(ui.groupFor(task, groupMode, tabGroups)) : undefined);
     const warning = explain(view);
     compact.classList.toggle("alerting", Boolean(warning));
     const allZero = !view.stale && kinds.every(kind => view.counts[kind] === 0);
@@ -479,7 +515,8 @@
       post({ type: "tp-frame-drag", gesture: drag.gesture,
         x: drag.x + drag.dx, y: drag.y + drag.dy, done });
     } else if (drag.moved) {
-      position = ui.move(drag.start, drag.dx, drag.dy, innerWidth, innerHeight);
+      const { width, height } = ui.viewportSize(window);
+      position = ui.move(drag.start, drag.dx, drag.dy, width, height);
       layoutSurface();
       if (done) void chrome.storage.local.set({ [ui.keys.position]: position }).catch(() => {});
     }
@@ -590,7 +627,8 @@
       state = changes[web.keys.state].newValue ?? rules.blank();
       for (const toast of [...toasts]) {
         const task = state.tasks[toast.id];
-        if (!task?.pending || !rules.taskAccessible(state, task) || rules.revision(task) !== toast.revision) removeToast(toast.revision);
+        if (!task?.pending || !rules.taskAccessible(state, task) || rules.isDismissed(task) ||
+            !rules.recentNoticeActivity(task, Date.now()) || rules.revision(task) !== toast.revision) removeToast(toast.revision);
       }
     }
     if (changes[pinKey]) {
@@ -623,11 +661,13 @@
   }).catch(() => {});
   chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     if (native && msg?.kind === "tp.route") {
+      ensureStyle();
       render();
       reply({ ok: true });
       return false;
     }
     if (native && msg?.kind === "tp.show") {
+      ensureStyle();
       if (expanded) closePanel();
       else setExpanded(true);
       reply({ ok: true });
@@ -641,6 +681,7 @@
         for (const task of msg.tasks ?? []) {
           const current = saved.tasks[task.id];
           if (current?.pending && rules.taskFresh(saved, current, Date.now()) && rules.canAcknowledge(current) &&
+              !rules.isDismissed(current) && rules.recentNoticeActivity(current, Date.now()) &&
               rules.revision(current) === task.revision) showToast(task);
         }
         reply({ ok: true });
@@ -650,18 +691,25 @@
   });
   // A real interaction with the DataAgent page (not the capsule) is an
   // independent visit after an old notification landed on this conversation.
-  let lastVisitAt = 0;
+  let lastVisitAt = 0, lastVisitKey = "";
   function userVisit(event) {
     if (!event.isTrusted || document.hidden || !document.hasFocus() ||
-        event.composedPath().includes(host) || Date.now() - lastVisitAt < 2_000) return;
+        event.composedPath().includes(host)) return;
     const id = web.conversationId(location.href);
     if (!id) return;
-    lastVisitAt = Date.now();
-    void chrome.runtime.sendMessage({ kind: "tp.visit", id, at: Date.now() }).catch(() => {});
+    const task = state.tasks[id];
+    const key = id + "/" + (task ? rules.revision(task) : "");
+    const now = Date.now();
+    // Debounce repeated input for the same reply, never a newer reply version.
+    if (key === lastVisitKey && now - lastVisitAt < 2_000) return;
+    lastVisitAt = now;
+    lastVisitKey = key;
+    void chrome.runtime.sendMessage({ kind: "tp.visit", id, at: now }).catch(() => {});
   }
   if (native) {
     document.addEventListener("pointerdown", userVisit, true);
     document.addEventListener("keydown", userVisit, true);
+    document.addEventListener("wheel", userVisit, { capture: true, passive: true });
   }
   if (frame) window.addEventListener("message", event => {
     if (event.source !== parent || event.origin !== attached.origin) return;
@@ -670,19 +718,26 @@
     if (event.data?.type === "tp-host-open" && !toastOnly) setExpanded(!expanded);
     if (event.data?.type === "tp-host-refresh" && toastOnly) void refreshToasts();
     if (event.data?.type === "tp-host-viewport" && !toastOnly) {
-      viewport = { width: Math.max(44, Math.min(10000, Number(event.data.width) || 240)),
-        height: Math.max(84, Math.min(10000, Number(event.data.height) || 600)) };
+      viewport = { width: Math.max(1, Math.min(10000, Number(event.data.width) || 240)),
+        height: Math.max(1, Math.min(10000, Number(event.data.height) || 600)) };
       position = ui.normalized(event.data.position);
       frameGeometryReady = true;
       layoutSurface();
     }
   });
-  document.addEventListener("visibilitychange", () => { if (alive()) render(); });
+  function resumeSurface() {
+    if (!alive() || document.hidden) return;
+    ensureStyle();
+    render();
+  }
+  document.addEventListener("visibilitychange", resumeSurface);
+  window.addEventListener("pageshow", resumeSurface);
   window.addEventListener("resize", () => { if (expanded) updateTimes(Date.now(), true); layoutSurface(); });
   if (!toastOnly && !side) {
     const observer = new ResizeObserver(layoutSurface);
     observer.observe(list);
     observer.observe(note);
+    if (native) observer.observe(document.compatMode === "BackCompat" ? document.body : document.documentElement);
   }
   const clock = toastOnly ? null : setInterval(() => {
     if (!alive()) {

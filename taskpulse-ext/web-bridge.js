@@ -23,6 +23,13 @@
   const messages = new Map();
   const probes = new Map();
   let trackedTasks = {};
+  let opened = new Set();
+  const readOpened = value => new Set(Array.isArray(value) ? value.map(web.id).filter(Boolean) : []);
+  // Storage changes are event-driven; no extra polling or DataAgent request.
+  chrome.storage.onChanged?.addListener((changes, area) => {
+    if (area !== "local" || !changes[web.keys.opened]) return;
+    opened = readOpened(changes[web.keys.opened].newValue);
+  });
   let leaseGeneration = 0;
   let cacheGeneration = -1;
   let urgent = false;
@@ -95,7 +102,7 @@
       }
     }
     dirty = true;
-    const watched = new Set(TaskPulseState.watchRows(conversations, samples, trackedTasks, Date.now()).map(row => row.id));
+    const watched = new Set(TaskPulseState.watchRows(conversations, samples, trackedTasks, Date.now(), opened, hints).map(row => row.id));
     for (const map of [samples, messages, probes]) {
       for (const id of map.keys()) if (!watched.has(id)) map.delete(id);
     }
@@ -252,7 +259,7 @@
   }
 
   function dueAt(now) {
-    return TaskPulseState.watchRows(conversations, samples, trackedTasks, now).map(row => {
+    return TaskPulseState.watchRows(conversations, samples, trackedTasks, now, opened, hints).map(row => {
       let sample = samples.get(row.id);
       if (!sample) {
         sample = { checked: 0, firstDue: now, version: row.updateTime, hotUntil: 0 };
@@ -276,10 +283,14 @@
         task?.messageUncertain || sample.awaiting || task?.awaitingReply ? 15_000 : timing.idle;
       return now - sample.checked >= interval;
     }).sort((a, b) => {
-      const priority = ({ row, sample }) => isHot(row, sample, now) ? 1 : 0;
-      // Guarantee cold discovery a bounded chance even with many hot tasks.
-      const overdue = item => now - (item.sample.checked || item.sample.firstDue) > timing.idle * 2 ? 1 : 0;
-      return overdue(b) - overdue(a) || priority(b) - priority(a) || a.sample.checked - b.sample.checked;
+      const priority = ({ row, sample }) => isHot(row, sample, now) ? 2 : opened.has(row.id) ? 1 : 0;
+      const oldest = item => item.sample.checked || item.sample.firstDue;
+      const overdue = item => now - oldest(item) >= timing.idle * 2 ? 1 : 0;
+      // Even a saturated hot/open set cannot indefinitely starve a cold row.
+      // Once overdue, oldest service wins before normal priority.
+      return overdue(b) - overdue(a) ||
+        (overdue(a) && overdue(b) ? oldest(a) - oldest(b) : 0) ||
+        priority(b) - priority(a) || a.sample.checked - b.sample.checked;
     }).slice(0, timing.queueBudget);
   }
 
@@ -304,6 +315,11 @@
         dirty = true;
         urgent = false;
         hints.clear();
+        // Read browser membership once per collector lease; changes thereafter
+        // arrive through storage events. Do not overwrite a newer event.
+        const before = opened;
+        const savedOpened = await chrome.storage.local.get(web.keys.opened).catch(() => null);
+        if (opened === before && savedOpened) opened = readOpened(savedOpened[web.keys.opened]);
       }
       // Read the durable monitoring set on every round, including after a
       // collector handoff. Old active/uncertain tasks retain their queue slots.

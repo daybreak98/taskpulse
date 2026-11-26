@@ -521,8 +521,9 @@ test("a late historical message newer than an old list timestamp is quiet at fir
   assert.equal(first.task.lastAssistant, "historical");
 });
 
-test("known active and unconfirmed tasks survive the 24-row discovery window", () => {
-  const rows = Array.from({ length: 30 }, (_, i) => ({ ...row(old - i), id: String(100 + i) }));
+test("known active and unconfirmed historical tasks survive the 24-row discovery floor", () => {
+  const cold = now - 25 * 60 * 60_000;
+  const rows = Array.from({ length: 30 }, (_, i) => ({ ...row(cold - i, cold - i), id: String(100 + i) }));
   const localBusy = rows[25].id;
   const durableBusy = rows[27].id;
   const uncertain = rows[28].id;
@@ -590,7 +591,7 @@ test("collector actually polls a durable old running task after leader handoff; 
     await until(() => reports.length >= round + 1, "collector round " + round);
   }
   assert.ok(queueReads.includes(trackedId), "old running task was evicted");
-  assert.ok(!queueReads.includes(rows.at(-2).id), "cold task exceeded discovery budget");
+  assert.ok(queueReads.includes(rows.at(-2).id), "recent task outside the first 24 never got a queue sample");
   assert.ok(reports.some(report => report.lastMessages[probeId] && !report.messageErrors[probeId]));
   assert.ok(listRequests >= 2, "list refresh was not exercised");
   assert.ok(reports.at(-1).queueAt[trackedId], "old task was lost after list refresh");
@@ -991,7 +992,7 @@ test("P1 durable old active task remains pollable when absent from a bounded ser
   const retained = watched.find(item => item.id === id);
   assert.ok(retained, "missing retained task");
   assert.equal(retained.retained, true);
-  assert.equal(watched.length, 25);
+  assert.equal(watched.length, 28);
   const result = tracker.next({ ...report(now + 10_000, retained, {
     message: message(old, now + 10_000, "completion", { atMessage: now + 8_000 })
   }), conversations: [retained] });
@@ -1012,6 +1013,8 @@ test("P2 current pending outbox survives a 24-hour permission outage", async () 
   const at = now + 24 * 60 * 60_000 + 10_000;
   await app.deliver(replyReport(at, update, "A"));
   assert.equal(app.notices.size, 1);
+  assert.equal(rules.view(app.local.data[web.keys.state], at).tasks.length, 0,
+    "the 24-hour display preference must not expose the old pending row");
   await app.deliver(replyReport(at + 5_000, update, "A"));
   assert.equal(app.notices.size, 1);
 });
@@ -1470,23 +1473,29 @@ test("idle report does not perform foreground-only browser queries when no reply
   assert.deepEqual({ windowReads, tabQueries, tabReads }, { windowReads: 0, tabQueries: 0, tabReads: 1 });
 });
 
-test("group mode resolves real tab groups, duplicate tabs, unopened rows and wrong agent IDs", () => {
+test("TAB mode exclusively uses real browser groups and opened conversation membership", () => {
   const tabs = [
     { id: 3, groupId: 8, url: web.conversationUrl(id, agent), active: false },
     { id: 2, groupId: -1, url: web.conversationUrl(id, agent), active: true },
     { id: 4, groupId: 9, url: web.conversationUrl("43", agent) },
-    { id: 5, groupId: 8, url: "https://example.com/" }
+    { id: 5, groupId: 8, url: "https://example.com/" },
+    { id: 6, groupId: -1, url: web.conversationUrl("45", agent) },
+    { id: 8, groupId: 10, url: web.conversationUrl("46", agent) }
   ];
   const mapping = ui.buildGroups(tabs, [{ id: 8, title: "项目 A", color: "blue" },
     { id: 9, title: "项目 A", color: "green" }], web);
-  assert.equal(Object.keys(mapping).length, 2);
+  assert.equal(Object.keys(mapping).length, 4);
   const task = { id, agentId: agent, group: "数据质量" };
   assert.equal(ui.groupFor(task, "dataagent", mapping).name, "数据质量");
   assert.equal(ui.groupFor(task, "tab", mapping).key, "tab:8");
   assert.equal(ui.groupFor(task, "tab", mapping).color, "#78a6db");
   assert.equal(ui.groupFor({ ...task, id: "43" }, "tab", mapping).key, "tab:9");
-  assert.equal(ui.groupFor({ ...task, id: "44" }, "tab", mapping).name, "未打开 · 数据质量");
-  assert.equal(ui.groupFor({ ...task, agentId: "2528" }, "tab", mapping).key, "closed:数据质量");
+  assert.equal(ui.groupFor({ ...task, id: "44" }, "tab", mapping), null);
+  assert.equal(ui.groupFor({ ...task, agentId: "2528" }, "tab", mapping), null);
+  assert.equal(ui.groupFor({ ...task, id: "45" }, "tab", mapping).name, "未分组标签页");
+  assert.equal(ui.groupFor({ ...task, id: "46" }, "tab", mapping).key, "tab:10");
+  assert.equal(ui.groupFor({ ...task, id: "46" }, "tab", mapping).name, "标签组名称待更新");
+  assert.equal(ui.groupFor(task, "tab", { [id]: { key: "closed:数据质量" } }), null);
 });
 
 test("drag position preserves original default and clamps across viewport and panel sizes", () => {
@@ -1547,14 +1556,14 @@ test("cross-page toast routing sends no task titles to the webpage host and reva
   assert.equal((await app.send({ kind: "tp.surface.toasts", token: registered.token }, frame)).tasks.length, 0);
 });
 
-async function latencyScenario({ idle = false, many = false } = {}) {
+async function latencyScenario({ idle = false, many = false, openedId = "" } = {}) {
   let durable = rules.blank(), stamp = now, interval, queue = idle ? "IDLE" : "BUSY";
   const reports = [], requests = [], listeners = [], replies = [];
-  const rows = Array.from({ length: many ? 24 : 1 }, (_, index) => ({ ...row(old - index - 1), id: String(42 + index) }));
+  const rows = Array.from({ length: many ? 36 : 1 }, (_, index) => ({ ...row(old - index - 1), id: String(42 + index) }));
   const first = rows[0], readyAt = now + 6_000;
   const success = data => ({ ok: true, json: async () => ({ success: true, data }) });
   const chrome = {
-    storage: { local: { get: async key => ({ [key]: durable }) } },
+    storage: { local: { get: async key => ({ [key]: key === web.keys.opened ? (openedId ? [openedId] : []) : durable }) } },
     runtime: { id: "collector-clock", onMessage: { addListener: fn => listeners.push(fn) },
       sendMessage: async packet => {
         if (packet.kind === "tp.webstate") {
@@ -1606,8 +1615,15 @@ test("fast completion retries a stale assistant without waiting 30 seconds", asy
 });
 
 test("cold historical rows remain low-frequency and request bursts are bounded", async () => {
-  const result = await latencyScenario({ idle: true, many: true });
+  const result = await latencyScenario({ idle: true, many: true, openedId: "77" });
   const list = result.requests.filter(r => r.path.endsWith("/list"));
+  const queue = result.requests.filter(r => r.path.endsWith("/queue"));
+  assert.ok(queue[0].path.includes("/77/"), "opened conversation did not get priority");
+  assert.equal(new Set(queue.map(r => r.path)).size, 36, "all recent conversations must receive a queue sample");
+  assert.ok(Object.values(result.durable.tasks).every(task => task.observedAt > 0));
+  for (const at of new Set(queue.map(r => r.at))) {
+    assert.ok(queue.filter(r => r.at === at).length <= web.timing.queueBudget, "per-round queue budget exceeded");
+  }
   assert.ok(list.length <= 3, "idle list request count: " + list.length);
   const checks = result.requests.filter(r => r.path.endsWith("/queue") && r.path.includes("/42/"));
   assert.ok(checks.length <= 2, "cold queue request count: " + checks.length);
@@ -1686,4 +1702,702 @@ test("top and side pills are exact rotations; expansion replaces the capsule wit
   const clamped = ui.glassLayout(top, 320, 180, true, 1000);
   assert.ok(clamped.left >= 0 && clamped.top >= 0 && clamped.left + clamped.width <= 320 && clamped.top + clamped.height <= 180);
   assert.deepEqual(ui.glassLayout(top, 1400, 880), a);
+});
+
+test("surface geometry uses content viewport without classic scrollbars", () => {
+  const win = { innerWidth: 1400, innerHeight: 880, document: {
+    compatMode: "CSS1Compat", documentElement: { clientWidth: 1380, clientHeight: 862 }
+  } };
+  const v = ui.viewportSize(win);
+  assert.deepEqual(v, { width: 1380, height: 862 });
+  const right = ui.glassLayout({ x: 1, y: 1 }, v.width, v.height);
+  assert.deepEqual({ left: right.left, top: right.top, width: right.width, height: right.height },
+    { left: 1352, top: 766, width: 28, height: 96 });
+  const top = ui.glassLayout({ x: 1, y: 0, edge: "top" }, v.width, v.height);
+  assert.equal(top.left + top.width, 1380);
+  const panel = ui.glassLayout({ x: 1, y: 1 }, v.width, v.height, true, 350);
+  assert.equal(panel.left + panel.width, 1380);
+  assert.equal(panel.top + panel.height, 862);
+  win.document.compatMode = "BackCompat";
+  win.document.body = { clientWidth: 1376, clientHeight: 860 };
+  assert.deepEqual(ui.viewportSize(win), { width: 1376, height: 860 });
+});
+
+test("new-tab completion retries the real document after early activation and transient injection failure", async () => {
+  const app = worker();
+  app.local.data[ui.keys.enabled] = true;
+  app.chrome.permissions = { contains: async () => true };
+  app.tabs[0].active = false;
+  const tab = { id: 9, windowId: 1, url: "chrome://newtab/", status: "loading", active: true };
+  app.tabs.push(tab);
+  let attempts = 0, probes = 0, installed = false;
+  app.chrome.scripting = { executeScript: async ({ target }) => {
+    assert.equal(target.tabId, tab.id);
+    if (++attempts === 1) throw new Error("transient injection rejection");
+    installed = true;
+  } };
+  app.chrome.tabs.sendMessage = async (tabId, msg) => {
+    if (tabId === tab.id && msg.kind === "tp.surface-probe") {
+      probes++;
+      return installed ? { ok: false, installed: true } : null;
+    }
+    return null;
+  };
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: tab.id, windowId: 1 });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(attempts, 0);
+  tab.url = "https://example.com/work";
+  tab.status = "complete";
+  app.chrome.tabs.onUpdated.listeners[0](tab.id, { status: "complete" }, tab);
+  for (let i = 0; i < 100 && !installed; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(attempts, 2);
+  assert.ok(installed);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const before = probes;
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: tab.id, windowId: 1 });
+  for (let i = 0; i < 50 && probes === before; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(probes > before);
+  assert.equal(attempts, 2, "installed but not ready host handles its own recovery");
+});
+
+
+test("uncertain row can be dismissed without false read evidence; same version stays hidden across refresh and restart", async () => {
+  const app = worker();
+  await app.deliver(report(now, row()));
+  const update = now + 1_000;
+  await app.deliver(report(now + 5_000, row(update), { messageError: true }));
+  const before = structuredClone(currentTask(app));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 5_000).tasks[0].uncertain, true);
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version: rules.displayVersion(before) })).ok, true);
+  const hidden = currentTask(app);
+  assert.equal(hidden.acked, before.acked);
+  assert.equal(hidden.pending, before.pending);
+  assert.equal(hidden.readRevision, before.readRevision);
+  assert.equal(hidden.messageUncertain, true);
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 5_000).tasks.length, 0);
+  const restarted = worker({ local: app.local.data, session: app.session.data });
+  await restarted.deliver(report(now + 10_000, row(update), { messageError: true }));
+  assert.equal(rules.view(restarted.local.data[web.keys.state], now + 10_000).tasks.length, 0);
+  await restarted.deliver(replyReport(now + 15_000, update, "new-after-dismiss"));
+  assert.equal(rules.view(restarted.local.data[web.keys.state], now + 15_000).tasks.length, 1);
+  assert.equal(currentTask(restarted).pending, true);
+  assert.equal(restarted.notices.size, 1);
+});
+
+test("checked verified reply disappears from counts, rows and notices; new run at same list timestamp returns", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  const version = rules.displayVersion(currentTask(app));
+  assert.equal(app.notices.size, 1);
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version })).ok, true);
+  assert.equal(currentTask(app).pending, false);
+  assert.equal(app.notices.size, 0);
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 5_000).tasks.length, 0);
+  await app.deliver(replyReport(now + 10_000, update, "A"));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 10_000).tasks.length, 0);
+  await app.deliver(report(now + 15_000, row(update), { busy: true }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 15_000).counts.running, 1);
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version })).ok, false, "old checkbox cannot dismiss a new run");
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version: rules.displayVersion(currentTask(app)) })).ok, false, "known running task cannot be marked handled");
+  await app.deliver(replyReport(now + 20_000, update, "B", { atMessage: now + 18_000 }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 20_000).counts.attention, 1);
+  assert.equal(app.notices.size, 1);
+});
+
+test("a dismissed uncertain pending reply cancels delayed delivery without marking it read", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  app.chrome.notifications.getPermissionLevel = async () => "denied";
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  assert.equal(Object.keys(app.local.data[web.keys.state].outbox).length, 1);
+  await app.deliver(report(now + 10_000, row(update), { busy: null, queueError: true }));
+  const before = currentTask(app);
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version: rules.displayVersion(before) })).ok, true);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(currentTask(app).acked, before.acked);
+  assert.deepEqual(app.local.data[web.keys.state].outbox, {});
+  app.chrome.notifications.getPermissionLevel = async () => "granted";
+  await app.deliver(replyReport(now + 15_000, update, "A"));
+  assert.equal(app.notices.size, 0);
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 15_000).tasks.length, 0);
+});
+
+test("24-hour display window uses activity rather than polling; older tasks remain in collector tracking", () => {
+  const tracker = timeline();
+  const age = 24 * 60 * 60_000;
+  const older = now - age - 1, edge = now - age;
+  const oldRow = { ...row(older, older), id: "43" };
+  const edgeRow = { ...row(edge, edge), id: "44" };
+  const packet = report(now, row());
+  packet.conversations.push(oldRow, edgeRow);
+  const initial = tracker.next(packet);
+  assert.deepEqual(rules.view(initial.state, now).tasks.map(t => t.id).sort(), ["42", "44"]);
+  const oldTask = initial.state.tasks["43"];
+  assert.ok(oldTask, "visibility filtering must not delete durable state");
+  assert.ok(rules.watchRows(Array.from({length: 24}, (_, i) => ({ ...row(), id: String(100 + i) })).concat(oldRow),
+    new Map(), { "43": { ...oldTask, pending: true } }, now).some(r => r.id === "43"));
+  const later = tracker.next({ ...packet, at: now + 1, listAt: now + 1, queueAt: { [id]: now + 1, "43": now + 1, "44": now + 1 },
+    queues: { [id]: { sessionState: "IDLE", pending: [] }, "43": { sessionState: "IDLE", pending: [] }, "44": { sessionState: "IDLE", pending: [] } } });
+  assert.deepEqual(rules.view(later.state, now + 1).tasks.map(t => t.id), ["42"]);
+  const renewed = tracker.next({ ...packet, at: now + 5_000, listAt: now + 5_000,
+    conversations: [row(), { ...oldRow, updateTime: now + 3_000 }, edgeRow] });
+  assert.ok(rules.view(renewed.state, now + 5_000).tasks.some(t => t.id === "43"));
+});
+
+
+test("historical user-message backfill never reopens a dismissed conversation, including missing timestamps", async () => {
+  const app = worker();
+  const update = now - 1_000;
+  await app.deliver(report(now, row(update), { busy: null, queueError: true }));
+  const original = currentTask(app);
+  const version = rules.displayVersion(original);
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version })).ok, true);
+  const saved = structuredClone(app.local.data);
+  assert.equal(currentTask(app).dismissedAt, now);
+  const restarted = worker({ local: saved, session: app.session.data });
+  for (const [delta, userId, atMessage] of [
+    [5_000, "historical-user", update],
+    [10_000, "historical-undated-user", 0],
+    [15_000, "historical-late-list", now - 1],
+    [20_000, "historical-late-list", now - 1]
+  ]) {
+    const at = now + delta;
+    await restarted.deliver(report(at, row(update), {
+      message: message(update, at, userId, { sender: "other", atMessage })
+    }));
+    const task = currentTask(restarted);
+    assert.equal(task.lastUserMessage, userId, "collector watermark is still recorded");
+    assert.equal(rules.displayVersion(task), version, "backfill is not activity");
+    assert.equal(task.acked, original.acked);
+    assert.equal(task.readRevision, original.readRevision);
+    assert.equal(rules.view(restarted.local.data[web.keys.state], at).tasks.length, 0);
+    assert.equal(restarted.notices.size, 0);
+  }
+
+  const at = now + 25_000;
+  const userAt = now + 22_000;
+  await restarted.deliver(report(at, row(update), {
+    message: message(update, at, "new-user", { sender: "other", atMessage: userAt })
+  }));
+  assert.equal(currentTask(restarted).userActivityAt, userAt);
+  assert.equal(rules.view(restarted.local.data[web.keys.state], at).tasks.length, 1);
+  assert.equal((await restarted.send({ kind: "tp.dismiss", id, version })).ok, false,
+    "old display ticket must not remove a newly evidenced activity");
+  assert.equal((await restarted.send({ kind: "tp.dismiss", id, version: rules.displayVersion(currentTask(restarted)) })).ok, true);
+  await restarted.deliver(report(now + 30_000, row(update), {
+    message: message(update, now + 30_000, "new-user", { sender: "other", atMessage: userAt })
+  }));
+  assert.equal(rules.view(restarted.local.data[web.keys.state], now + 30_000).tasks.length, 0);
+  await restarted.deliver(report(now + 35_000, row(now + 32_000)));
+  assert.equal(rules.view(restarted.local.data[web.keys.state], now + 35_000).tasks.length, 1,
+    "new list activity must still reopen even without a timestamped message");
+});
+
+test("legacy dismissal ticket is preserved when its only change is a hydrated user watermark", () => {
+  const task = {
+    id, agentId: agent, created: old, update: old, status: "seen",
+    dismissedVersion: JSON.stringify([id, agent, old, old, "", 0, ""]),
+    lastUserMessage: "historical"
+  };
+  assert.equal(rules.isDismissed(task), true);
+  assert.equal(rules.isDismissed({ ...task, userActivityAt: now }), false);
+  assert.equal(rules.isDismissed({ ...task, runCycleAt: now }), false);
+  assert.equal(rules.isDismissed({ ...task, replyKey: "message.new" }), false);
+  assert.equal(rules.isDismissed({ ...task, update: now }), false);
+});
+
+
+test("P1 landed exact notice waits for fresh evidence, then reads after worker restart", async () => {
+  const app = worker(), update = now + 1000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5000, update, "A"));
+  const revision = exactRevision(app);
+  await app.deliver(report(now + 10000, row(update), { busy: null, queueError: true }));
+  app.tabs.push({ id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete", active: false });
+  const opened = await app.send({ kind: "tp.open", id, revision, intent: "notice" });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.clearNotice, false);
+  assert.equal(currentTask(app).pending, true);
+  const guard = app.session.data["tp-web-jump-tabs-v1"]["9"];
+  assert.equal(guard.deferredRead, true);
+  const restarted = worker({ local: app.local.data, session: app.session.data, notices: [...app.notices] });
+  restarted.tabs.splice(0, restarted.tabs.length, ...structuredClone(app.tabs));
+  await restarted.deliver(replyReport(now + 15000, update, "A"));
+  assert.equal(currentTask(restarted).pending, false);
+  assert.equal(currentTask(restarted).jumpCommit, guard.token);
+  assert.equal(restarted.notices.size, 0);
+});
+
+test("P1 deferred notice must not acknowledge newer reply or a background tab", async () => {
+  for (const next of ["newer", "background", "stuck"]) {
+    const app = worker(), update = now + 1000;
+    await app.deliver(report(now, row()));
+    await app.deliver(replyReport(now + 5000, update, "A", { failed: next === "stuck" }));
+    const revision = exactRevision(app);
+    await app.deliver(report(now + 10000, row(update), { busy: null, queueError: true }));
+    app.tabs.push({ id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete", active: false });
+    const opened = await app.send({ kind: "tp.open", id, revision, intent: "notice" });
+    assert.equal(opened.ok, true);
+    assert.equal(opened.clearNotice, false);
+    if (next === "background") {
+      app.tabs.find(tab => tab.id === 9).active = false;
+      app.tabs[0].active = true;
+    }
+    await app.deliver(replyReport(now + 15000, next === "newer" ? now + 12000 : update,
+      next === "newer" ? "B" : "A", { failed: next === "stuck" }));
+    assert.equal(currentTask(app).pending, next !== "stuck");
+    if (next === "newer") assert.notEqual(exactRevision(app), revision);
+  }
+});
+
+test("TAB display counts and rows use the same opened-tab membership", () => {
+  const { state } = timeline().next(report(now, row(), { busy: true }));
+  const original = state.tasks[id];
+  state.tasks["43"] = { ...original, id: "43", status: "attention" };
+  state.tasks["44"] = { ...original, id: "44", status: "stuck" };
+  const tabs = [{ id: 9, groupId: 8, url: web.conversationUrl(id, agent) },
+    { id: 10, groupId: -1, url: web.conversationUrl("43", agent) }];
+  const mapping = ui.buildGroups(tabs, [{ id: 8, title: "浏览器分组", color: "blue" }], web);
+  const v = rules.view(state, now, task => Boolean(ui.groupFor(task, "tab", mapping)));
+  assert.deepEqual(v.counts, { running: 1, attention: 1, stuck: 0 });
+  assert.deepEqual(v.tasks.map(task => task.id).sort(), ["42", "43"]);
+  assert.equal(rules.view(state, now).tasks.length, 3);
+  const closed = ui.buildGroups(tabs.slice(0, 1), [{ id: 8, title: "浏览器分组", color: "blue" }], web);
+  assert.deepEqual(rules.view(state, now, task => Boolean(ui.groupFor(task, "tab", closed))).counts,
+    { running: 1, attention: 0, stuck: 0 });
+});
+
+
+test("dismissed reply stays hidden when the list catches up to an independently observed reply", async () => {
+  for (const dated of [true, false]) {
+    const app = worker(), firstUpdate = now + 1_000, replyAt = now + 4_000;
+    await app.deliver(report(now, row()));
+    await app.deliver(replyReport(now + 5_000, firstUpdate, "A", { atMessage: dated ? replyAt : 0 }));
+    const version = rules.displayVersion(currentTask(app));
+    assert.equal((await app.send({ kind: "tp.dismiss", id, version })).ok, true);
+    const restarted = worker({ local: app.local.data, session: app.session.data });
+    await restarted.deliver(replyReport(now + 8_000, replyAt, "A", { atMessage: dated ? replyAt : 0 }));
+    assert.equal(rules.displayVersion(currentTask(restarted)), version);
+    assert.equal(rules.view(restarted.local.data[web.keys.state], now + 8_000).tasks.length, 0);
+    assert.equal(restarted.notices.size, 0);
+    await restarted.deliver(report(now + 10_000, row(replyAt), { busy: true }));
+    assert.equal(rules.view(restarted.local.data[web.keys.state], now + 10_000).counts.running, 1);
+    assert.equal((await restarted.send({ kind: "tp.dismiss", id, version })).ok, false);
+    await restarted.deliver(replyReport(now + 14_000, replyAt, "B", { atMessage: now + 12_000 }));
+    assert.equal(rules.view(restarted.local.data[web.keys.state], now + 14_000).counts.attention, 1);
+    assert.equal(restarted.notices.size, 1);
+  }
+});
+
+test("pre-upgrade dismissal survives an equivalent delayed list watermark but not newer evidence", () => {
+  const task = {
+    id, agentId: agent, created: old, update: now + 4_000, replyKey: "message.A",
+    replyAt: now + 4_000, replyActivityAt: now + 4_000, runCycleAt: 0,
+    dismissedVersion: JSON.stringify([id, agent, old, now + 1_000, "message.A", 0, 0])
+  };
+  assert.equal(rules.isDismissed(task), true);
+  assert.equal(rules.isDismissed({ ...task, update: now + 6_000 }), false);
+  assert.equal(rules.isDismissed({ ...task, replyKey: "message.B" }), false);
+  assert.equal(rules.isDismissed({ ...task, runCycleAt: now + 5_000 }), false);
+});
+
+test("all recent rows and explicitly opened or hinted old rows enter the bounded collector", () => {
+  const recent = Array.from({ length: 60 }, (_, i) => ({ ...row(old - i), id: String(100 + i) }));
+  const cold = now - 25 * 60 * 60_000;
+  const history = Array.from({ length: 4 }, (_, i) => ({ ...row(cold - i, cold - i), id: String(200 + i) }));
+  const watched = rules.watchRows(recent.concat(history), new Map(), {}, now,
+    new Set(["200"]), new Map([["201", now + 1000], ["202", now - 1]])).map(row => row.id);
+  assert.equal(watched.length, 62);
+  assert.ok(recent.every(row => watched.includes(row.id)));
+  assert.ok(watched.includes("200"));
+  assert.ok(watched.includes("201"));
+  assert.ok(!watched.includes("202") && !watched.includes("203"));
+});
+
+test("overlapping surface authorization cannot overwrite the newest credential", async () => {
+  const app = worker();
+  app.local.data[ui.keys.enabled] = true;
+  const ordinary = { id: 9, windowId: 1, active: true, status: "complete", url: "https://example.com/work" };
+  app.tabs.push(ordinary);
+  const sender = { id: "unit", tab: ordinary, frameId: 0, url: ordinary.url };
+  const frame = { id: "unit", tab: ordinary, frameId: 4, url: "surface.html" };
+  let release, entered = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  app.chrome.permissions = { contains: async () => {
+    if (!entered) { entered = true; await gate; }
+    return true;
+  } };
+  const older = app.send({ kind: "tp.surface.register" }, sender);
+  await until(() => entered);
+  const newer = await app.send({ kind: "tp.surface.register" }, sender);
+  assert.equal(newer.ok, true);
+  release();
+  assert.equal((await older).ok, false);
+  assert.equal(app.session.data[ui.keys.surface(ordinary.id)].token, newer.token);
+  assert.equal((await app.send({ kind: "tp.surface.attach", token: newer.token }, frame)).ok, true);
+  assert.equal((await app.send({ kind: "tp.surface.register" }, { ...sender, documentLifecycle: "cached" })).ok, false);
+});
+
+test("in-flight surface storage writes serialize and a revoked credential triggers recovery", async () => {
+  const app = worker();
+  app.local.data[ui.keys.enabled] = true;
+  const ordinary = { id: 9, windowId: 1, active: true, status: "complete", url: "https://example.com/work" };
+  app.tabs[0].active = false;
+  app.tabs.push(ordinary);
+  let authorizations = 0;
+  app.chrome.permissions = { contains: async () => { authorizations++; return true; } };
+  const sender = { id: "unit", tab: ordinary, frameId: 0, url: ordinary.url };
+  const frame = { id: "unit", tab: ordinary, frameId: 4, url: "surface.html" };
+  const key = ui.keys.surface(ordinary.id);
+  const save = app.session.set;
+  let release, entered = false, firstToken;
+  const gate = new Promise(resolve => { release = resolve; });
+  app.session.set = async values => {
+    if (values[key] && !entered) { entered = true; firstToken = values[key].token; await gate; }
+    await save(values);
+  };
+  const first = app.send({ kind: "tp.surface.register" }, sender);
+  await until(() => entered);
+  const second = app.send({ kind: "tp.surface.register" }, sender);
+  await until(() => authorizations >= 2);
+  release();
+  assert.equal((await first).ok, false);
+  const current = await second;
+  assert.equal(current.ok, true);
+  assert.equal(app.session.data[key].token, current.token);
+  const rejected = await app.send({ kind: "tp.dismiss", id, version: "old", token: firstToken }, frame);
+  assert.equal(rejected.surfaceInvalid, true);
+  assert.equal((await app.send({ kind: "tp.surface.attach", token: current.token }, frame)).ok, true);
+  const messages = [];
+  app.chrome.tabs.sendMessage = async (tabId, packet) => {
+    if (tabId !== ordinary.id) return null;
+    messages.push(packet);
+    if (packet.kind === "tp.surface-probe") return { ok: true, installed: true, token: firstToken };
+    return { ok: true };
+  };
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: ordinary.id, windowId: ordinary.windowId });
+  await until(() => messages.some(packet => packet.kind === "tp.surface-repair"));
+  assert.equal(messages.find(packet => packet.kind === "tp.surface-repair").token, firstToken);
+});
+
+
+// f7eaaad follow-up: exercise the real state engine and the actual panel
+// grouping functions, not a separately implemented approximation.
+function panelGroups(view, filter = "", groupMode = "dataagent", tabGroups = {}) {
+  const source = fs.readFileSync(path.join(ext, "capsule.js"), "utf8");
+  const status = source.slice(source.indexOf("  const checkedTask ="), source.indexOf("  function progress("));
+  const groups = source.slice(source.indexOf("  function makeGroups("), source.indexOf("  function groupRow("));
+  const evaluate = new Function("rules", "ui", "filter", "groupMode", "tabGroups", "severity", "choices",
+    status + groups + "\nreturn { makeGroups, isOpen };");
+  const actual = evaluate(rules, ui, filter, groupMode, tabGroups,
+    { stuck: 3, attention: 2, running: 1, seen: 0, done: 0 }, new Map());
+  return { groups: actual.makeGroups(view.tasks), isOpen: actual.isOpen };
+}
+
+test("P1 verified unread survives failure, full recovery, restart and another queue failure", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  const revision = exactRevision(app), acked = currentTask(app).acked;
+  await app.deliver(report(now + 10_000, row(update), { busy: null, error: "HTTP 503" }));
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 10_000).stale, true);
+  await app.deliver(replyReport(now + 15_000, update, "A"));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 15_000).counts.attention, 1);
+  const restarted = worker({ local: app.local.data, session: app.session.data, notices: [...app.notices] });
+  await restarted.deliver(report(now + 20_000, row(update), { busy: null, queueError: true }));
+  const view = rules.view(restarted.local.data[web.keys.state], now + 20_000);
+  assert.equal(currentTask(restarted).pending, true);
+  assert.equal(currentTask(restarted).acked, acked);
+  assert.equal(exactRevision(restarted), revision);
+  assert.equal(view.tasks[0].uncertain, true);
+  assert.equal(rules.canAcknowledge(currentTask(restarted)), false);
+  assert.equal(view.counts.attention, 1, "revalidated unread disappeared during the next transient failure");
+  assert.equal(restarted.notices.size, 1, "same reply must not notify twice");
+});
+
+test("P1 existing unread survives a queue-only valid revalidation; auth fence still blocks stale samples", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  await app.deliver(report(now + 10_000, row(update), { busy: null, error: "HTTP 401" }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 10_000).tasks.length, 0);
+  await app.deliver(report(now + 15_000, row(update), { queueAt: now + 5_000 }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 15_000).counts.attention, 0);
+  await app.deliver(report(now + 20_000, row(update)));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 20_000).counts.attention, 1);
+  await app.deliver(report(now + 25_000, row(update), { busy: null, queueError: true }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 25_000).counts.attention, 1);
+  assert.equal(currentTask(app).pending, true);
+  await app.deliver(report(now + 30_000, row(update), { busy: null, accessError: true }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 30_000).tasks.length, 0);
+});
+
+test("P1 DA and TAB counters, actual group badges and filter membership agree during uncertainty", () => {
+  const tracker = timeline(), update = now + 1_000, at = now + 10_000;
+  tracker.next(report(now, row()));
+  tracker.next(replyReport(now + 5_000, update, "A"));
+  const { state } = tracker.next(report(at, row(update), { busy: null, queueError: true }));
+  const unread = state.tasks[id];
+  state.tasks["43"] = { ...unread, id: "43", status: "running", runAt: now, awaitingReply: true,
+    pending: false, replyKey: undefined, replyAt: 0 };
+  state.tasks["44"] = { ...unread, id: "44", status: "stuck", runAt: now, awaitingReply: true,
+    pending: false, replyKey: undefined, replyAt: 0 };
+  state.tasks["45"] = { ...unread, id: "45", status: "stuck", failed: true };
+  state.tasks["45"].replyVerifiedRevision = rules.revision(state.tasks["45"]);
+  state.tasks["46"] = { ...unread, id: "46", status: "running", runAt: now, awaitingReply: true,
+    queueError: false, observedAt: at, pending: false, replyKey: undefined, replyAt: 0 };
+  const tabs = [id, "43", "44", "46"].map((cid, i) => ({
+    id: 100 + i, groupId: 8, url: web.conversationUrl(cid, agent)
+  }));
+  const mapping = ui.buildGroups(tabs, [{ id: 8, title: "真实标签组", color: "blue" }], web);
+  for (const mode of ["dataagent", "tab"]) {
+    const view = rules.view(state, at, mode === "tab" ? task => !!ui.groupFor(task, mode, mapping) : undefined);
+    assert.deepEqual(view.counts, { running: 1, attention: 1, stuck: mode === "tab" ? 0 : 1 });
+    const total = Object.values(view.counts).reduce((a, b) => a + b, 0);
+    assert.equal(panelGroups(view, "", mode, mapping).groups.reduce((n, g) => n + g.active, 0), total);
+    for (const kind of ["running", "attention", "stuck"]) {
+      const p = panelGroups(view, kind, mode, mapping);
+      assert.equal(p.groups.reduce((n, g) => n + g.matched.length, 0), view.counts[kind]);
+      assert.ok(p.groups.every(g => p.isOpen(g) === (g.matched.length > 0)));
+    }
+  }
+});
+
+test("P1 regressed list is not authoritative; unread display recovers after a fresh matching sample", () => {
+  const tracker = timeline(), update = now + 1_000;
+  tracker.next(report(now, row()));
+  tracker.next(replyReport(now + 5_000, update, "A"));
+  const regressed = tracker.next(report(now + 10_000, row(old)));
+  assert.equal(regressed.task.listUncertain, true);
+  assert.equal(regressed.task.pending, true);
+  const view = rules.view(regressed.state, now + 10_000);
+  assert.equal(view.counts.attention, 0);
+  assert.equal(panelGroups(view, "attention").groups.reduce((n, g) => n + g.matched.length, 0), 0);
+  const recovered = tracker.next(replyReport(now + 15_000, update, "A"));
+  assert.equal(rules.view(recovered.state, now + 15_000).counts.attention, 1);
+});
+
+test("P1 red row successfully landed during a queue error acknowledges only its exact reply on recovery", async () => {
+  for (const mode of ["same", "newer", "background", "running", "aged"]) {
+    const app = worker(), update = now + 1000;
+    await app.deliver(report(now, row()));
+    await app.deliver(replyReport(now + 5000, update, "A", { failed: mode !== "aged" }));
+    let stamp = now + 5000;
+    if (mode === "aged") {
+      stamp += 31 * 60_000;
+      await app.deliver(replyReport(stamp, update, "A"));
+    }
+    assert.equal(currentTask(app).status, "stuck");
+    const revision = exactRevision(app);
+    await app.deliver(report(stamp + 5000, row(update), { busy: null, queueError: true }));
+    app.tabs.push({ id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete", active: false });
+    const result = await app.send({ kind: "tp.open", id, revision, intent: "row" });
+    assert.equal(result.ok, true);
+    assert.equal(result.clearNotice, false);
+    assert.equal(currentTask(app).pending, true);
+    const restarted = worker({ local: app.local.data, session: app.session.data, notices: [...app.notices] });
+    restarted.tabs.splice(0, restarted.tabs.length, ...structuredClone(app.tabs));
+    if (mode === "background") {
+      restarted.tabs.find(t => t.id === 9).active = false;
+      restarted.tabs[0].active = true;
+    }
+    if (mode === "running") {
+      await restarted.deliver(report(stamp + 10000, row(update), { busy: true }));
+      assert.equal(currentTask(restarted).pending, true);
+      assert.ok(currentTask(restarted).runAt);
+      assert.equal(currentTask(restarted).readRevision, undefined);
+      continue;
+    }
+    const later = stamp + 10000;
+    await restarted.deliver(replyReport(later, mode === "newer" ? later - 1000 : update,
+      mode === "newer" ? "B" : "A", { failed: mode !== "aged" && mode !== "newer" }));
+    const shouldRead = mode === "same" || mode === "aged";
+    assert.equal(currentTask(restarted).pending, !shouldRead, mode);
+    if (shouldRead) {
+      assert.equal(currentTask(restarted).readRevision, revision);
+      assert.equal(rules.view(restarted.local.data[web.keys.state], later).counts.stuck, 0);
+      assert.equal(restarted.notices.size, 0);
+    } else if (mode === "newer") {
+      assert.notEqual(exactRevision(restarted), revision);
+      assert.equal(currentTask(restarted).replyKey, "message.B");
+      assert.ok([...restarted.notices.keys()].some(key => key.endsWith("message.B")));
+    }
+  }
+});
+
+test("P2 running and stuck row fills have distinct visible tint while capsule palette stays intact", () => {
+  const css = fs.readFileSync(path.join(ext, "capsule.css"), "utf8");
+  for (const [kind, minimum] of [["running", .35], ["stuck", .38]]) {
+    const match = css.match(new RegExp("\\.row\\." + kind + "\\s*\\{[^}]*--row-tint:\\s*rgb\\([^/]+/\\s*([.\\d]+)\\)"));
+    assert.ok(match && Number(match[1]) >= minimum, kind + " row tint is too faint");
+  }
+});
+
+
+async function landRedReplyForVisit(app, replyId = "A") {
+  const update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, replyId, { failed: true }));
+  const revision = exactRevision(app);
+  await app.deliver(report(now + 10_000, row(update), { busy: null, queueError: true }));
+  const target = { id: 9, windowId: 1, url: web.conversationUrl(id, agent), status: "complete", active: false };
+  app.tabs.push(target);
+  const opened = await app.send({ kind: "tp.open", id, revision, intent: "row" });
+  assert.equal(opened.ok, true);
+  assert.equal(currentTask(app).pending, true);
+  return { target, revision, update };
+}
+
+async function markVisitedAndSwitchAway(app, target, at = now + 11_000) {
+  const sender = { id: "unit", frameId: 0, tab: target, url: target.url };
+  const visit = await app.send({ kind: "tp.visit", id, at }, sender);
+  assert.equal(visit.ok, true);
+  const guards = () => app.session.data["tp-web-jump-tabs-v1"] || {};
+  const visited = guards()["9"];
+  target.active = false;
+  app.tabs[0].active = true;
+  app.chrome.tabs.onActivated.listeners[0]({ tabId: 7, windowId: 1 });
+  await new Promise(resolve => setTimeout(resolve, 15));
+  return { visit, guard: guards()["9"], visited };
+}
+
+test("P1 verified unread survives partial list recovery while its queue still fails", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  const revision = exactRevision(app);
+  await app.deliver(report(now + 10_000, row(update), { busy: null, error: "HTTP 503" }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 10_000).stale, true);
+  await app.deliver(report(now + 15_000, row(update), { busy: null, queueError: true }));
+  const state = app.local.data[web.keys.state], view = rules.view(state, now + 15_000);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(currentTask(app).replyKey, "message.A");
+  assert.equal(view.stale, false, "list has recovered");
+  assert.equal(view.tasks[0].uncertain, true, "queue is still unconfirmed");
+  assert.equal(view.counts.attention, 1, "confirmed unread must not turn into zero");
+  assert.equal(panelGroups(view, "attention").groups.reduce((n, g) => n + g.matched.length, 0), 1);
+  assert.equal(app.notices.size, 1, "no duplicate or premature notification removal");
+  await app.deliver(report(now + 20_000, row(update), { busy: null, queueError: true }));
+  assert.equal(rules.view(app.local.data[web.keys.state], now + 20_000).counts.attention, 1);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(exactRevision(app), revision);
+});
+
+test("P1 per-conversation access denial is applied even when the list row regresses", async () => {
+  const app = worker(), update = now + 1_000;
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, update, "A"));
+  assert.equal(app.notices.size, 1);
+  await app.deliver(report(now + 10_000, row(old), { busy: null, accessError: true }));
+  const state = app.local.data[web.keys.state], task = currentTask(app);
+  assert.ok(task.accessDeniedAt, "403 evidence must not be skipped by the list-regression branch");
+  assert.equal(rules.taskAccessible(state, task), false);
+  assert.equal(rules.view(state, now + 10_000).tasks.length, 0);
+  assert.equal(app.notices.size, 0, "inaccessible prior-account notification must be withdrawn");
+  assert.equal(task.pending, true, "access denial hides; it does not fake a read");
+});
+
+test("P1 trusted visit survives switching away and acknowledges only the exact red reply after recovery", async () => {
+  const app = worker();
+  const { target, revision, update } = await landRedReplyForVisit(app, "A");
+  const result = await markVisitedAndSwitchAway(app, target);
+  assert.equal(result.visited?.deferredRead, true);
+  assert.equal(result.visited?.visited, true, "trusted page interaction must persist the visit intent");
+  assert.equal(result.guard?.token, result.visited.token, "switching away must retain the exact read intent");
+  assert.equal(currentTask(app).pending, true);
+  await app.deliver(replyReport(now + 15_000, update, "A", { failed: true }));
+  assert.equal(currentTask(app).pending, false);
+  assert.equal(currentTask(app).readRevision, revision);
+  assert.equal(currentTask(app).replyKey, "message.A");
+  assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"], undefined,
+    "successful durable read must release its guard");
+});
+
+test("P1 visited red reply intent cannot clear a later reply or an active run", async () => {
+  for (const mode of ["newer", "running"]) {
+    const app = worker();
+    const { target, revision, update } = await landRedReplyForVisit(app, "A");
+    const result = await markVisitedAndSwitchAway(app, target);
+    assert.equal(result.guard?.visited, true);
+    if (mode === "running") {
+      await app.deliver(report(now + 15_000, row(update), { busy: true }));
+      assert.equal(currentTask(app).pending, true);
+      assert.ok(currentTask(app).runAt);
+      assert.equal(currentTask(app).readRevision, undefined);
+      assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"]?.token, result.guard.token);
+    } else {
+      await app.deliver(replyReport(now + 15_000, now + 14_000, "B", { failed: true }));
+      assert.equal(currentTask(app).pending, true);
+      assert.equal(currentTask(app).replyKey, "message.B");
+      assert.notEqual(exactRevision(app), revision);
+      assert.equal(currentTask(app).readRevision, undefined);
+      assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"]?.revision, revision,
+        "the stale A intent must remain a barrier, not be applied to B");
+      assert.ok([...app.notices.keys()].some(key => key.endsWith("message.B")));
+      app.tabs.forEach(tab => { tab.active = tab.id === 9; });
+      app.chrome.tabs.onActivated.listeners[0]({ tabId: 9, windowId: 1 });
+      await new Promise(resolve => setTimeout(resolve, 15));
+      assert.equal(currentTask(app).pending, false,
+        "reactivating the page after B arrives is a fresh visit to B");
+      assert.equal(currentTask(app).readRevision, exactRevision(app));
+      assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"], undefined);
+    }
+  }
+});
+
+test("P1 account authorization loss invalidates a visited red-read intent without acknowledging it", async () => {
+  const app = worker();
+  const { target } = await landRedReplyForVisit(app, "A");
+  const result = await markVisitedAndSwitchAway(app, target);
+  assert.equal(result.guard?.visited, true);
+  await app.deliver(report(now + 15_000, row(now + 14_000), { busy: null, error: "HTTP 401" }));
+  assert.equal(app.local.data[web.keys.state].authBlocked, true);
+  assert.equal(currentTask(app).pending, true);
+  assert.equal(currentTask(app).readRevision, undefined);
+  assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"], undefined,
+    "account authorization loss must invalidate the prior account's read intent");
+  await app.deliver(report(now + 20_000, row(now + 14_000)));
+  assert.equal(currentTask(app).pending, true, "reauthentication must not replay the old visit intent");
+  assert.equal(currentTask(app).readRevision, undefined);
+});
+
+test("P1 a visited red reply cannot auto-read a later foreground reply", async () => {
+  for (const mode of ["direct", "after-run"]) {
+    const app = worker();
+    const { target, revision: oldRevision, update } = await landRedReplyForVisit(app, "A");
+    app.tabs.forEach(tab => { tab.active = tab.id === target.id; });
+    const sender = { id: "unit", frameId: 0, tab: target, url: target.url };
+    const firstVisit = await app.send({ kind: "tp.visit", id, at: now + 11_000 }, sender);
+    assert.equal(firstVisit.ok, true);
+    assert.equal(firstVisit.deferred, true);
+    assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"]?.visited, true);
+
+    if (mode === "after-run") {
+      await app.deliver(report(now + 12_000, row(update), { busy: true }));
+      assert.ok(currentTask(app).runAt, "the intervening run must remain active");
+      assert.equal(currentTask(app).pending, true);
+    }
+
+    const nextUpdate = now + 14_000;
+    // The first successful sample after A's queue outage also sees B.
+    await app.deliver(replyReport(now + 15_000, nextUpdate, "B"));
+    const nextRevision = exactRevision(app);
+    assert.notEqual(nextRevision, oldRevision);
+    assert.equal(currentTask(app).pending, true,
+      "A's earlier page interaction must not silently acknowledge B");
+    assert.notEqual(currentTask(app).readRevision, nextRevision);
+    assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"]?.revision, oldRevision,
+      "the superseded visit remains a read barrier until a fresh visit to B");
+    assert.ok([...app.notices.keys()].some(key => key.endsWith("message.B")),
+      "B must retain its own pending notice");
+
+    const secondVisit = await app.send({ kind: "tp.visit", id, at: now + 21_000 }, sender);
+    assert.equal(secondVisit.ok, true);
+    assert.equal(currentTask(app).pending, false,
+      "a new trusted visit after B arrives may acknowledge B");
+    assert.equal(currentTask(app).readRevision, nextRevision);
+    assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"], undefined);
+  }
 });

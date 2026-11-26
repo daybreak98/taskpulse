@@ -7,6 +7,17 @@
     toast: tabId => "tp-web-toast:" + tabId
   };
   const origins = ["http://*/*", "https://*/*"];
+  // innerWidth/Height include classic scrollbars; fixed overlay geometry
+  // must use the drawable content viewport, including in quirks mode.
+  function viewportSize(win) {
+    const doc = win.document;
+    const root = doc?.compatMode === "BackCompat" ? doc.body : doc?.documentElement;
+    const dimension = (client, inner) => Math.max(1, Math.floor(
+      Number.isFinite(client) && client > 0 ? Math.min(client, Number.isFinite(inner) && inner > 0 ? inner : client) :
+        Number.isFinite(inner) && inner > 0 ? inner : 1));
+    return { width: dimension(root?.clientWidth, win.innerWidth),
+      height: dimension(root?.clientHeight, win.innerHeight) };
+  }
   const clamp = (value, lo, hi) => Math.min(Math.max(value, lo), Math.max(lo, hi));
   const normalized = value => ({
     x: Number.isFinite(value?.x) ? clamp(value.x, 0, 1) : 1,
@@ -95,18 +106,20 @@
       if (!url || !cid || selected.has(cid)) continue;
       const agentId = web.id(url.searchParams.get("agentId"));
       const group = byId.get(tab.groupId);
-      selected.set(cid, group ? { agentId, key: "tab:" + group.id,
-        name: clean(group.title) || "未命名标签组", color: colors[group.color] || colors.grey } :
+      selected.set(cid, tab.groupId >= 0 ? { agentId, key: "tab:" + tab.groupId,
+        name: group ? clean(group.title) || "未命名标签组" : "标签组名称待更新",
+        color: colors[group?.color] || colors.grey } :
         { agentId, key: "tab:ungrouped", name: "未分组标签页", color: "" });
     }
     return Object.fromEntries(selected);
   }
   function groupFor(task, mode, mapping = {}) {
+    if (mode === "tab") {
+      const match = mapping[task.id];
+      return match && match.key?.startsWith("tab:") && (!match.agentId || match.agentId === task.agentId) ? match : null;
+    }
     const platform = clean(task.group) || "未分组";
-    if (mode !== "tab") return { key: "da:" + platform, name: platform, color: "" };
-    const match = mapping[task.id];
-    if (match && (!match.agentId || match.agentId === task.agentId)) return match;
-    return { key: "closed:" + platform, name: "未打开 · " + platform, color: "" };
+    return { key: "da:" + platform, name: platform, color: "" };
   }
-  globalThis.TaskPulseUI = { keys, origins, normalized, place, move, pill, glassLayout, glassClip, ordinary, buildGroups, groupFor };
+  globalThis.TaskPulseUI = { keys, origins, viewportSize, normalized, place, move, pill, glassLayout, glassClip, ordinary, buildGroups, groupFor };
 })();
