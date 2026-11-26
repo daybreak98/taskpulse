@@ -2355,3 +2355,42 @@ test("P1 account authorization loss invalidates a visited red-read intent withou
   assert.equal(currentTask(app).pending, true, "reauthentication must not replay the old visit intent");
   assert.equal(currentTask(app).readRevision, undefined);
 });
+
+test("P1 a visited red reply cannot auto-read a later foreground reply", async () => {
+  for (const mode of ["direct", "after-run"]) {
+    const app = worker();
+    const { target, revision: oldRevision, update } = await landRedReplyForVisit(app, "A");
+    app.tabs.forEach(tab => { tab.active = tab.id === target.id; });
+    const sender = { id: "unit", frameId: 0, tab: target, url: target.url };
+    const firstVisit = await app.send({ kind: "tp.visit", id, at: now + 11_000 }, sender);
+    assert.equal(firstVisit.ok, true);
+    assert.equal(firstVisit.deferred, true);
+    assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"]?.visited, true);
+
+    if (mode === "after-run") {
+      await app.deliver(report(now + 12_000, row(update), { busy: true }));
+      assert.ok(currentTask(app).runAt, "the intervening run must remain active");
+      assert.equal(currentTask(app).pending, true);
+    }
+
+    const nextUpdate = now + 14_000;
+    // The first successful sample after A's queue outage also sees B.
+    await app.deliver(replyReport(now + 15_000, nextUpdate, "B"));
+    const nextRevision = exactRevision(app);
+    assert.notEqual(nextRevision, oldRevision);
+    assert.equal(currentTask(app).pending, true,
+      "A's earlier page interaction must not silently acknowledge B");
+    assert.notEqual(currentTask(app).readRevision, nextRevision);
+    assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"]?.revision, oldRevision,
+      "the superseded visit remains a read barrier until a fresh visit to B");
+    assert.ok(Object.keys(app.local.data[web.keys.state].outbox)
+      .some(key => key.endsWith("message.B")), "B must retain its own pending notice");
+
+    const secondVisit = await app.send({ kind: "tp.visit", id, at: now + 21_000 }, sender);
+    assert.equal(secondVisit.ok, true);
+    assert.equal(currentTask(app).pending, false,
+      "a new trusted visit after B arrives may acknowledge B");
+    assert.equal(currentTask(app).readRevision, nextRevision);
+    assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"], undefined);
+  }
+});

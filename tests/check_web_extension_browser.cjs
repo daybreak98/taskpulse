@@ -586,6 +586,10 @@ async function trial() {
     // Never write synthetic task state into extension storage.
     await created.bringToFront();
     const continuityPanel = created.locator(root + " .panel");
+    if (!await continuityPanel.isVisible()) {
+      await created.locator(root + " .compact [data-filter='running']").click();
+    }
+    await continuityPanel.waitFor({ state: "visible" });
     const yellow = continuityPanel.locator(".horizontal [data-filter='attention']");
     const red = continuityPanel.locator(".horizontal [data-filter='stuck']");
     const continuityGroup = continuityPanel.locator(".group-head").filter({ hasText: "数据质量" });
@@ -694,6 +698,52 @@ async function trial() {
     const redRead = await waitState(s => s?.tasks["11"]?.pending === false &&
       s.tasks["11"].readRevision === deferred.revision, "exact red reply acknowledged after recovery");
     assert.equal(redRead.tasks["11"].status, "seen");
+
+    // P1: the interaction that inspected red reply A must not transfer to
+    // a later reply B while the same destination tab remains foreground.
+    fixture.setQueueFault(true);
+    const guardedStamp = fixture.releaseReply(0, true);
+    await nudgePrimary();
+    await waitState(s => s?.tasks["11"]?.replyKey === "message.m" + guardedStamp &&
+      s.tasks["11"].pending && s.tasks["11"].status === "stuck" && s.tasks["11"].queueError,
+      "second red reply with unavailable queue");
+    await red.filter({ hasText: /^1$/ }).waitFor();
+    await continuityPanel.locator(".row.stuck [data-cid='11']").click();
+    let guarded;
+    for (let i = 0; i < 80; i++) {
+      guarded = await worker.evaluate(async target => {
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        const guards = (await chrome.storage.session.get("tp-web-jump-tabs-v1"))["tp-web-jump-tabs-v1"] || {};
+        return tab?.url === target ? guards[tab.id] : null;
+      }, existing);
+      if (guarded?.deferredRead) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(guarded?.deferredRead);
+    await other.mouse.move(420, 420);
+    await other.mouse.wheel(0, 900);
+    for (let i = 0; i < 80; i++) {
+      const current = await worker.evaluate(async () =>
+        (await chrome.storage.session.get("tp-web-jump-tabs-v1"))["tp-web-jump-tabs-v1"] || {});
+      if (Object.values(current).some(g => g?.visited && g.revision === guarded.revision)) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    fixture.setQueueFault(false);
+    const successorStamp = fixture.releaseReply(0, false);
+    await nudgePrimary();
+    const successor = await waitState(s => s?.tasks["11"]?.replyKey === "message.m" + successorStamp &&
+      s.tasks["11"].pending && !s.tasks["11"].queueError,
+      "successor reply B recovered without transferring A read");
+    assert.notEqual(successor.tasks["11"].readRevision,
+      "11/515/" + successorStamp + "/message.m" + successorStamp);
+    assert.ok(Object.keys(successor.outbox).some(key => key.endsWith("message.m" + successorStamp)),
+      "successor reply must retain its own notice");
+    await other.mouse.move(420, 420);
+    await other.mouse.wheel(0, 900);
+    await waitState(s => s?.tasks["11"]?.pending === false &&
+      s.tasks["11"].readRevision === "11/515/" + successorStamp + "/message.m" + successorStamp,
+      "a fresh page interaction after B may acknowledge B");
+    await created.bringToFront();
 
     // A per-conversation 403 must win over a regressed list row, hide the
     // prior-account title and withdraw its notification.
