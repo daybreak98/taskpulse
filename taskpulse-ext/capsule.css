@@ -19,6 +19,8 @@ button:focus-visible { outline: 1px solid #94d6f5; outline-offset: -2px; }
   display: grid; overflow: hidden; isolation: isolate; background: rgb(62 112 139 / .67);
   border-radius: 999px; box-shadow: 0 4px 13px rgb(5 26 41 / .20);
 }
+/* Quiet only a verified all-zero counter; never fade the task panel itself. */
+.capsule.all-zero { opacity: .75; }
 .capsule.compact { width: var(--pill-short); height: var(--pill-long); grid-template-rows: repeat(3, minmax(0, 1fr)); grid-template-columns: minmax(0, 1fr); touch-action: none; cursor: grab; }
 .capsule.compact.dock-horizontal { width: var(--pill-long); height: var(--pill-short); grid-template-rows: minmax(0, 1fr); grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .capsule::after {

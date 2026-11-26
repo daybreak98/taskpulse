@@ -187,6 +187,8 @@ async function trial() {
       [palette.active[0].base, palette.zero[1].base, palette.zero[2].base]);
     console.log("Reference capsule palette: zero, active and selected states retain all three segment hues");
 
+    const opacityOf = counter => counter.evaluate(el => getComputedStyle(el).opacity);
+    assert.equal(await opacityOf(compact), "1", "active counter must retain full opacity");
     const vertical = await compact.boundingBox();
     assert.deepEqual(vertical, { x: 1372, y: 22, width: 28, height: 96 });
     const pillFont = await compact.locator(".number").first().evaluate(el => getComputedStyle(el).fontSize);
@@ -302,12 +304,16 @@ async function trial() {
     await page.bringToFront();
     await toast.waitFor({ state: "hidden" });
     await horizontal.locator(".number.zero").nth(2).waitFor();
+    assert.equal(await opacityOf(horizontal), "0.75");
+    assert.equal(await opacityOf(compact), "0.75");
+    assert.equal(await opacityOf(panel), "1", "the surrounding panel must not fade");
     assert.deepEqual((await readPalette(horizontal)).map(p => p.base), palette.zero.map(p => p.base));
     await attention.click();
     assert.equal(await attention.getAttribute("aria-pressed"), "true");
     const selectedPalette = await readPalette(horizontal);
     assert.deepEqual(selectedPalette.map(p => p.base), palette.zero.map(p => p.base));
     assert.deepEqual(selectedPalette.map(p => p.selection), ["0", ".42", "0"]);
+    assert.equal(await opacityOf(horizontal), "0.75", "selection keeps the highlight hierarchy at zero counts");
     assert.equal(await horizontal.locator(".dimmed").count(), 2);
     await attention.click();
     if (await group.getAttribute("aria-expanded") === "false") await group.click();
@@ -453,6 +459,10 @@ async function trial() {
     await other.locator("h1").click();
     await waitState(s => s?.tasks["11"]?.status === "running", "active run before background completion");
     await external2.bringToFront();
+    const resumedFrame = await waitFrame(external2, "panel");
+    const resumedCounter = resumedFrame.locator(root + " .panel .horizontal");
+    await resumedCounter.locator("[data-filter='running']").filter({ hasText: /^1$/ }).waitFor({ timeout: 8_000 });
+    assert.equal(await opacityOf(resumedCounter), "1", "new work restores full opacity");
     const thirdStamp = fixture.releaseReply(1_400);
     const thirdAt = Date.now();
     await waitState(s => s?.tasks["11"]?.replyKey === "message.m" + thirdStamp &&
