@@ -7,7 +7,7 @@
   const extOrigin = chrome.runtime.getURL("").replace(/\/$/, "");
   let enabled = false, position, mountGeneration = 0, registration = null, mountPromise = null;
   let host = null, shadow = null, panel = null, toast = null;
-  let panelSize = { width: 44, height: 84 }, pendingOpen = false, pendingToast = false;
+  let panelSize = { expanded: false, panelHeight: 0 }, pendingOpen = false, pendingToast = false;
   let dragStart = null, moveFrame = 0;
   let prefGeneration = 0, prefVersion = 0, listening = false;
   const visible = () => !document.hidden && enabled && alive() &&
@@ -17,24 +17,27 @@
     frame.title = mode === "panel" ? "TaskPulse" : "TaskPulse 提醒";
     frame.src = chrome.runtime.getURL("surface.html") + "#" + mode + "/" + registration.token;
     Object.assign(frame.style, { position: "fixed", display: "block", margin: "0", border: "0",
-      background: "transparent", colorScheme: "dark", pointerEvents: "auto", overflow: "hidden" });
+      background: "transparent", colorScheme: "light", pointerEvents: "auto", overflow: "hidden" });
     frame.setAttribute("scrolling", "no");
     shadow.append(frame);
     return frame;
   }
   function reposition() {
     if (!panel) return;
-    const p = ui.place(position, innerWidth, innerHeight, panelSize.width, panelSize.height);
+    const p = ui.glassLayout(position, innerWidth, innerHeight, panelSize.expanded, panelSize.panelHeight);
     Object.assign(panel.style, { left: p.left + "px", top: p.top + "px",
-      width: panelSize.width + "px", height: panelSize.height + "px" });
+      width: p.width + "px", height: p.height + "px", clipPath: ui.glassClip(p) });
   }
   function signalFrame(frame, message) {
     frame?.contentWindow?.postMessage(message, extOrigin);
   }
-  function sizePanel(width, height) {
-    panelSize = { width: Math.max(44, Math.min(innerWidth, Math.ceil(Number(width) || 44), 260)),
-      height: Math.max(28, Math.min(innerHeight, Math.ceil(Number(height) || 84))) };
+  function sendGeometry() {
+    signalFrame(panel, { type: "tp-host-viewport", height: innerHeight, width: innerWidth, position: ui.normalized(position) });
+  }
+  function sizePanel(expanded, panelHeight) {
+    panelSize = { expanded: expanded === true, panelHeight: Math.max(0, Math.min(innerHeight, Math.ceil(Number(panelHeight) || 0))) };
     reposition();
+    if (panel) panel.style.visibility = "visible";
   }
   function mountToast() {
     if (!panel || !registration || !visible()) return;
@@ -69,7 +72,7 @@
         zIndex: "2147483000" });
       shadow = host.attachShadow({ mode: "closed" });
       document.documentElement.append(host);
-      panelSize = { width: 44, height: 84 };
+      panelSize = { expanded: false, panelHeight: 0 };
       panel = createFrame("panel");
       panel.style.visibility = "hidden";
       reposition();
@@ -84,17 +87,16 @@
     const msg = event.data;
     if (panel && event.source === panel.contentWindow) {
       if (msg.type === "tp-frame-ready") {
-        panel.style.visibility = "visible";
+        sendGeometry();
         if (pendingOpen) { pendingOpen = false; signalFrame(panel, { type: "tp-host-open" }); }
-        signalFrame(panel, { type: "tp-host-viewport", height: innerHeight, width: innerWidth });
-      } else if (msg.type === "tp-frame-size") sizePanel(msg.width, msg.height);
+      } else if (msg.type === "tp-frame-size") sizePanel(msg.expanded, msg.panelHeight);
       else if (msg.type === "tp-frame-drag" && Number.isFinite(msg.dx) && Number.isFinite(msg.dy)) {
         if (msg.start || !dragStart) dragStart = ui.normalized(position);
         position = ui.move(dragStart, msg.dx, msg.dy, innerWidth, innerHeight);
-        if (!moveFrame) moveFrame = requestAnimationFrame(() => { moveFrame = 0; reposition(); });
+        if (!moveFrame) moveFrame = requestAnimationFrame(() => { moveFrame = 0; reposition(); sendGeometry(); });
         if (msg.done) {
           dragStart = null;
-          reposition();
+          reposition(); sendGeometry();
           void chrome.storage.local.set({ [ui.keys.position]: position }).catch(() => {});
         }
       }
@@ -106,14 +108,14 @@
   });
   window.addEventListener("resize", () => {
     reposition();
-    signalFrame(panel, { type: "tp-host-viewport", width: innerWidth, height: innerHeight });
+    sendGeometry();
     if (toast) toast.style.width = Math.max(1, Math.min(288, innerWidth - 28)) + "px";
   }, { passive: true });
   function onPrefs(changes, area) {
     if (area !== "local" || !changes[ui.keys.enabled] && !changes[ui.keys.position]) return;
     prefVersion++;
     if (changes[ui.keys.enabled]) { enabled = changes[ui.keys.enabled].newValue === true; show(); }
-    if (changes[ui.keys.position] && !dragStart) { position = changes[ui.keys.position].newValue; reposition(); }
+    if (changes[ui.keys.position] && !dragStart) { position = changes[ui.keys.position].newValue; reposition(); sendGeometry(); }
   }
   function followVisibility() {
     const generation = ++prefGeneration;
@@ -133,7 +135,7 @@
       enabled = saved[ui.keys.enabled] === true;
       if (!dragStart) position = saved[ui.keys.position];
       show();
-      reposition();
+      reposition(); sendGeometry();
     }).catch(() => {});
   }
   document.addEventListener("visibilitychange", followVisibility);

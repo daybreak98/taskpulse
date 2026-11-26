@@ -39,9 +39,10 @@
   root.innerHTML = `
     <aside class="window" hidden aria-label="TaskPulse">
       ${counter("compact")}
+      <i class="glass-bridge" aria-hidden="true" hidden></i>
       <section class="panel" id="tp-conversations" aria-label="会话列表" hidden>
         <header class="header">
-          ${counter("horizontal")}
+          <span class="panel-title">TaskPulse</span>
           <button type="button" class="header-blank" aria-label="拖动面板或双击切换全部分组" title="拖动 · 双击切换分组"></button>
           <div class="source group-mode" role="group" aria-label="分组方式">
             <button type="button" data-mode="dataagent" aria-label="DataAgent 分组" title="DataAgent 内部分组">DA</button>
@@ -60,6 +61,8 @@
   const box = root.querySelector(".window");
   const compact = root.querySelector(".compact");
   const panel = root.querySelector(".panel");
+  const bridge = root.querySelector(".glass-bridge");
+  const header = root.querySelector(".header"), footer = root.querySelector(".footer");
   const pin = root.querySelector(".pin");
   const note = root.querySelector(".note");
   const list = root.querySelector(".groups");
@@ -81,7 +84,7 @@
   let hoverTimer = null;
   let panelClock = null;
   let position, groupMode = "dataagent", tabGroups = {};
-  let viewport = { width: innerWidth, height: innerHeight };
+  let viewport = { width: innerWidth, height: innerHeight }, frameGeometryReady = !frame;
   let lastSize = "", drag = null, dragFrame = 0, suppressClickUntil = 0;
   let styled = false, prefsChanged = new Set(), toastLoaded = !toastOnly;
   const groupButtons = [...root.querySelectorAll("[data-mode]")];
@@ -345,14 +348,29 @@
       if (key !== lastSize) { lastSize = key; post({ type: "tp-frame-size", height }); }
       return;
     }
-    const rect = box.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
+    if (side || !frameGeometryReady) return;
+    const w = frame ? viewport.width : innerWidth, h = frame ? viewport.height : innerHeight;
+    // Measure natural row height, not the previously constrained scroll area.
+    // This lets the panel shrink on filter changes and prevents resize loops.
+    const naturalListHeight = 10 + [...list.children].reduce((sum, node, index) =>
+      sum + node.offsetHeight + (index && node.classList.contains("group") ? 4 : 0), 0);
+    const panelHeight = expanded ? header.offsetHeight + footer.offsetHeight + note.offsetHeight + naturalListHeight : 0;
+    const layout = ui.glassLayout(position, w, h, expanded, panelHeight);
+    compact.classList.toggle("dock-horizontal", layout.horizontal);
+    bridge.dataset.relation = layout.relation;
+    bridge.hidden = !layout.bridge;
+    const setRect = (node, r) => {
+      if (r) Object.assign(node.style, { left: r.left + "px", top: r.top + "px",
+        width: r.width + "px", height: r.height + "px" });
+    };
+    setRect(compact, layout.capsule);
+    setRect(panel, layout.panel);
+    setRect(bridge, layout.bridge);
+    Object.assign(box.style, { left: (frame ? 0 : layout.left) + "px", top: (frame ? 0 : layout.top) + "px",
+      right: "auto", width: layout.width + "px", height: layout.height + "px" });
     if (frame) {
-      const key = rect.width + "/" + rect.height;
-      if (key !== lastSize) { lastSize = key; post({ type: "tp-frame-size", width: rect.width, height: rect.height }); }
-    } else if (native) {
-      const p = ui.place(position, innerWidth, innerHeight, rect.width, rect.height);
-      Object.assign(box.style, { left: p.left + "px", top: p.top + "px", right: "auto" });
+      const key = JSON.stringify([layout.width, layout.height, expanded, panelHeight]);
+      if (key !== lastSize) { lastSize = key; post({ type: "tp-frame-size", expanded, panelHeight }); }
     }
   }
 
@@ -379,7 +397,7 @@
       button.title = names[kind] + " · " + (view.stale ? "待更新" : value);
       button.setAttribute("aria-label", button.title);
     }
-    compact.hidden = expanded;
+    compact.hidden = side;
     panel.hidden = !expanded;
     for (const button of groupButtons) button.setAttribute("aria-pressed", String(button.dataset.mode === groupMode));
     pin.setAttribute("aria-pressed", String(pinned));
@@ -408,7 +426,7 @@
       choices.clear();
       actionError = "";
       setExpanded(true);
-      if (event.detail === 0) root.querySelector(`.horizontal [data-filter="${kind}"]`).focus({ preventScroll: true });
+      if (event.detail === 0) button.focus({ preventScroll: true });
     });
   }
   const blank = root.querySelector(".header-blank");
@@ -566,7 +584,7 @@
     }
     if (changes[ui.keys.position] || changes[ui.keys.grouping] || changes[ui.keys.tabGroups]) {
       for (const key of [ui.keys.position, ui.keys.grouping, ui.keys.tabGroups]) if (changes[key]) prefsChanged.add(key);
-      if (changes[ui.keys.position] && !drag) position = changes[ui.keys.position].newValue;
+      if (changes[ui.keys.position] && !drag && !frame) position = changes[ui.keys.position].newValue;
       if (changes[ui.keys.grouping]) {
         groupMode = changes[ui.keys.grouping].newValue === "tab" ? "tab" : "dataagent";
         choices.clear(); lastRows = "";
@@ -582,7 +600,7 @@
       pinned = items[pinKey] === true;
       if (pinned) expanded = true;
     }
-    if (!prefsChanged.has(ui.keys.position)) position = items[ui.keys.position];
+    if (!frame && !prefsChanged.has(ui.keys.position)) position = items[ui.keys.position];
     if (!prefsChanged.has(ui.keys.grouping)) groupMode = items[ui.keys.grouping] === "tab" ? "tab" : "dataagent";
     if (!prefsChanged.has(ui.keys.tabGroups)) tabGroups = items[ui.keys.tabGroups] || {};
     render();
@@ -636,14 +654,18 @@
     if (event.data?.type === "tp-host-viewport" && !toastOnly) {
       viewport = { width: Math.max(44, Math.min(10000, Number(event.data.width) || 240)),
         height: Math.max(84, Math.min(10000, Number(event.data.height) || 600)) };
-      host.style.setProperty("--tp-viewport-width", viewport.width + "px");
-      host.style.setProperty("--tp-viewport-height", viewport.height + "px");
+      position = ui.normalized(event.data.position);
+      frameGeometryReady = true;
       layoutSurface();
     }
   });
   document.addEventListener("visibilitychange", () => { if (alive()) render(); });
   window.addEventListener("resize", () => { if (expanded) updateTimes(Date.now(), true); layoutSurface(); });
-  if (!toastOnly) new ResizeObserver(layoutSurface).observe(box);
+  if (!toastOnly && !side) {
+    const observer = new ResizeObserver(layoutSurface);
+    observer.observe(list);
+    observer.observe(note);
+  }
   const clock = toastOnly ? null : setInterval(() => {
     if (!alive()) {
       clearInterval(clock);

@@ -10,21 +10,76 @@
   const clamp = (value, lo, hi) => Math.min(Math.max(value, lo), Math.max(lo, hi));
   const normalized = value => ({
     x: Number.isFinite(value?.x) ? clamp(value.x, 0, 1) : 1,
-    y: Number.isFinite(value?.y) ? clamp(value.y, 0, 1) : null
+    y: Number.isFinite(value?.y) ? clamp(value.y, 0, 1) : null,
+    ...(value?.edge === "top" ? { edge: "top" } : {})
   });
+  // Keep legacy x/y storage and the right-side default. Only a drag into
+  // the top docking band selects horizontal orientation.
+  function move(value, dx, dy, w, h) {
+    const p = normalized(value);
+    const x = p.x * Math.max(0, w - 44) + dx;
+    const y = (p.edge === "top" ? 0 : p.y === null ? 22 : p.y * Math.max(0, h - 84)) + dy;
+    const edge = y <= (p.edge === "top" ? 64 : 42) ? "top" : "";
+    return { x: clamp(x / Math.max(1, w - 44), 0, 1),
+      y: edge ? 0 : clamp(y / Math.max(1, h - 84), 0, 1), ...(edge ? { edge } : {}) };
+  }
   function place(value, viewportWidth, viewportHeight, width, height) {
     const p = normalized(value);
-    // The default remains the original right-edge, 22px top capsule.
     const anchorX = p.x * Math.max(0, viewportWidth - 44);
     const anchorY = p.y === null ? 22 : p.y * Math.max(0, viewportHeight - 84);
     return { left: Math.round(clamp(anchorX - (width - 44) * p.x, 0, viewportWidth - width)),
       top: Math.round(clamp(anchorY, 0, viewportHeight - height)) };
   }
-  function move(value, dx, dy, w, h) {
-    const p = normalized(value);
-    const x = p.x * Math.max(0, w - 44), y = p.y === null ? 22 : p.y * Math.max(0, h - 84);
-    return { x: clamp((x + dx) / Math.max(1, w - 44), 0, 1),
-      y: clamp((y + dy) / Math.max(1, h - 84), 0, 1) };
+  const rect = (left, top, width, height) => ({
+    left: Math.round(left), top: Math.round(top), width: Math.round(width), height: Math.round(height)
+  });
+  function glassLayout(value, w, h, expanded = false, panelHeight = 0) {
+    const p = normalized(value), horizontal = p.edge === "top";
+    w = Math.max(1, Math.round(w)); h = Math.max(1, Math.round(h));
+    const gap = 10;
+    const cw = Math.min(w, horizontal ? 108 : 44), ch = Math.min(h, horizontal ? 32 : 84);
+    const x = Math.round(p.x * (w - cw));
+    const y = Math.round(clamp(horizontal ? 8 : p.y === null ? 22 : p.y * (h - ch), 0, h - ch));
+    const cap = rect(x, y, cw, ch);
+    let panel = null, bridge = null, relation = "";
+    if (expanded && panelHeight > 0) {
+      const pw = Math.min(240, w);
+      const ph = Math.min(panelHeight, h);
+      const leftRoom = x >= pw + gap, rightRoom = w - x - cw >= pw + gap;
+      if (!horizontal && (leftRoom || rightRoom)) {
+        const left = leftRoom && (!rightRoom || p.x >= .5);
+        const py = clamp(y + ch / 2 - ph / 2, 0, h - ph);
+        panel = rect(left ? x - gap - pw : x + cw + gap, py, pw, ph);
+        const cy = clamp(y + ch / 2, panel.top + Math.min(8, ph / 2), panel.top + ph - Math.min(8, ph / 2));
+        bridge = rect(left ? x - gap : x + cw, cy - 5, gap, 10);
+        relation = "side";
+      } else if (h > ch + gap + 1) {
+        // Top-docked capsules open downward; on short viewports use the
+        // available side of the anchor. Do not move the capsule on expand.
+        const below = horizontal || h - y - ch >= y;
+        const available = below ? h - y - ch - gap : y - gap;
+        const height = Math.min(ph, Math.max(1, available));
+        const px = clamp(x + cw / 2 - pw / 2, 0, w - pw);
+        panel = rect(px, below ? y + ch + gap : y - gap - height, pw, height);
+        const cx = clamp(x + cw / 2, panel.left + Math.min(8,pw / 2), panel.left + pw - Math.min(8,pw / 2));
+        bridge = rect(cx - 5, below ? y + ch : y - gap, 10, gap);
+        relation = "vertical";
+      }
+    }
+    const boxes = [cap, panel, bridge].filter(Boolean);
+    const left = Math.min(...boxes.map(b => b.left)), top = Math.min(...boxes.map(b => b.top));
+    const width = Math.max(...boxes.map(b => b.left + b.width)) - left;
+    const height = Math.max(...boxes.map(b => b.top + b.height)) - top;
+    const local = b => b && rect(b.left - left, b.top - top, b.width, b.height);
+    return { left, top, width, height, horizontal, capsule: local(cap), panel: local(panel),
+      bridge: local(bridge), relation };
+  }
+  // Clip the iframe's rectangular hit area to the actual surfaces and the
+  // small hover bridge. The glass rounded corners remain transparent.
+  function glassClip(layout) {
+    const path = [layout.capsule, layout.panel, layout.bridge].filter(Boolean).map(r =>
+      "M" + r.left + " " + r.top + "h" + r.width + "v" + r.height + "h-" + r.width + "Z").join(" ");
+    return "path('" + path + "')";
   }
   function ordinary(value) {
     try {
@@ -61,5 +116,5 @@
     if (match && (!match.agentId || match.agentId === task.agentId)) return match;
     return { key: "closed:" + platform, name: "未打开 · " + platform, color: "" };
   }
-  globalThis.TaskPulseUI = { keys, origins, normalized, place, move, ordinary, buildGroups, groupFor };
+  globalThis.TaskPulseUI = { keys, origins, normalized, place, move, glassLayout, glassClip, ordinary, buildGroups, groupFor };
 })();

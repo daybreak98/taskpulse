@@ -129,15 +129,32 @@ async function trial() {
     await page.goto(home);
     const compact = page.locator(root + " .compact");
     const panel = page.locator(root + " .panel");
-    const horizontal = panel.locator(".horizontal");
+    const horizontal = compact; // The same capsule remains visible when expanded.
     await compact.locator("[data-filter='running']").filter({ hasText: /^1$/ }).waitFor({ timeout: 16_000 });
     assert.deepEqual(await compact.boundingBox(), { x: 1356, y: 22, width: 44, height: 84 });
     await compact.hover();
-    await horizontal.waitFor();
-    assert.deepEqual(await horizontal.boundingBox(), { x: 1170, y: 24, width: 96, height: 24 });
+    await panel.waitFor({ state: "visible" });
+    assert.deepEqual(await compact.boundingBox(), { x: 1356, y: 22, width: 44, height: 84 });
     assert.equal((await panel.boundingBox()).width, 240);
     assert.equal(await panel.locator("[data-mode='dataagent']").getAttribute("aria-pressed"), "true");
     assert.equal(await panel.locator(".footer span").textContent(), "WEB");
+    await page.mouse.move(600, 400);
+    await panel.waitFor({ state: "hidden" });
+    const initial = await compact.boundingBox();
+    await page.mouse.move(initial.x + 22, initial.y + 42);
+    await page.mouse.down();
+    await page.mouse.move(700, 7, { steps: 10 });
+    await page.mouse.up();
+    await compact.locator("[data-filter='running']").waitFor();
+    for (let i = 0; i < 30 && !(await compact.getAttribute("class")).includes("dock-horizontal"); i++)
+      await new Promise(r => setTimeout(r, 50));
+    const top = await compact.boundingBox();
+    assert.equal(top.width, 108); assert.equal(top.height, 32); assert.equal(top.y, 8);
+    await compact.hover();
+    await panel.waitFor({ state: "visible" });
+    assert.ok((await panel.boundingBox()).y >= top.y + top.height + 9);
+    // Restore the legacy location for the existing behavioral checks.
+    await worker.evaluate(() => chrome.storage.local.remove("tp-web-position"));
     await page.mouse.move(600, 400);
     await panel.waitFor({ state: "hidden" });
     await compact.hover();
@@ -217,7 +234,7 @@ async function trial() {
     await toast.waitFor({ state: "hidden" });
     await attention.click();
     assert.equal(await attention.getAttribute("aria-pressed"), "true");
-    assert.equal(await horizontal.locator(".dimmed").count(), 2);
+    assert.equal(await compact.locator(".dimmed").count(), 2);
     await attention.click();
     if (await group.getAttribute("aria-expanded") === "false") await group.click();
     const newTab = context.waitForEvent("page", { timeout: 10_000 });
@@ -316,6 +333,20 @@ async function trial() {
     assert.equal(await external2.locator("#underlying").textContent(), "clicked");
     assert.equal(await external2.evaluate(() => document.getElementById("taskpulse-global-host")?.shadowRoot === null), true);
     assert.equal(await external2.evaluate(() => document.body.innerText.includes("验证 Spark 分区更新")), false);
+    assert.equal(await frame2.evaluate(() => getComputedStyle(document.documentElement).backgroundColor), "rgba(0, 0, 0, 0)");
+    assert.equal(await frame2.evaluate(() => getComputedStyle(document.documentElement).colorScheme), "light");
+    const capsule2 = frame2.locator(root + " .compact");
+    const rect2 = await capsule2.boundingBox();
+    await external2.mouse.move(rect2.x + rect2.width / 2, rect2.y + rect2.height / 2);
+    await external2.mouse.down();
+    await external2.mouse.move(700, 5, { steps: 10 });
+    await external2.mouse.up();
+    for (let i = 0; i < 50 && !(await capsule2.getAttribute("class")).includes("dock-horizontal"); i++)
+      await new Promise(r => setTimeout(r, 50));
+    const docked = await capsule2.boundingBox();
+    assert.equal(docked.width, 108); assert.equal(docked.height, 32); assert.equal(docked.y, 8);
+    assert.ok((await frame2.locator(root + " .panel").boundingBox()).y >= docked.y + docked.height + 9);
+    await worker.evaluate(() => chrome.storage.local.set({ "tp-web-position": position }), position);
     console.log("Global isolated capsule drag, persistence across tabs and ordinary page interaction passed");
 
     // The active collector is allowed to be hidden while the user works

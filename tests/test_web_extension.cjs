@@ -1496,7 +1496,7 @@ test("drag position preserves original default and clamps across viewport and pa
   assert.deepEqual(ui.place(position, 1400, 880, 44, 84), { left: 1156, top: 122 });
   const small = ui.place(position, 320, 240, 240, 200);
   assert.ok(small.left >= 0 && small.left <= 80 && small.top >= 0 && small.top <= 40);
-  assert.deepEqual(ui.move(undefined, 1e6, -1e6, 1400, 880), { x: 1, y: 0 });
+  assert.deepEqual(ui.move(undefined, 1e6, -1e6, 1400, 880), { x: 1, y: 0, edge: "top" });
 });
 
 test("global presentation is opt-in; external frame needs same-tab opaque registration", async () => {
@@ -1653,4 +1653,27 @@ test("hidden active collector is nudged without a second lease and stops waking 
   await app.deliver({ ...replyReport(now + 5_000, now + 4_000, "finished"), hidden: true });
   assert.equal(currentTask(app).pending, true);
   assert.equal(timers.size, 0);
+});
+
+test("top drag switches to a horizontal capsule, side drag restores vertical; panel never moves its anchor", () => {
+  const side = ui.glassLayout(undefined, 1400, 880);
+  assert.deepEqual(side.capsule, { left: 0, top: 0, width: 44, height: 84 });
+  const top = ui.move(undefined, -600, -90, 1400, 880);
+  const a = ui.glassLayout(top, 1400, 880);
+  assert.equal(a.horizontal, true);
+  assert.equal(a.top, 8);
+  assert.deepEqual(a.capsule, { left: 0, top: 0, width: 108, height: 32 });
+  const b = ui.glassLayout(top, 1400, 880, true, 220);
+  assert.equal(b.top + b.capsule.top, a.top);
+  assert.equal(b.left + b.capsule.left, a.left);
+  assert.equal(b.top + b.panel.top, a.top + 32 + 10);
+  assert.equal(b.relation, "vertical");
+  const back = ui.move(top, 400, 240, 1400, 880);
+  const c = ui.glassLayout(back, 1400, 880, true, 220);
+  assert.equal(c.horizontal, false);
+  assert.equal(c.relation, "side");
+  assert.ok(c.left >= 0 && c.top >= 0 && c.left + c.width <= 1400 && c.top + c.height <= 880);
+  const clamped = ui.glassLayout(top, 320, 180, true, 1000);
+  assert.ok(clamped.left >= 0 && clamped.top >= 0 && clamped.left + clamped.width <= 320 && clamped.top + clamped.height <= 180);
+  assert.ok(ui.glassClip(b).startsWith("path('M"));
 });
