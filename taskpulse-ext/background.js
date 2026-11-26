@@ -1,5 +1,5 @@
 // Manifest V3 service worker. Collection stays in one DataAgent tab.
-importScripts("config.js", "state.js");
+importScripts("config.js", "state.js", "ui-rules.js", "surface-worker.js");
 
 const web = globalThis.TaskPulseWeb;
 const rules = globalThis.TaskPulseState;
@@ -72,7 +72,9 @@ async function getLeader() {
 }
 
 const isPage = tab => web.conversationPage(tab?.url) !== null;
-const isReady = tab => isPage(tab) && tab.status === "complete" && (!tab.pendingUrl || tab.pendingUrl === tab.url) && !tab.discarded && !tab.frozen;
+const isUsable = tab => !!tab?.url && tab.status === "complete" &&
+  (!tab.pendingUrl || tab.pendingUrl === tab.url) && !tab.discarded && !tab.frozen;
+const isReady = tab => isPage(tab) && isUsable(tab);
 const pages = () => chrome.tabs.query({ url: web.match });
 
 async function signal(tabId, message) {
@@ -171,7 +173,7 @@ function refreshLeader() {
   }, 80);
 }
 
-async function foregroundPage() {
+async function foregroundTab() {
   // Activation events caused by a valid navigation may arrive during an API
   // query. Retry once if the event epoch changed; never accept a stale snapshot.
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -179,15 +181,84 @@ async function foregroundPage() {
     const win = await chrome.windows.getLastFocused({}).catch(() => null);
     if (!win?.focused || !Number.isInteger(win.id) || win.id < 0) return null;
     const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
-    if (!isReady(tab) || tab.active !== true || tab.windowId !== win.id) return null;
+    if (!isUsable(tab) || tab.active !== true || tab.windowId !== win.id) return null;
     const actual = await chrome.tabs.get(tab.id).catch(() => null);
     const confirm = await chrome.windows.getLastFocused({}).catch(() => null);
     if (epoch !== focusEpoch) continue;
     if (!confirm?.focused || confirm.id !== win.id ||
-        !isReady(actual) || !actual.active || actual.windowId !== win.id || actual.url !== tab.url) return null;
+        !isUsable(actual) || !actual.active || actual.windowId !== win.id || actual.url !== tab.url) return null;
     return actual;
   }
   return null;
+}
+
+async function foregroundPage() {
+  const tab = await foregroundTab();
+  return isReady(tab) ? tab : null;
+}
+
+// Hidden DataAgent pages can be throttled. During verified active work only,
+// the MV3 worker asks the same collector to run its existing due-work queue.
+// No second collector, no new permissions and no artificial keepalive.
+let fastWakeTimer = null, fastWakeLeader = null, fastWakeUntil = 0;
+let hiddenCollector = false, activityUntil = 0;
+function stopFastWake() {
+  if (fastWakeTimer !== null) clearTimeout(fastWakeTimer);
+  fastWakeTimer = null;
+  fastWakeLeader = null;
+  fastWakeUntil = 0;
+}
+function armFastWake() {
+  if (fastWakeTimer !== null || !fastWakeLeader || Date.now() >= fastWakeUntil) return;
+  fastWakeTimer = setTimeout(async () => {
+    fastWakeTimer = null;
+    const expected = fastWakeLeader;
+    try {
+      const current = await getLeader();
+      if (!expected || current?.lease !== expected.lease || Date.now() >= fastWakeUntil) {
+        stopFastWake();
+        return;
+      }
+      const answer = await signal(current.tabId, { kind: "tp.nudge", pageId: current.pageId });
+      if (!answer?.pageId) { stopFastWake(); refreshLeader(); return; }
+    } catch { stopFastWake(); return; }
+    armFastWake();
+  }, web.timing.hot);
+}
+function updateFastWake(leader, state, hidden) {
+  hiddenCollector = hidden === true;
+  const active = !state.error && !state.sourceUnavailable && Object.values(state.tasks).some(task =>
+    !task.accessDeniedAt && (task.runAt || task.awaitingReply));
+  if (!hiddenCollector || (!active && activityUntil <= Date.now())) { stopFastWake(); return; }
+  fastWakeLeader = leader;
+  fastWakeUntil = active ? Math.min(Date.now() + web.timing.sourceStale,
+    state.at + web.timing.sourceStale) : activityUntil;
+  armFastWake();
+}
+async function relayActivity(msg, sender) {
+  const actual = await chrome.tabs.get(sender.tab.id).catch(() => null);
+  if (!isReady(actual)) return { ok: false };
+  const leader = await getLeader();
+  if (!leader) { refreshLeader(); return { ok: true }; }
+  const cid = web.conversationId(actual.url);
+  activityUntil = Date.now() + web.timing.hotWindow;
+  if (leader.tabId !== sender.tab.id || msg.route === true)
+    await signal(leader.tabId, { kind: "tp.nudge", pageId: leader.pageId, activity: true, cid });
+  if (hiddenCollector) {
+    fastWakeLeader = leader;
+    fastWakeUntil = Math.max(fastWakeUntil, activityUntil);
+    armFastWake();
+  }
+  return { ok: true };
+}
+
+async function collectorVisibility(msg, sender) {
+  const leader = await getLeader();
+  if (!leader || leader.tabId !== sender.tab.id || leader.pageId !== msg.pageId || leader.lease !== msg.lease)
+    return { ok: false };
+  const state = await getState();
+  updateFastWake(leader, state, msg.hidden);
+  return { ok: true };
 }
 
 function matchesConversation(tab, cid, agentId) {
@@ -379,18 +450,20 @@ async function acceptReport(msg, sender) {
     // pruneOutbox removes read, replaced or expired-history tasks.
     pruneOutbox(next);
     await saveState(next);
+    updateFastWake(leader, next, msg.payload.hidden);
     await syncNotices(next);
     const pendingReplies = replies.filter(task => {
       const current = noticeTask(next, rules.revision(task));
       return freshTask(next, current) && rules.canAcknowledge(current);
     });
-    const currentPage = pendingReplies.length ? await foregroundPage() : null;
-    if (currentPage && pendingReplies.length) await signal(currentPage.id, {
+    const currentPage = pendingReplies.length ? await foregroundTab() : null;
+    if (currentPage && isPage(currentPage)) await signal(currentPage.id, {
       kind: "tp.replies",
       tasks: pendingReplies.slice(0, 3).reverse().map(task => ({
         id: task.id, name: task.name, revision: rules.revision(task), failed: task.failed
       }))
     });
+    else if (currentPage) await surfaces.notify(currentPage, pendingReplies).catch(info);
   }
   return { ok: true };
 }
@@ -582,14 +655,36 @@ function senderIsPage(sender) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-  if (!msg || !senderIsPage(sender)) return false;
+  if (!msg || sender.id !== chrome.runtime.id) return false;
   let reply;
+  const page = senderIsPage(sender);
+  if (msg.kind === "tp.surface.register" && surfaces.topSender(sender)) reply = surfaces.register(sender);
+  else if (surfaces.candidate(sender)) {
+    if (msg.kind === "tp.surface.attach") reply = surfaces.attach(sender, msg.token);
+    else if (msg.kind === "tp.surface.toasts") reply = surfaces.toastData(sender, msg.token);
+    else if (["tp.open", "tp.check", "tp.settings"].includes(msg.kind)) {
+      reply = surfaces.validate(sender, msg.token).then(allowed => {
+        if (!allowed) return { ok: false };
+        if (msg.kind === "tp.open") return openTask(msg.id, msg.revision, false, msg.intent);
+        if (msg.kind === "tp.check") return serialize(() => markChecked(msg.id, msg.revision, msg.checked));
+        return chrome.runtime.openOptionsPage().then(() => ({ ok: true }));
+      });
+    }
+  }
+  if (!page) {
+    if (!reply) return false;
+    reply.then(respond, error => { info(error); respond({ ok: false }); });
+    return true;
+  }
   if (msg.kind === "tp.ready") {
     refreshLeader();
     respond({ ok: true });
     return false;
   }
   if (msg.kind === "tp.webstate") reply = serialize(() => acceptReport(msg, sender));
+  if (msg.kind === "tp.activity") reply = relayActivity(msg, sender);
+  if (msg.kind === "tp.visibility") reply = collectorVisibility(msg, sender);
+  if (msg.kind === "tp.settings") reply = chrome.runtime.openOptionsPage().then(() => ({ ok: true }));
   if (msg.kind === "tp.open") reply = openTask(msg.id, msg.revision, false, msg.intent);
   if (msg.kind === "tp.check") reply = serialize(() => markChecked(msg.id, msg.revision, msg.checked));
   if (msg.kind === "tp.visit" && !opening.has(msg.id)) {
@@ -644,13 +739,14 @@ function wake(install = false) {
   }).catch(() => {});
 }
 
-chrome.runtime.onInstalled.addListener(() => wake(true));
-chrome.runtime.onStartup.addListener(() => wake());
+chrome.runtime.onInstalled.addListener(() => { wake(true); surfaces.install(); });
+chrome.runtime.onStartup.addListener(() => { wake(); surfaces.install(); });
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === ALARM) wake();
 });
 
 chrome.tabs.onUpdated.addListener((id, change) => {
+  if (change.groupId !== undefined || change.url || change.status === "complete") surfaces.scheduleGroups();
   if (!(change.url || change.discarded !== undefined || change.frozen !== undefined || change.status === "complete")) return;
   focusEpoch++;
   void (async () => {
@@ -665,6 +761,7 @@ chrome.tabs.onUpdated.addListener((id, change) => {
         (!tab.pendingUrl || tab.pendingUrl === tab.url)) await forgetJump(id, true);
     if (isPage(tab)) {
       refreshLeader();
+      if (change.url && tab.active) void relayActivity({ route: true }, { tab }).catch(() => {});
       if (tab.active && !jumpTabs.has(id) && !opening.has(cid) && (change.url || change.status === "complete")) {
         await serialize(() => markVisited(id, tab.windowId));
       }
@@ -678,6 +775,7 @@ chrome.tabs.onRemoved.addListener(id => {
 });
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   focusEpoch++;
+  surfaces.activate(tabId);
   void (async () => {
     await jumpReady;
     // A genuine switch away releases the previous tab's versioned protection.
@@ -711,7 +809,14 @@ chrome.windows.onFocusChanged.addListener(windowId => {
 });
 
 chrome.action.onClicked.addListener(tab => {
+  // Browser-protected pages cannot host content scripts. Opening a native
+  // side panel must occur directly inside the user's toolbar gesture.
+  if (!isPage(tab) && chrome.sidePanel?.open && Number.isInteger(tab.windowId)) {
+    void chrome.sidePanel.open({ windowId: tab.windowId }).catch(info);
+    return;
+  }
   void (async () => {
+    if (!isPage(tab) && await surfaces.toolbar(tab)) return;
     const candidates = isReady(tab) ? [tab] : await pages();
     const target = candidates.find(isReady) ?? (isPage(tab) ? tab : candidates.find(isPage));
     if (!target) {
@@ -725,3 +830,6 @@ chrome.action.onClicked.addListener(tab => {
     }
   })().catch(info);
 });
+
+// Instantiate last: keep the original listener order for navigation and tests.
+const surfaces = globalThis.TaskPulseSurfaceWorker.create({ web, rules, signal, getState });

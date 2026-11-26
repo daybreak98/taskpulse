@@ -7,6 +7,8 @@ const { webcrypto } = require("node:crypto");
 
 require("../taskpulse-ext/config.js");
 require("../taskpulse-ext/state.js");
+require("../taskpulse-ext/ui-rules.js");
+const ui = globalThis.TaskPulseUI;
 const web = globalThis.TaskPulseWeb;
 const rules = globalThis.TaskPulseState;
 const ext = path.join(__dirname, "../taskpulse-ext");
@@ -186,7 +188,7 @@ function worker(seed = {}) {
   };
   const local = { data: structuredClone(seed.local || {}) }, session = { data: structuredClone(seed.session || {}) };
   for (const store of [local, session]) {
-    store.get = async key => ({ [key]: structuredClone(store.data[key]) });
+    store.get = async key => Object.fromEntries((Array.isArray(key) ? key : [key]).map(k => [k, structuredClone(store.data[k])]));
     store.set = async data => Object.assign(store.data, structuredClone(data));
     store.remove = async key => { delete store.data[key]; };
   }
@@ -1465,4 +1467,150 @@ test("idle report does not perform foreground-only browser queries when no reply
   app.chrome.tabs.get = async (...args) => { tabReads++; return g(...args); };
   await app.deliver(report(now + 5_000, row()));
   assert.deepEqual({ windowReads, tabQueries, tabReads }, { windowReads: 0, tabQueries: 0, tabReads: 1 });
+});
+
+test("group mode resolves real tab groups, duplicate tabs, unopened rows and wrong agent IDs", () => {
+  const tabs = [
+    { id: 3, groupId: 8, url: web.conversationUrl(id, agent), active: false },
+    { id: 2, groupId: -1, url: web.conversationUrl(id, agent), active: true },
+    { id: 4, groupId: 9, url: web.conversationUrl("43", agent) },
+    { id: 5, groupId: 8, url: "https://example.com/" }
+  ];
+  const mapping = ui.buildGroups(tabs, [{ id: 8, title: "项目 A", color: "blue" },
+    { id: 9, title: "项目 A", color: "green" }], web);
+  assert.equal(Object.keys(mapping).length, 2);
+  const task = { id, agentId: agent, group: "数据质量" };
+  assert.equal(ui.groupFor(task, "dataagent", mapping).name, "数据质量");
+  assert.equal(ui.groupFor(task, "tab", mapping).key, "tab:8");
+  assert.equal(ui.groupFor(task, "tab", mapping).color, "#78a6db");
+  assert.equal(ui.groupFor({ ...task, id: "43" }, "tab", mapping).key, "tab:9");
+  assert.equal(ui.groupFor({ ...task, id: "44" }, "tab", mapping).name, "未打开 · 数据质量");
+  assert.equal(ui.groupFor({ ...task, agentId: "2528" }, "tab", mapping).key, "closed:数据质量");
+});
+
+test("drag position preserves original default and clamps across viewport and panel sizes", () => {
+  assert.deepEqual(ui.place(undefined, 1400, 880, 44, 84), { left: 1356, top: 22 });
+  assert.deepEqual(ui.place(undefined, 1400, 880, 240, 200), { left: 1160, top: 22 });
+  const position = ui.move(undefined, -200, 100, 1400, 880);
+  assert.deepEqual(ui.place(position, 1400, 880, 44, 84), { left: 1156, top: 122 });
+  const small = ui.place(position, 320, 240, 240, 200);
+  assert.ok(small.left >= 0 && small.left <= 80 && small.top >= 0 && small.top <= 40);
+  assert.deepEqual(ui.move(undefined, 1e6, -1e6, 1400, 880), { x: 1, y: 0 });
+});
+
+test("global presentation is opt-in; external frame needs same-tab opaque registration", async () => {
+  const app = worker();
+  const ordinary = { id: 9, windowId: 1, active: true, status: "complete", url: "https://example.com/work" };
+  app.tabs.push(ordinary);
+  app.chrome.permissions = { contains: async () => true };
+  const sender = { id: "unit", tab: ordinary, frameId: 0, url: ordinary.url };
+  const frame = { id: "unit", tab: ordinary, frameId: 4, url: "surface.html" };
+  assert.equal((await app.send({ kind: "tp.surface.register" }, sender)).ok, false);
+  app.local.data[ui.keys.enabled] = true;
+  const registered = await app.send({ kind: "tp.surface.register" }, sender);
+  assert.ok(registered.ok && registered.token);
+  assert.equal((await app.send({ kind: "tp.surface.attach", token: "bad" }, frame)).ok, false);
+  assert.equal((await app.send({ kind: "tp.surface.attach", token: registered.token }, frame)).ok, true);
+  assert.equal((await app.send({ kind: "tp.surface.attach", token: registered.token }, { ...frame, frameId: 0 })).ok, false);
+  assert.equal((await app.send({ kind: "tp.surface.attach", token: registered.token }, { ...frame, tab: app.tabs[0] })).ok, false);
+  app.chrome.permissions.contains = async () => false;
+  assert.equal((await app.send({ kind: "tp.surface.attach", token: registered.token }, frame)).ok, false);
+});
+
+test("cross-page toast routing sends no task titles to the webpage host and revalidates the isolated frame", async () => {
+  const app = worker();
+  app.local.data[ui.keys.enabled] = true;
+  app.chrome.permissions = { contains: async () => true };
+  const ordinary = { id: 9, windowId: 1, active: true, status: "complete", url: "https://example.com/work" };
+  app.tabs[0].active = false;
+  app.tabs.push(ordinary);
+  const messages = [];
+  app.chrome.tabs.sendMessage = async (tabId, packet) => {
+    if (tabId === 9) { messages.push(packet); return { ok: true }; }
+    return null;
+  };
+  const sender = { id: "unit", tab: ordinary, frameId: 0, url: ordinary.url };
+  const registered = await app.send({ kind: "tp.surface.register" }, sender);
+  await app.deliver(report(now, row()));
+  await app.deliver(replyReport(now + 5_000, now + 1_000, "external-reply"));
+  assert.ok(messages.some(p => p.kind === "tp.surface-notice"));
+  assert.ok(!JSON.stringify(messages).includes(row().name));
+  const frame = { id: "unit", tab: ordinary, frameId: 4, url: "surface.html" };
+  const result = await app.send({ kind: "tp.surface.toasts", token: registered.token }, frame);
+  assert.equal(result.tasks.length, 1);
+  assert.equal(result.tasks[0].name, row().name);
+  const bad = await app.send({ kind: "tp.surface.toasts", token: "wrong" }, frame);
+  assert.equal(bad.ok, false);
+  await app.send({ kind: "tp.check", id, revision: exactRevision(app), checked: true });
+  assert.equal((await app.send({ kind: "tp.surface.toasts", token: registered.token }, frame)).tasks.length, 0);
+});
+
+async function latencyScenario({ idle = false, many = false } = {}) {
+  let durable = rules.blank(), stamp = now, interval, queue = idle ? "IDLE" : "BUSY";
+  const reports = [], requests = [], listeners = [], replies = [];
+  const rows = Array.from({ length: many ? 24 : 1 }, (_, index) => ({ ...row(old - index - 1), id: String(42 + index) }));
+  const first = rows[0], readyAt = now + 6_000;
+  const success = data => ({ ok: true, json: async () => ({ success: true, data }) });
+  const chrome = {
+    storage: { local: { get: async key => ({ [key]: durable }) } },
+    runtime: { id: "collector-clock", onMessage: { addListener: fn => listeners.push(fn) },
+      sendMessage: async packet => {
+        if (packet.kind === "tp.webstate") {
+          reports.push(packet.payload);
+          const result = rules.absorb(durable, packet.payload, stamp);
+          durable = result.state; replies.push(...result.replies.map(task => ({ at: stamp, revision: rules.revision(task) })));
+        }
+        return { ok: true };
+      }
+    }
+  };
+  class Clock extends Date { static now() { return stamp; } }
+  const context = vm.createContext({
+    chrome, URL, console, crypto: webcrypto, AbortController, Date: Clock,
+    location: new URL(web.page), document: { hidden: false, addEventListener() {} },
+    setTimeout, clearTimeout, setInterval: fn => { interval = fn; return 1; }, clearInterval() {},
+    fetch: async url => {
+      requests.push({ at: stamp, path: url.pathname });
+      if (url.pathname.endsWith("/list")) return success({ groups: [], ungrouped: { conversations: rows } });
+      const cid = url.pathname.split("/").at(-2);
+      if (url.pathname.endsWith("/queue")) return success({ sessionState: cid === id ? queue : "IDLE", pending: [] });
+      const fresh = !idle && cid === id && stamp >= readyAt;
+      return success({ list: [{ sender: "assistant", id: fresh ? "new" : "old-" + cid,
+        createTime: fresh ? readyAt : old - 1000 }] });
+    }
+  });
+  for (const file of ["config.js", "state.js", "web-bridge.js"])
+    vm.runInContext(fs.readFileSync(path.join(ext, file), "utf-8"), context, { filename: file });
+  let page;
+  listeners[0]({ kind: "tp.probe" }, {}, answer => { page = answer; });
+  const role = lease => listeners[0]({ kind: "tp.role", pageId: page.pageId, lease }, {}, () => {});
+  role("clock");
+  await until(() => reports.length >= 1);
+  await new Promise(resolve => setTimeout(resolve, 5));
+  for (let second = 1; second <= (idle ? 65 : 40); second++) {
+    stamp = now + second * 1_000;
+    if (!idle && second >= 2) queue = "IDLE";
+    await interval();
+  }
+  role("");
+  return { readyAt, replies, requests, reports, durable };
+}
+
+test("fast completion retries a stale assistant without waiting 30 seconds", async () => {
+  const result = await latencyScenario();
+  assert.equal(result.replies.length, 1);
+  assert.ok(result.replies[0].at - result.readyAt <= 3_000, "reply latency: " + (result.replies[0].at - result.readyAt));
+  assert.equal(result.durable.tasks[id].pending, true);
+});
+
+test("cold historical rows remain low-frequency and request bursts are bounded", async () => {
+  const result = await latencyScenario({ idle: true, many: true });
+  const list = result.requests.filter(r => r.path.endsWith("/list"));
+  assert.ok(list.length <= 3, "idle list request count: " + list.length);
+  const checks = result.requests.filter(r => r.path.endsWith("/queue") && r.path.includes("/42/"));
+  assert.ok(checks.length <= 2, "cold queue request count: " + checks.length);
+  for (const request of result.requests) {
+    const count = result.requests.filter(r => r.at > request.at - 2_000 && r.at <= request.at).length;
+    assert.ok(count <= 12, "request budget exceeded: " + count);
+  }
 });

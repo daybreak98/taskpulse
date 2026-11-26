@@ -90,6 +90,10 @@
     return task.update > Math.max(task.acked || 0, task.created || 0, task.replyUpdate || 0, task.historyAt || 0);
   }
 
+  function isNewReply(task, message) {
+    return !!task && newReply(task, message, replyIdentity(task, message));
+  }
+
   function rememberAssistant(task, key, message, latest = true) {
     if (!key) return;
     task.replyKeys = [...new Set([...(task.replyKeys || []), task.replyKey, key].filter(Boolean))].slice(-32);
@@ -335,5 +339,5 @@
     return { counts, tasks, stale, offline, error };
   }
 
-  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, mayDismissNotice, authError, taskAccessible, taskFresh, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
+  globalThis.TaskPulseState = { blank, absorb, view, revision, acknowledge, mayDismissNotice, authError, taskAccessible, taskFresh, isNewReply, canAcknowledge, verifiedReply, queueBusy, watchRows, reportRows, stuckMs: STUCK };
 })();

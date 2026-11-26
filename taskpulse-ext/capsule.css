@@ -341,3 +341,27 @@ button:focus-visible { outline: 1px solid #e4f4ff; outline-offset: -2px; }
 @media (prefers-reduced-motion: reduce) {
   .toast { animation: none; transition: none; }
 }
+
+/* Same segmented control geometry as the desktop SourceToggleView. */
+.header-blank { cursor: grab; touch-action: none; min-width: 8px; }
+.header-blank:active, .compact:active { cursor: grabbing; }
+.compact { touch-action: none; }
+.source.group-mode { flex: 0 0 52px; width: 52px; height: 18px; display: grid;
+  grid-template-columns: 1fr 1fr; padding: 1px; gap: 0;
+  border: .8px solid var(--line); background: rgb(15 26 33 / .35); }
+.group-mode button { border-radius: 8px; font-size: 8.5px; font-weight: 500; color: rgb(194 206 224 / .7); }
+.group-mode button[aria-pressed="true"] { font-weight: 700; color: rgb(255 255 255 / .96); }
+.group-mode button[data-mode="dataagent"][aria-pressed="true"] { background: rgb(100 188 157 / .85); }
+.group-mode button[data-mode="tab"][aria-pressed="true"] { background: rgb(102 167 204 / .85); }
+.footer { display: flex; justify-content: space-between; align-items: center; height: 21px;
+  padding: 0 11px; color: rgb(194 206 224 / .55); font-size: 9.5px; border-top: .5px solid var(--line); }
+.settings { font-size: 10px; color: var(--secondary); }
+.settings:hover { color: var(--ink); }
+.group-head.tab-group .group-name { border-left: 2px solid var(--group-color); padding-left: 5px; }
+:host([data-surface="panel"]) .window { top: 0; right: 0; }
+:host([data-surface="panel"]) .panel { width: min(240px, var(--tp-viewport-width, 240px)); }
+:host([data-surface="panel"]) .groups { max-height: calc(var(--tp-viewport-height, 600px) - 85px); }
+:host([data-surface="toast"]) .toast-stack { top: 0; right: 0; width: 100%; }
+:host([data-surface="side"]) .window { top: 8px; left: 8px; right: 8px; }
+:host([data-surface="side"]) .panel { width: 100%; }
+:host([data-surface="side"]) .pin, :host([data-surface="side"]) .close { display: none; }
