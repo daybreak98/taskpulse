@@ -988,7 +988,38 @@ def pending_reply(task: dict, update: int, stamp: int) -> str | None:
     return None
 
 
+def task_revision(task: dict) -> str:
+    identity = [str(task.get("agent_id") or ""), task.get("created_ms"), task.get("update_ms"),
+                task.get("run_version") or task.get("running_since"), task.get("reply_version"),
+                [r.get("version") for r in task.get("pending_replies") or [] if isinstance(r, dict)],
+                bool(task.get("muted")), task.get("status")]
+    return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+
+
+def acknowledge_reply(task: dict, version: str) -> bool:
+    pending = task.get("pending_replies")
+    if not isinstance(pending, list):
+        return False
+    index = next((i for i, reply in enumerate(pending) if reply["version"] == version), None)
+    if index is None:
+        return False
+    del pending[:index + 1]
+    task["reply_pending"] = bool(pending)
+    task["acked_at"] = now_ms()
+    if not pending and not task.get("running_since"):
+        if task.get("awaiting_reply"):
+            task["status"] = "running"
+        else:
+            task["status"] = "seen"
+            task["acked_update"] = task.get("update_ms") or 0
+        task["countdown_since"] = 0
+        task["failed"] = False
+    return True
+
+
 def mark_seen(task: dict) -> None:
+    if isinstance(task.get("pending_replies"), list):
+        task["pending_replies"].clear()
     task["acked_update"] = task.get("update_ms") or 0
     task["acked_at"] = now_ms()
     task["reply_pending"] = False
@@ -1703,6 +1734,10 @@ def view(state: dict) -> dict:
             "prev": task.get("prev"),
             "reply_version": task.get("reply_version"),
             "reply_pending": task.get("reply_pending"),
+            "scope": source_scope(),
+            "action_scope": action_scope(),
+            "agent_id": str(task.get("agent_id") or ""),
+            "action_revision": task_revision(task),
             "pending_replies": task.get("pending_replies"),
             "run_version": task.get("run_version"),
             "awaiting_reply": bool(task.get("awaiting_reply")),
@@ -1811,6 +1846,80 @@ _web_diag: dict = {}
 _tab_ingest_lock = threading.Lock()
 _tab_sample_at: dict[str, int] = {}
 _active_browser = ""
+_profile_tabs: dict[str, dict] = {}
+
+
+def same_task_url(url: str, expected: str, cid: str) -> bool:
+    if conversation_id(url) != cid:
+        return False
+    try:
+        wanted = parse_qs(urlparse(expected).query).get("agentId", [])
+        actual = parse_qs(urlparse(url).query).get("agentId", [])
+        return not wanted or actual == wanted
+    except ValueError:
+        return False
+
+
+def current_profiles() -> dict:
+    with _tab_ingest_lock:
+        return {k: v for k, v in _profile_tabs.items()
+                if now_ms() - v["at"] <= WEB_STALE_SECONDS * 1000}
+
+
+def route_for_task(task: dict) -> dict | None:
+    cid, expected = str(task.get("id") or ""), task.get("url") or ""
+    profiles = current_profiles()
+    if source_mode() == "web":
+        snap = current_web_snapshot()
+        owner = snap.get("collector")
+        if not owner or now_ms() - int(snap.get("at") or 0) > WEB_STALE_SECONDS * 1000:
+            return None
+        tab = profiles.get(owner, {}).get("tabs", {}).get(cid, {})
+        return {"key": owner, "collector": owner, "browser": snap.get("browser"),
+                "tabId": tab.get("tabId") if same_task_url(tab.get("url") or "", expected, cid) else None}
+    matches = []
+    for key, profile in profiles.items():
+        tab = profile["tabs"].get(cid, {})
+        if same_task_url(tab.get("url") or "", expected, cid):
+            matches.append({"key": key, "collector": profile.get("collector"), "browser": profile["browser"],
+                            "tabId": tab.get("tabId")})
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1 or len(profiles) > 1:
+        return None
+    if len(profiles) == 1:
+        key, profile = next(iter(profiles.items()))
+        return {"key": key, "collector": profile.get("collector"), "browser": profile["browser"], "tabId": None}
+    return None
+
+
+def confirm_active_evidence(task: dict, payload: dict) -> bool:
+    if not isinstance(task.get("pending_replies"), list) or task.get("muted"):
+        return False
+    if payload.get("action_scope") != action_scope() or not payload.get("focused"):
+        return False
+    try:
+        observed = int(payload.get("at") or 0)
+    except (ValueError, TypeError):
+        return False
+    if not 0 <= now_ms() - observed <= 10000:
+        return False
+    if _active_tab.get("scope") == action_scope() and observed < (_active_tab.get("ts") or 0):
+        return False
+    if not same_task_url(payload.get("url") or "", task.get("url") or "", str(task.get("id"))):
+        return False
+    route = route_for_task(task)
+    if not route or not route.get("collector") or route["collector"] != payload.get("collector"):
+        return False
+    guard = int(task.get("jump_guard_at") or 0)
+    if guard:
+        if not payload.get("explicit") or observed < guard:
+            return False
+        task.pop("jump_guard_at", None)
+    eligible = [r for r in task["pending_replies"] if 0 < int(r.get("observed_at") or 0) <= observed]
+    if not eligible:
+        return bool(guard)
+    return acknowledge_reply(task, eligible[-1]["version"])
 
 
 def watching(cid: str, act: dict) -> bool:
@@ -1826,13 +1935,17 @@ def load_active() -> dict:
     try:
         with open(ACTIVE_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
-        return {"cid": d.get("cid"), "focused": bool(d.get("focused")), "ts": d.get("ts") or 0}
+        if d.get("scope") != action_scope():
+            return {"cid": None, "focused": False, "ts": 0}
+        return {"cid": d.get("cid"), "focused": bool(d.get("focused")), "ts": d.get("ts") or 0,
+                "collector": d.get("collector"), "scope": d.get("scope")}
     except Exception:
         return {"cid": None, "focused": False, "ts": 0}
 
 
 def save_active(act: dict) -> None:
-    act["ts"] = now_ms()
+    act.setdefault("ts", now_ms())
+    act.setdefault("scope", action_scope())
     _active_tab.update(act)
     try:
         tmp = ACTIVE_FILE + ".tmp"
@@ -1871,9 +1984,21 @@ def _ingest_tabs(payload: dict, ua: str = "") -> int:
     _tab_report_at = now_ms()
     b = browser_of(ua, payload.get("browser") or "")
     sample_at = int(payload.get("at") or _tab_report_at)
-    if sample_at < _tab_sample_at.get(b, 0):
+    collector = payload.get("collector")
+    collector = collector if isinstance(collector, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", collector) else None
+    profile_key = collector or b
+    if sample_at < _tab_sample_at.get(profile_key, 0) or sample_at > _tab_report_at + 5000:
         return 0
-    _tab_sample_at[b] = sample_at
+    _tab_sample_at[profile_key] = sample_at
+    profile_tabs = {}
+    for tab in payload.get("tabs") or []:
+        if not isinstance(tab, dict):
+            continue
+        cid = conversation_id(tab.get("url") or "")
+        if cid:
+            profile_tabs[cid] = tab
+    if profile_key:
+        _profile_tabs[profile_key] = {"at": sample_at, "browser": b, "collector": collector, "tabs": profile_tabs}
     if b:
         _tab_report_by_browser[b] = _tab_report_at
     if isinstance(payload.get("web"), dict):
@@ -1882,9 +2007,14 @@ def _ingest_tabs(payload: dict, ua: str = "") -> int:
     active_cid = conversation_id(act.get("url") or "")
     focused = bool(act.get("focused"))
     # A heartbeat from an unfocused browser must not clear the focused browser's session.
-    if focused or not _active_browser or _active_browser == b:
-        _active_browser = b if focused else ""
-        save_active({"cid": active_cid or None, "focused": focused})
+    owner_ok = source_mode() != "web" or collector == current_web_snapshot().get("collector")
+    scope = action_scope()
+    scope_ok = not collector or payload.get("action_scope") == scope
+    if owner_ok and scope_ok and (_active_tab.get("scope") != scope or sample_at >= (_active_tab.get("ts") or 0)) and (
+            focused or not _active_browser or _active_browser == profile_key):
+        _active_browser = profile_key if focused else ""
+        save_active({"cid": active_cid or None, "focused": focused, "ts": sample_at,
+                     "collector": collector, "scope": scope})
 
     # 整份快照替换：同一次上报里没出现的会话，说明它的标签已经不在了。
     # 不清理的话旧 tabId 会一直留着，点任务时先「聚焦」到不存在的标签再新开。
@@ -2119,26 +2249,25 @@ _ext_seen = 0.0          # 扩展最近一次长轮询的时间
 _auth_warned = False     # 「密钥不可用、请求放行」的告警只打一次，别刷屏日志
 
 
-def _confirm_open(cid: str, clicked_update: int, clicked_reply: str | None = None) -> None:
-    """标签确实切过去了，才算用户「看过这个会话的这一次回复」。
-
-    clicked_update 是点击时的 update_ms：如果这期间又来了新回复（update_ms
-    变大），那一次不算读过，留给用户自己看。
-    """
-    try:
-        with _lock:
-            state = load_state()
-            task = (state.get("tasks") or {}).get(str(cid))
-            if not task or task.get("muted") or task.get("running_since"):
-                return
-            if (task.get("update_ms") or 0) > clicked_update:
-                return
-            if clicked_reply is not None and (task.get("reply_version") or "") != clicked_reply:
-                return
-            mark_seen(task)
-            save_state(state)
-    except OSError as exc:
-        log(f"标记已读失败 cid={cid}: {exc}")
+def _confirm_open(cid: str, clicked_update: int, clicked_reply: str | None = None,
+                  scope: str | None = None, agent_id: str | None = None) -> None:
+    with _lock:
+        if scope is not None and scope != action_scope():
+            return
+        state = load_state()
+        task = (state.get("tasks") or {}).get(str(cid))
+        if not task or task.get("muted") or (agent_id is not None and str(task.get("agent_id") or "") != agent_id):
+            return
+        if isinstance(task.get("pending_replies"), list):
+            if scope is not None and clicked_reply and acknowledge_reply(task, clicked_reply):
+                save_state(state)
+            return
+        if task.get("running_since") or (task.get("update_ms") or 0) > clicked_update:
+            return
+        if clicked_reply is not None and (task.get("reply_version") or "") != clicked_reply:
+            return
+        mark_seen(task)
+        save_state(state)
 
 
 def _cmd_queue(browser: str) -> "queue.Queue[dict]":
@@ -2325,7 +2454,7 @@ function makeRow(id) {
   jump.addEventListener("click", () => post("/open", id));
   deadline.addEventListener("click", () => setDeadline(id));
   row.append(jump, deadline);
-  return {row, name, tag, meta, progress};
+  return {row, name, tag, meta, progress, task: null};
 }
 
 function showHealth(message, old = false) {
@@ -2358,6 +2487,7 @@ function render(data, disconnected = false) {
     const unconfirmed = task.stale || (stale && (status === "running" || status === "stuck"));
     ids.add(id);
     rows.set(id, nodes);
+    nodes.task = task;
     if (nodes.row !== position) list.insertBefore(nodes.row, position);
     position = nodes.row.nextElementSibling;
     nodes.row.className = "row " + status + (unconfirmed ? " unconfirmed" : "");
@@ -2384,6 +2514,14 @@ async function post(path, id, minutes) {
   const notice = document.getElementById("action-status");
   notice.hidden = true;
   const params = new URLSearchParams({id});
+  const task = rows.get(id)?.task;
+  if (task) {
+    params.set("scope", task.action_scope || "");
+    params.set("revision", task.action_revision || "");
+    params.set("agent", task.agent_id || "");
+    params.set("version", task.reply_version || "-");
+    params.set("update", String(task.updated_ms || 0));
+  }
   if (minutes !== undefined && minutes !== "") params.set("minutes", minutes);
   try {
     const response = await fetch(path + "?" + params, {method:"POST", headers:TP_HEADERS});
@@ -2564,9 +2702,10 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 mode = source_mode()
                 generation = web_generation()
+                scope = action_scope()
                 snapshot = read_web_snapshot()
                 owner = snapshot.get("collector") if now_ms() - int(snapshot.get("at") or 0) <= WEB_STALE_SECONDS * 1000 else None
-            self._json({"ok": True, "source": mode, "generation": generation, "collector": owner})
+            self._json({"ok": True, "source": mode, "generation": generation, "collector": owner, "action_scope": scope})
         elif path in ("/", "/index.html"):
             # 令牌随页面一起下发（同源）：看板不必再走一次单独取密钥的接口，
             # 也不需要在服务端为它开一个免鉴权的口子。json.dumps 负责转义。
@@ -2589,8 +2728,18 @@ class Handler(BaseHTTPRequestHandler):
                 ln = 0
             raw = self.rfile.read(ln) if ln > 0 else b"{}"
             try:
-                n = ingest_tabs(json.loads(raw or b"{}"),
-                                self.headers.get("User-Agent") or "")
+                payload = json.loads(raw or b"{}")
+                n = ingest_tabs(payload, self.headers.get("User-Agent") or "")
+                active = payload.get("active") or {}
+                active_cid = conversation_id(active.get("url") or "")
+                if active_cid:
+                    with _lock:
+                        state = load_state()
+                        task = (state.get("tasks") or {}).get(active_cid)
+                        evidence = {**active, "at": payload.get("at"), "collector": payload.get("collector"),
+                                    "action_scope": payload.get("action_scope")}
+                        if task and confirm_active_evidence(task, evidence):
+                            save_state(state)
             except Exception:
                 n = 0
             self._json({"ok": True, "mapped": n})
@@ -2784,21 +2933,31 @@ class Handler(BaseHTTPRequestHandler):
             state = load_state()
             task = (state.get("tasks") or {}).get(cid)
             changed = bool(task)
+            if task and parsed.path != "/active":
+                scope = (query.get("scope") or [""])[0]
+                revision = (query.get("revision") or [""])[0]
+                agent_id = (query.get("agent") or [""])[0]
+                if scope or "pending_replies" in task:
+                    if scope != action_scope() or agent_id != str(task.get("agent_id") or "") or revision != task_revision(task):
+                        self._json({"ok": False, "error": "任务版本已变更，请重试"}, 409)
+                        return
             if task:
                 if parsed.path == "/ack":
                     mark_seen(task)
-                    task.update(status="done", muted=True, running_since=0)
+                    task.update(status="done", muted=True, running_since=0, awaiting_reply=False)
                 elif parsed.path == "/unack":
                     if task.get("muted"):
                         task.update(muted=False, archived=False, status="seen",
                                     seen_ms=now_ms(), running_since=0, queue_error=True)
                 elif parsed.path == "/active":
-                    # 后台窗口里的程序化切标签不算「用户在看」
-                    changed = (focused and not task.get("muted") and not task.get("running_since")
-                               and time.monotonic() >= _open_visit_until.get(cid, 0)
-                               and task.get("status") in ("attention", "stuck"))
-                    if changed:
-                        mark_seen(task)
+                    if isinstance(task.get("pending_replies"), list):
+                        changed = confirm_active_evidence(task, payload)
+                    else:
+                        changed = (focused and not task.get("muted") and not task.get("running_since")
+                                   and time.monotonic() >= _open_visit_until.get(cid, 0)
+                                   and task.get("status") in ("attention", "stuck"))
+                        if changed:
+                            mark_seen(task)
                 elif parsed.path == "/important":
                     # 用户手动标的「完成后提醒我」：只影响展示与弹窗持久化，
                     # 不参与状态判定，也不改变卡住计时

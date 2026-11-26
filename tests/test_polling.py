@@ -74,6 +74,8 @@ class PollingTests(unittest.TestCase):
             WEBSTATE_FILE=str(Path(self.directory) / "webstate.json"),
             ACTIVE_FILE=str(Path(self.directory) / "active.json"),
             _open_visit_until={},  # 每个测试独立模拟一个桌面后台进程
+            _profile_tabs={}, _tab_sample_at={}, _active_browser="",
+            _active_tab={"cid": None, "focused": False, "ts": 0},
             # 身份密钥也指到临时目录：绝不能碰本机真实的那一份
             TOKEN_FILE=str(Path(self.directory) / "token"),
             CONV_URL="https://agent.example.com/chat?conversationId={cid}",
@@ -840,6 +842,45 @@ class PollingTests(unittest.TestCase):
         self.assertEqual(task["status"], "attention")
         self.assertEqual(task["countdown_since"], NOW)
         self.assertEqual(events, [])
+
+    def test_versioned_actions_cannot_ack_new_reply_or_new_scope(self):
+        task = {"id": 1, "name": "A", "agent_id": 7, "status": "attention",
+                "url": "https://agent.example.com/chat?conversationId=1",
+                "update_ms": NOW, "reply_version": "b", "reply_pending": True,
+                "pending_replies": [{"version": "a", "observed_at": NOW - 1000},
+                                    {"version": "b", "observed_at": NOW}]}
+        poller.save_state({"tasks": {"1": task}})
+        scope = poller.action_scope()
+        revision = poller.task_revision(task)
+        poller._confirm_open("1", NOW - 1000, "a", scope, "7")
+        got = poller.load_state()["tasks"]["1"]
+        self.assertEqual([x["version"] for x in got["pending_replies"]], ["b"])
+        self.assertTrue(got["reply_pending"])
+        poller._confirm_open("1", NOW, "b", "old-scope", "7")
+        self.assertTrue(poller.load_state()["tasks"]["1"]["reply_pending"])
+        with self.serve() as url:
+            r = self.auth().post(url + "/ack", params={"id": "1", "scope": scope,
+                "revision": revision, "agent": "7"}, timeout=2)
+            self.assertFalse(r.json()["ok"])
+        self.assertTrue(poller.load_state()["tasks"]["1"]["reply_pending"])
+
+    def test_active_observation_only_acks_replies_visible_at_event_time(self):
+        task = {"id": 1, "name": "A", "agent_id": 7, "status": "attention",
+                "url": "https://agent.example.com/chat?conversationId=1",
+                "reply_version": "b", "reply_pending": True, "update_ms": NOW,
+                "pending_replies": [{"version": "a", "observed_at": NOW - 2000},
+                                    {"version": "b", "observed_at": NOW}]}
+        scope = poller.action_scope()
+        poller.ingest_tabs({"at": NOW - 1500, "browser": "chrome", "collector": "chrome-a",
+            "action_scope": scope, "tabs": [{"url": task["url"], "tabId": 1}]})
+        evidence = {"action_scope": scope, "collector": "chrome-a", "focused": True,
+                    "url": task["url"], "at": NOW - 1000}
+        task["jump_guard_at"] = NOW - 3000
+        self.assertFalse(poller.confirm_active_evidence(task, evidence))
+        self.assertTrue(poller.confirm_active_evidence(task, {**evidence, "explicit": True}))
+        self.assertEqual([x["version"] for x in task["pending_replies"]], ["b"])
+        self.assertFalse(poller.confirm_active_evidence(task, {**evidence, "at": NOW,
+            "collector": "edge-b"}))
 
     def test_open_confirmation_is_bound_to_reply_and_not_running(self):
         task = {"id": 1, "status": "attention", "reply_pending": True,
