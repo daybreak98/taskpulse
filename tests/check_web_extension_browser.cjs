@@ -736,8 +736,8 @@ async function trial() {
       "successor reply B recovered without transferring A read");
     assert.notEqual(successor.tasks["11"].readRevision,
       "11/515/" + successorStamp + "/message.m" + successorStamp);
-    assert.ok(Object.keys(successor.outbox).some(key => key.endsWith("message.m" + successorStamp)),
-      "successor reply must retain its own notice");
+    assert.equal(successor.tasks["11"].notified, "message.m" + successorStamp,
+      "successor reply must be recorded as its own notification");
     await other.mouse.move(420, 420);
     await other.mouse.wheel(0, 900);
     await waitState(s => s?.tasks["11"]?.pending === false &&
