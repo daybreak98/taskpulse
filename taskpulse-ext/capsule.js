@@ -259,7 +259,9 @@
       // version immediately, never a newer version already in local state.
       if (result?.ok && state.tasks[task.id] &&
           rules.displayVersion(state.tasks[task.id]) === version) {
-        state = { ...state, tasks: { ...state.tasks, [task.id]: rules.dismiss(state.tasks[task.id]) } };
+        if (!rules.isDismissed(state.tasks[task.id]))
+          state = { ...state, tasks: { ...state.tasks, [task.id]:
+            rules.dismiss(state.tasks[task.id], result.dismissedAt) } };
         render();
       } else if (!result?.ok) check.disabled = false;
     });

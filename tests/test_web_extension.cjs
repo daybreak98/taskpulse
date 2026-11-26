@@ -1828,3 +1828,65 @@ test("48-hour display window uses activity rather than polling; older tasks rema
     conversations: [row(), { ...oldRow, updateTime: now + 3_000 }, edgeRow] });
   assert.ok(rules.view(renewed.state, now + 5_000).tasks.some(t => t.id === "43"));
 });
+
+
+test("historical user-message backfill never reopens a dismissed conversation, including missing timestamps", async () => {
+  const app = worker();
+  const update = now - 1_000;
+  await app.deliver(report(now, row(update), { busy: null, queueError: true }));
+  const original = currentTask(app);
+  const version = rules.displayVersion(original);
+  assert.equal((await app.send({ kind: "tp.dismiss", id, version })).ok, true);
+  const saved = structuredClone(app.local.data[web.keys.state]);
+  assert.equal(currentTask(app).dismissedAt, now);
+  const restarted = worker({ local: saved, session: app.session.data });
+  for (const [delta, userId, atMessage] of [
+    [5_000, "historical-user", update],
+    [10_000, "historical-undated-user", 0],
+    [15_000, "historical-late-list", now - 1],
+    [20_000, "historical-late-list", now - 1]
+  ]) {
+    const at = now + delta;
+    await restarted.deliver(report(at, row(update), {
+      message: message(update, at, userId, { sender: "other", atMessage })
+    }));
+    const task = currentTask(restarted);
+    assert.equal(task.lastUserMessage, userId, "collector watermark is still recorded");
+    assert.equal(rules.displayVersion(task), version, "backfill is not activity");
+    assert.equal(task.acked, original.acked);
+    assert.equal(task.readRevision, original.readRevision);
+    assert.equal(rules.view(restarted.local.data[web.keys.state], at).tasks.length, 0);
+    assert.equal(restarted.notices.size, 0);
+  }
+
+  const at = now + 25_000;
+  const userAt = now + 22_000;
+  await restarted.deliver(report(at, row(update), {
+    message: message(update, at, "new-user", { sender: "other", atMessage: userAt })
+  }));
+  assert.equal(currentTask(restarted).userActivityAt, userAt);
+  assert.equal(rules.view(restarted.local.data[web.keys.state], at).tasks.length, 1);
+  assert.equal((await restarted.send({ kind: "tp.dismiss", id, version })).ok, false,
+    "old display ticket must not remove a newly evidenced activity");
+  assert.equal((await restarted.send({ kind: "tp.dismiss", id, version: rules.displayVersion(currentTask(restarted)) })).ok, true);
+  await restarted.deliver(report(now + 30_000, row(update), {
+    message: message(update, now + 30_000, "new-user", { sender: "other", atMessage: userAt })
+  }));
+  assert.equal(rules.view(restarted.local.data[web.keys.state], now + 30_000).tasks.length, 0);
+  await restarted.deliver(report(now + 35_000, row(now + 32_000)));
+  assert.equal(rules.view(restarted.local.data[web.keys.state], now + 35_000).tasks.length, 1,
+    "new list activity must still reopen even without a timestamped message");
+});
+
+test("legacy dismissal ticket is preserved when its only change is a hydrated user watermark", () => {
+  const task = {
+    id, agentId: agent, created: old, update: old, status: "seen",
+    dismissedVersion: JSON.stringify([id, agent, old, old, "", 0, ""]),
+    lastUserMessage: "historical"
+  };
+  assert.equal(rules.isDismissed(task), true);
+  assert.equal(rules.isDismissed({ ...task, userActivityAt: now }), false);
+  assert.equal(rules.isDismissed({ ...task, runCycleAt: now }), false);
+  assert.equal(rules.isDismissed({ ...task, replyKey: "message.new" }), false);
+  assert.equal(rules.isDismissed({ ...task, update: now }), false);
+});

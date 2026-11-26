@@ -129,8 +129,10 @@ async function trial() {
   try {
     const extension = await installFixtureCopy(dir, origin);
     // Fault injection is confined to this disposable extension copy.
-    // First registration is rejected; first authenticated frame never
-    // completes rendering. The next mount must recover on its own.
+    // First registration returns synchronously without a result; the next
+    // rejects asynchronously, then an authenticated frame never completes
+    // rendering. Keep the synchronous case: it exposed the latched promise.
+    // Each independent failure scenario must recover on its own.
     const hostPath = path.join(extension, "surface-host.js");
     const hostSource = await fs.readFile(hostPath, "utf8");
     const regAnchor = 'const result = await chrome.runtime.sendMessage({ kind: "tp.surface.register" }).catch(() => null);';
@@ -140,7 +142,8 @@ async function trial() {
       'const fault = new URL(location.href).searchParams.has("fixture-recover");' +
       'const attempt = fault ? Number(document.documentElement.dataset.fixtureMountAttempts || 0) + 1 : 0;' +
       'if (fault) document.documentElement.dataset.fixtureMountAttempts = String(attempt);' +
-      'const result = attempt === 1 ? null : await chrome.runtime.sendMessage({ kind: "tp.surface.register" }).catch(() => null);')
+      'const asyncFault = new URL(location.href).searchParams.has("fixture-async");' +
+      'const result = attempt === 1 ? (asyncFault ? await Promise.reject(new Error("fixture rejection")).catch(() => null) : null) : await chrome.runtime.sendMessage({ kind: "tp.surface.register" }).catch(() => null);')
       .replace(sizeAnchor, 'else if (msg.type === "tp-frame-size") {' +
       'if (new URL(location.href).searchParams.has("fixture-recover") && document.documentElement.dataset.fixtureMountAttempts === "2") return;' +
       'sizePanel(msg.expanded, msg.panelHeight); }'));
@@ -595,7 +598,6 @@ async function trial() {
     }
     assert.equal(await recovering.evaluate(() => Number(document.documentElement.dataset.fixtureMountAttempts || 0)), 3);
     const recoveredPanel = recoveredFrame.locator(root + " .panel");
-    const recoveredCompact = recoveredFrame.locator(root + " .compact");
     await recoveredPanel.waitFor({ state: "visible", timeout: 8_000 });
     const probeSurface = () => worker.evaluate(async url => {
       const tab = (await chrome.tabs.query({})).find(t => t.url === url);
@@ -625,6 +627,11 @@ async function trial() {
     assert.equal(bounds.width, 28); assert.equal(bounds.height, 96);
     // Verify the user's actual checkbox interaction in the isolated frame.
     await worker.evaluate(() => chrome.storage.local.remove("tp-web-position"));
+    for (let i = 0; i < 60; i++) {
+      if ((await boundedCompact.boundingBox())?.y === 22) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal((await boundedCompact.boundingBox()).y, 22);
     await boundedCompact.hover();
     await boundedPanel.waitFor({ state: "visible" });
     await boundedPanel.locator(".pin").click();
@@ -652,6 +659,19 @@ async function trial() {
     assert.equal(await boundedPanel.locator(".task-open").count(), 0);
     console.log("Uncertain and verified checkbox dismissal removes rows, keeps evidence, and excludes 49-hour history");
     await recovering.close();
+    const asyncRecovering = monitor(await context.newPage());
+    await asyncRecovering.goto(externalUrl + "?fixture-recover=1&fixture-async=1");
+    await asyncRecovering.bringToFront();
+    for (let i = 0; i < 120; i++) {
+      const attempts = await asyncRecovering.evaluate(() => Number(document.documentElement.dataset.fixtureMountAttempts || 0));
+      const f = asyncRecovering.frames().find(f => f.url().includes("surface.html#panel/"));
+      if (attempts === 3 && f && await f.locator(root + " .panel").isVisible().catch(() => false)) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.equal(await asyncRecovering.evaluate(() => Number(document.documentElement.dataset.fixtureMountAttempts || 0)), 3);
+    const asyncFrame = await waitFrame(asyncRecovering, "panel");
+    await asyncFrame.locator(root + " .panel").waitFor({ state: "visible", timeout: 8_000 });
+    await asyncRecovering.close();
     await worker.evaluate(value => chrome.scripting.registerContentScripts(value), registrations);
     console.log("New-tab completion, bounded failed-register/frame recovery, detached-host repair and isolated scrollbar geometry passed");
     await options.bringToFront();

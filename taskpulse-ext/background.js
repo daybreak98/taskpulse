@@ -640,6 +640,7 @@ async function markChecked(id, revision, checked) {
     delete task.checkedRevision;
     delete task.dismissedVersion;
     delete task.dismissedNoticeRevision;
+    delete task.dismissedAt;
     await saveState(state);
   }
   return { ok: true };
@@ -650,16 +651,16 @@ async function dismissTask(id, version) {
   const state = await getState();
   const task = state.tasks[id], now = Date.now();
   if (!task || rules.displayVersion(task) !== version) return { ok: false };
-  if (rules.isDismissed(task)) return { ok: true };
+  if (rules.isDismissed(task)) return { ok: true, dismissedAt: task.dismissedAt || 0 };
   if (!rules.canDismiss(state, task, now)) return { ok: false };
   // Verified replies may be acknowledged. An uncertain row is only
   // dismissed from the presentation, without advancing any read watermark.
   const confirmed = freshTask(state, task, now) && rules.canAcknowledge(task);
-  state.tasks[id] = rules.dismiss(confirmed ? rules.acknowledge(task) : task);
+  state.tasks[id] = rules.dismiss(confirmed ? rules.acknowledge(task) : task, now);
   pruneOutbox(state);
   await saveState(state);
   await syncNotices(state);
-  return { ok: true };
+  return { ok: true, dismissedAt: now };
 }
 
 async function userVisit(id, sender, visitAt) {

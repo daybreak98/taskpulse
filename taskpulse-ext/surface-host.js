@@ -150,7 +150,10 @@
     if (retryTimer !== null) return Promise.resolve(false);
     if (host || panel) unmount(true);
     const generation = ++mountGeneration;
-    mountPromise = (async () => {
+    // Publish the attempt before its body can run or synchronously fail.
+    // A failed/stale attempt must never overwrite the next attempt's slot.
+    const pending = Promise.resolve().then(async () => {
+      if (generation !== mountGeneration || !visible()) return false;
       const result = await chrome.runtime.sendMessage({ kind: "tp.surface.register" }).catch(() => null);
       if (generation !== mountGeneration || !visible()) return false;
       if (!result?.ok) { failedMount(generation); return false; }
@@ -169,16 +172,20 @@
       // A successful script injection or iframe load is not a render.
       // Only the authenticated frame's geometry message completes mounting.
       watchdog = setTimeout(() => {
+        if (generation !== mountGeneration) return;
         watchdog = null;
         if (!healthy()) failedMount(generation);
       }, 2_500);
       if (pendingToast) mountToast();
       return true;
-    })().catch(() => {
+    }).catch(() => {
       failedMount(generation);
       return false;
-    }).finally(() => { if (generation === mountGeneration) mountPromise = null; });
-    return mountPromise;
+    }).finally(() => {
+      if (mountPromise === pending) mountPromise = null;
+    });
+    mountPromise = pending;
+    return pending;
   }
   function show() {
     if (!visible()) {

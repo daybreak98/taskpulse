@@ -20,15 +20,25 @@
     return [task.id, task.agentId, task.replyUpdate || task.update, task.replyKey || "-"].join("/");
   }
 
-  // A display ticket includes the current list version and observed run,
-  // unlike a reply ticket which intentionally refers to an exact reply.
+  // Raw lastUserMessage is a collector watermark, not proof of new activity.
+  // Hydrating an old/undated user message must not invalidate a dismissal.
   function displayVersion(task) {
     return JSON.stringify([task.id, task.agentId, task.created || 0, task.update || 0,
-      task.replyKey || "", task.runCycleAt || task.runAt || 0, task.lastUserMessage || ""]);
+      task.replyKey || "", task.runCycleAt || task.runAt || 0, task.userActivityAt || 0]);
   }
 
   function isDismissed(task) {
-    if (task.dismissedVersion) return task.dismissedVersion === displayVersion(task);
+    if (task.dismissedVersion) {
+      const current = displayVersion(task);
+      if (task.dismissedVersion === current) return true;
+      // Candidate builds used the raw user ID in slot 7. Preserve those
+      // dismissals when only historical evidence has been hydrated.
+      try {
+        const old = JSON.parse(task.dismissedVersion);
+        return Array.isArray(old) && old.length === 7 && typeof old[6] === "string" &&
+          !task.userActivityAt && JSON.stringify([...old.slice(0, 6), 0]) === current;
+      } catch { return false; }
+    }
     // Migrate the old checkbox's persistent marker without hiding a new run.
     return Boolean(task.checkedRevision && task.checkedRevision === revision(task) &&
       !task.runAt && !task.awaitingReply && (!task.replyUpdate || task.update <= task.replyUpdate));
@@ -37,7 +47,7 @@
   function recentActivity(task, now) {
     // Never use listAt, observedAt or the latest polling timestamp as activity.
     const activity = Math.max(task.created || 0, task.update || 0, task.replyAt || 0,
-      task.runCycleAt || task.runAt || 0, task.replyActivityAt || 0);
+      task.runCycleAt || task.runAt || 0, task.replyActivityAt || 0, task.userActivityAt || 0);
     return activity > 0 && now - activity <= DISPLAY_HISTORY;
   }
 
@@ -48,9 +58,9 @@
     return Boolean(uncertain || (!task.runAt && !task.awaitingReply && task.status !== "running"));
   }
 
-  function dismiss(task) {
+  function dismiss(task, now = Date.now()) {
     return { ...task, dismissedVersion: displayVersion(task),
-      dismissedNoticeRevision: revision(task) };
+      dismissedNoticeRevision: revision(task), dismissedAt: now };
   }
 
   function acknowledge(task) {
@@ -216,7 +226,18 @@
       task.messageUpdate = task.update;
       task.messageObservedAt = message.at;
       task.messageUncertain = false;
-      if (message.sender === "other" && message.messageId) task.lastUserMessage = message.messageId;
+      if (message.sender === "other") {
+        const stamp = time(message.atMessage);
+        // A user message needs its own server timestamp, newer than both
+        // known activity and the dismissal. Merely observing an ID later
+        // does not prove that the user actually sent a new message.
+        const floor = Math.max(task.created || 0, task.update || 0, task.replyAt || 0,
+          task.replyActivityAt || 0, task.runCycleAt || task.runAt || 0,
+          task.userActivityAt || 0, task.dismissedAt || 0);
+        if (stamp > floor && stamp <= message.at + 5_000 &&
+            (!message.messageId || message.messageId !== task.lastUserMessage)) task.userActivityAt = stamp;
+        if (message.messageId) task.lastUserMessage = message.messageId;
+      }
     }
     if (changed) {
       rememberAssistant(task, key, message);
