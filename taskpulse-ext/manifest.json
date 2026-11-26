@@ -3,19 +3,68 @@
   "name": "TaskPulse · 网页版",
   "version": "2.1.1",
   "minimum_chrome_version": "120",
-  "description": "在 DataAgent 网页看任务状态，新回复时收系统通知，点一下直达会话。",
-  "permissions": ["alarms", "notifications", "scripting", "storage"],
-  "host_permissions": ["https://dataagent.corp.kuaishou.com/*"],
-  "background": { "service_worker": "background.js" },
-  "content_scripts": [{
-    "matches": ["https://dataagent.corp.kuaishou.com/ai/data-agent*"],
-    "js": ["config.js", "state.js", "web-bridge.js", "capsule.js"],
-    "run_at": "document_idle"
-  }],
-  "web_accessible_resources": [{
-    "resources": ["capsule.css"],
-    "matches": ["https://dataagent.corp.kuaishou.com/*"]
-  }],
-  "icons": { "128": "icon.png" },
-  "action": { "default_title": "TaskPulse · 打开 DataAgent", "default_icon": "icon.png" }
+  "description": "在浏览器看 DataAgent 任务状态，快速回复提醒及会话跳转。",
+  "permissions": [
+    "alarms",
+    "notifications",
+    "scripting",
+    "storage",
+    "tabGroups",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://dataagent.corp.kuaishou.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://dataagent.corp.kuaishou.com/ai/data-agent*"
+      ],
+      "js": [
+        "config.js",
+        "state.js",
+        "ui-rules.js",
+        "web-bridge.js",
+        "capsule.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "capsule.css"
+      ],
+      "matches": [
+        "https://dataagent.corp.kuaishou.com/*"
+      ]
+    },
+    {
+      "resources": [
+        "surface.html"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ]
+    }
+  ],
+  "icons": {
+    "128": "icon.png"
+  },
+  "action": {
+    "default_title": "TaskPulse · 打开 DataAgent",
+    "default_icon": "icon.png"
+  },
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "options_page": "options.html",
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
 }

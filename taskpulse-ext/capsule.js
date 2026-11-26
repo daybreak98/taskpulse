@@ -1,14 +1,25 @@
-(() => {
-  const web = globalThis.TaskPulseWeb;
-  const rules = globalThis.TaskPulseState;
+(async () => {
+  const web = globalThis.TaskPulseWeb, rules = globalThis.TaskPulseState, ui = globalThis.TaskPulseUI;
   const hostId = "taskpulse-web-capsule";
-  if (!web.conversationPage(location.href) || globalThis.taskPulseCapsule?.alive()) return;
+  const native = !!web.conversationPage(location.href);
+  const side = !native && location.href === chrome.runtime.getURL("sidepanel.html");
+  const [frameMode, token] = !native && !side ? location.hash.slice(1).split("/") : [];
+  const frame = !native && !side && ["panel", "toast"].includes(frameMode);
+  const toastOnly = frame && frameMode === "toast";
+  if ((!native && !side && !frame) || !ui || globalThis.taskPulseCapsule?.alive()) return;
 
   document.getElementById(hostId)?.remove();
   function alive() {
     try { return Boolean(chrome.runtime?.id); } catch { return false; }
   }
   globalThis.taskPulseCapsule = { alive };
+  let attached = null;
+  if (frame || side) {
+    attached = await chrome.runtime.sendMessage({ kind: "tp.surface.attach", token }).catch(() => null);
+    if (!attached?.ok) return;
+  }
+  const post = message => { if (frame) parent.postMessage(message, attached.origin); };
+  const request = (kind, fields = {}) => chrome.runtime.sendMessage({ kind, ...fields, ...(frame ? { token } : {}) });
 
   const names = { running: "运行中", attention: "待处理", stuck: "疑似卡住", seen: "已查看", done: "已处理" };
   const kinds = ["running", "attention", "stuck"];
@@ -16,6 +27,9 @@
   const pinKey = "tp-web-pinned";
   const host = document.createElement("div");
   host.id = hostId;
+  host.dataset.surface = native ? "native" : side ? "side" : frameMode;
+  host.style.setProperty("--pill-long", ui.pill.long + "px");
+  host.style.setProperty("--pill-short", ui.pill.short + "px");
   const root = host.attachShadow({ mode: "open" });
 
   function counter(layout) {
@@ -30,13 +44,17 @@
       <section class="panel" id="tp-conversations" aria-label="会话列表" hidden>
         <header class="header">
           ${counter("horizontal")}
-          <button type="button" class="header-blank" aria-label="切换全部分组"></button>
-          <span class="source" title="取数来源：浏览器 WEB">WEB</span>
+          <button type="button" class="header-blank" aria-label="拖动面板或双击切换全部分组" title="拖动 · 双击切换分组"></button>
+          <div class="source group-mode" role="group" aria-label="分组方式">
+            <button type="button" data-mode="dataagent" aria-label="DataAgent 分组" title="DataAgent 内部分组">DA</button>
+            <button type="button" data-mode="tab" aria-label="浏览器标签组" title="Chrome / Edge 原生标签组">TAB</button>
+          </div>
           <button type="button" class="pin" aria-label="固定展开" aria-pressed="false"></button>
           <button type="button" class="close" aria-label="收起 TaskPulse" title="收起 TaskPulse"></button>
         </header>
         <p class="note" role="status" hidden></p>
         <div class="groups"></div>
+        <footer class="footer"><span>WEB</span><button type="button" class="settings" aria-label="显示设置">显示设置</button></footer>
       </section>
     </aside>
     <div class="toast-stack" aria-live="polite" hidden></div>`;
@@ -44,6 +62,7 @@
   const box = root.querySelector(".window");
   const compact = root.querySelector(".compact");
   const panel = root.querySelector(".panel");
+  const header = root.querySelector(".header"), footer = root.querySelector(".footer");
   const pin = root.querySelector(".pin");
   const note = root.querySelector(".note");
   const list = root.querySelector(".groups");
@@ -59,11 +78,16 @@
   let filter = "";
   let lastRows = "";
   let actionError = "";
-  let expanded = false;
+  let expanded = side;
   let pinned = false;
   let hovered = false;
   let hoverTimer = null;
   let panelClock = null;
+  let position, groupMode = "dataagent", tabGroups = {};
+  let viewport = { width: innerWidth, height: innerHeight }, frameGeometryReady = !frame;
+  let lastSize = "", drag = null, dragFrame = 0, suppressClickUntil = 0, gestureSerial = 0;
+  let styled = false, prefsChanged = new Set(), toastLoaded = !toastOnly;
+  const groupButtons = [...root.querySelectorAll("[data-mode]")];
 
   document.documentElement.append(host);
   fetch(chrome.runtime.getURL("capsule.css")).then(response => {
@@ -73,9 +97,15 @@
     const style = new CSSStyleSheet();
     style.replaceSync(css);
     root.adoptedStyleSheets = [style];
-    box.hidden = false;
-    stack.hidden = false;
+    styled = true;
+    box.hidden = toastOnly;
+    stack.hidden = frame && !toastOnly || side;
     render();
+    if (frame) {
+      post({ type: "tp-frame-ready" });
+      layoutSurface();
+      if (toastOnly) void refreshToasts();
+    }
   }).catch(error => console.warn("TaskPulse:", error.message));
 
   function element(tag, className, value) {
@@ -117,7 +147,7 @@
   function explain(view) {
     if (actionError) return actionError;
     if (!state.at) return "等待首次采样…";
-    if (/HTTP (401|403)/.test(view.error)) return "请登录 DataAgent 后继续";
+    if (state.authBlocked || rules.authError(view.error)) return "请登录 DataAgent 后继续";
     if (view.error) return "取数暂时失败，显示上次快照";
     if (view.stale) return "取数暂未更新，显示上次快照";
     const uncertain = view.tasks.filter(task => task.uncertain).length;
@@ -149,7 +179,8 @@
   }
 
   function setExpanded(value) {
-    expanded = value;
+    if (toastOnly) return;
+    expanded = side || value;
     if (!value) actionError = "";
     clearTimeout(hoverTimer);
     render();
@@ -170,7 +201,7 @@
     const { id } = task;
     const revision = task.revision || rules.revision(task);
     try {
-      const result = await chrome.runtime.sendMessage({ kind, id, revision, ...fields });
+      const result = await request(kind, { id, revision, ...fields });
       if (result?.ok) return result;
     } catch { /* A worker restart or tab navigation can invalidate a pending action. */ }
     actionError = kind === "tp.open" ? "暂时无法打开此会话，请重试" : "任务状态已变化，请重试";
@@ -218,9 +249,9 @@
     const buckets = new Map();
     for (const task of [...tasks].sort((a, b) =>
       severity[taskStatus(b)] - severity[taskStatus(a)] || b.update - a.update)) {
-      const name = oneLine(task.group) || "未分组";
-      if (!buckets.has(name)) buckets.set(name, { name, tasks: [], active: 0, worst: "seen", matched: [] });
-      const group = buckets.get(name);
+      const identity = ui.groupFor(task, groupMode, tabGroups);
+      if (!buckets.has(identity.key)) buckets.set(identity.key, { ...identity, tasks: [], active: 0, worst: "seen", matched: [] });
+      const group = buckets.get(identity.key);
       group.tasks.push(task);
       if (task.uncertain || !severity[taskStatus(task)]) continue;
       group.active++;
@@ -230,7 +261,7 @@
     return [...buckets.values()].sort((a, b) => severity[b.worst] - severity[a.worst] || a.name.localeCompare(b.name));
   }
 
-  const isOpen = group => choices.get(group.name) ??
+  const isOpen = group => choices.get(group.key) ??
     (filter ? group.matched.length > 0 : severity[group.worst] > 1);
 
   function groupRow(group) {
@@ -239,7 +270,11 @@
     const box = element("section", "group " + (filter || group.worst) + (badge ? "" : " quiet"));
     const button = element("button", "group-head");
     button.type = "button";
-    button.dataset.group = group.name;
+    button.dataset.group = group.key;
+    if (group.color) {
+      button.classList.add("tab-group");
+      button.style.setProperty("--group-color", group.color);
+    }
     button.title = group.name;
     button.setAttribute("aria-expanded", String(open));
     const chars = Array.from(group.name);
@@ -248,7 +283,7 @@
     const line = element("i", "group-line");
     button.append(element("i", "chevron"), element("span", "group-name", title),
       element("span", "group-count", meta), element("span", "group-open", String(badge)), line);
-    button.addEventListener("click", () => { choices.set(group.name, !open); render(); });
+    button.addEventListener("click", () => { choices.set(group.key, !open); render(); });
     box.append(button);
     groupViews.push({ group, line });
     if (open) {
@@ -259,8 +294,8 @@
   }
 
   function drawRows(tasks, unavailable) {
-    const key = JSON.stringify([filter, [...choices], unavailable, tasks.map(task => [
-      rules.revision(task), task.group, task.name, task.status, task.uncertain,
+    const key = JSON.stringify([filter, groupMode, [...choices], unavailable, tasks.map(task => [
+      rules.revision(task), ui.groupFor(task, groupMode, tabGroups), task.name, task.status, task.uncertain,
       task.checkedRevision, task.uncertain ? task.observedAt : 0, task.runAt, task.phaseAt, task.failed, task.messageUncertain
     ])]);
     if (key === lastRows) return;
@@ -271,7 +306,7 @@
     groupViews = [];
     groups = makeGroups(tasks);
     const content = document.createDocumentFragment();
-    if (groups.length === 1 && groups[0].name === "未分组") {
+    if (groupMode === "dataagent" && groups.length === 1 && groups[0].name === "未分组") {
       for (const task of groups[0].tasks) content.append(taskRow(task));
     } else {
       for (const group of groups) content.append(groupRow(group));
@@ -304,8 +339,45 @@
     }
   }
 
+  function layoutSurface() {
+    if (!styled || host.hidden) return;
+    if (toastOnly) {
+      if (!toastLoaded) return;
+      const height = toasts.length ? 64 + (toasts.length - 1) * 44 : 0;
+      const key = "toast/" + height;
+      if (key !== lastSize) { lastSize = key; post({ type: "tp-frame-size", height }); }
+      return;
+    }
+    if (side || !frameGeometryReady) return;
+    const w = frame ? viewport.width : innerWidth, h = frame ? viewport.height : innerHeight;
+    // Measure natural row height, not the previously constrained scroll area.
+    // This lets the panel shrink on filter changes and prevents resize loops.
+    const naturalListHeight = 10 + [...list.children].reduce((sum, node, index) =>
+      sum + node.offsetHeight + (index && node.classList.contains("group") ? 4 : 0), 0);
+    const panelHeight = expanded ? header.offsetHeight + footer.offsetHeight + note.offsetHeight + naturalListHeight : 0;
+    const layout = ui.glassLayout(position, w, h, expanded, panelHeight);
+    compact.classList.toggle("dock-horizontal", layout.horizontal);
+    const setRect = (node, r) => {
+      if (r) Object.assign(node.style, { left: r.left + "px", top: r.top + "px",
+        width: r.width + "px", height: r.height + "px" });
+    };
+    setRect(compact, layout.capsule);
+    setRect(panel, layout.panel);
+    Object.assign(box.style, { left: (frame ? 0 : layout.left) + "px", top: (frame ? 0 : layout.top) + "px",
+      right: "auto", width: layout.width + "px", height: layout.height + "px" });
+    if (frame) {
+      const key = JSON.stringify([layout.width, layout.height, expanded, panelHeight]);
+      if (key !== lastSize) { lastSize = key; post({ type: "tp-frame-size", expanded, panelHeight }); }
+    }
+  }
+
   function render() {
-    host.hidden = !web.conversationPage(location.href);
+    host.hidden = native && !web.conversationPage(location.href);
+    if (toastOnly) { layoutSurface(); return; }
+    if (document.hidden || host.hidden) {
+      if (panelClock !== null) { clearInterval(panelClock); panelClock = null; }
+      return;
+    }
     const now = Date.now();
     const view = rules.view(state, now);
     const warning = explain(view);
@@ -322,8 +394,9 @@
       button.title = names[kind] + " · " + (view.stale ? "待更新" : value);
       button.setAttribute("aria-label", button.title);
     }
-    compact.hidden = expanded;
+    compact.hidden = side || expanded;
     panel.hidden = !expanded;
+    for (const button of groupButtons) button.setAttribute("aria-pressed", String(button.dataset.mode === groupMode));
     pin.setAttribute("aria-pressed", String(pinned));
     pin.title = pinned ? "已固定展开（点击取消）" : "固定展开";
     const clockWanted = expanded && !document.hidden && !host.hidden;
@@ -333,11 +406,14 @@
     } else if (clockWanted && panelClock === null) {
       panelClock = setInterval(() => updateTimes(Date.now()), 1_000);
     }
-    if (!expanded) return;
-    note.textContent = warning;
-    note.hidden = !warning;
+    if (!expanded) { layoutSurface(); return; }
+    const age = state.at ? now - state.at : 0;
+    const panelNote = warning || (age > 12_000 ? "数据 " + Math.round(age / 1000) + " 秒前" : "");
+    note.textContent = panelNote;
+    note.hidden = !panelNote;
     drawRows(view.tasks, view.stale);
     updateTimes(now);
+    layoutSurface();
   }
 
   for (const button of buttons) {
@@ -353,15 +429,22 @@
   const blank = root.querySelector(".header-blank");
   function toggleGroups() {
     const allClosed = groups.some(isOpen);
-    for (const group of groups) choices.set(group.name, !allClosed);
+    for (const group of groups) choices.set(group.key, !allClosed);
     render();
   }
-  blank.addEventListener("dblclick", toggleGroups);
+  blank.addEventListener("dblclick", event => { if (Date.now() >= suppressClickUntil) toggleGroups(); });
   blank.addEventListener("click", event => { if (event.detail === 0) toggleGroups(); });
+  for (const button of groupButtons) button.addEventListener("click", () => {
+    groupMode = button.dataset.mode === "tab" ? "tab" : "dataagent";
+    choices.clear(); lastRows = "";
+    void chrome.storage.local.set({ [ui.keys.grouping]: groupMode }).catch(() => {});
+    render();
+  });
+  root.querySelector(".settings").addEventListener("click", () => { void request("tp.settings").catch(() => {}); });
   pin.addEventListener("click", () => { savePin(!pinned); render(); });
   root.querySelector(".close").addEventListener("click", event => closePanel(event.detail === 0));
   box.addEventListener("pointerenter", event => {
-    if (event.pointerType === "touch") return;
+    if (event.pointerType === "touch" || drag || toastOnly || side) return;
     hovered = true;
     clearTimeout(hoverTimer);
     if (!expanded && !event.buttons) hoverTimer = setTimeout(() => setExpanded(true), 120);
@@ -369,10 +452,69 @@
   box.addEventListener("pointerleave", () => {
     hovered = false;
     clearTimeout(hoverTimer);
-    if (!pinned && expanded && !root.activeElement?.matches(":focus-visible")) {
+    if (!drag && !side && !pinned && expanded && !root.activeElement?.matches(":focus-visible")) {
       hoverTimer = setTimeout(() => setExpanded(false), 150);
     }
   });
+  // The cross-origin iframe moves during a drag. Chromium may transfer
+  // pointer events to its parent when its clipped hit region changes. Start
+  // the parent gesture on pointerdown, so it can continue the same drag.
+  box.addEventListener("pointerdown", event => {
+    if (event.button !== 0) return;
+    // A new deliberate click is not the synthetic click from a prior drag.
+    suppressClickUntil = 0;
+    if (side || toastOnly || drag || !event.target.closest(".compact,.horizontal,.header-blank")) return;
+    clearTimeout(hoverTimer);
+    drag = { pointer: event.pointerId, gesture: ++gestureSerial, x: event.screenX, y: event.screenY,
+      start: ui.normalized(position), dx: 0, dy: 0, moved: false, target: event.target };
+    if (frame) post({ type: "tp-frame-drag-start", gesture: drag.gesture, x: drag.x, y: drag.y });
+    try { event.target.setPointerCapture(event.pointerId); } catch {}
+  });
+  function applyDrag(done = false) {
+    if (!drag) return;
+    if (frame) {
+      post({ type: "tp-frame-drag", gesture: drag.gesture,
+        x: drag.x + drag.dx, y: drag.y + drag.dy, done });
+    } else if (drag.moved) {
+      position = ui.move(drag.start, drag.dx, drag.dy, innerWidth, innerHeight);
+      layoutSurface();
+      if (done) void chrome.storage.local.set({ [ui.keys.position]: position }).catch(() => {});
+    }
+  }
+  function measureDrag(event) {
+    drag.dx = event.screenX - drag.x; drag.dy = event.screenY - drag.y;
+    drag.moved ||= Math.hypot(drag.dx, drag.dy) >= 5;
+  }
+  function clearDrag(moved = false) {
+    if (dragFrame) cancelAnimationFrame(dragFrame);
+    dragFrame = 0;
+    if (moved || drag?.moved) suppressClickUntil = Date.now() + 350;
+    const previous = drag;
+    drag = null;
+    try {
+      if (previous?.target.hasPointerCapture(previous.pointer)) previous.target.releasePointerCapture(previous.pointer);
+    } catch {}
+  }
+  box.addEventListener("pointermove", event => {
+    if (!drag || event.pointerId !== drag.pointer) return;
+    measureDrag(event);
+    if (!drag.moved) return;
+    event.preventDefault();
+    if (!dragFrame) dragFrame = requestAnimationFrame(() => { dragFrame = 0; applyDrag(); });
+  });
+  function endDrag(event) {
+    if (!drag || event.pointerId !== drag.pointer) return;
+    if (event.type === "pointerup") measureDrag(event);
+    if (dragFrame) cancelAnimationFrame(dragFrame);
+    dragFrame = 0;
+    applyDrag(true);
+    clearDrag();
+  }
+  box.addEventListener("pointerup", endDrag);
+  box.addEventListener("pointercancel", endDrag);
+  root.addEventListener("click", event => {
+    if (Date.now() < suppressClickUntil) { event.preventDefault(); event.stopImmediatePropagation(); }
+  }, true);
   root.addEventListener("keydown", event => {
     if (event.key === "Escape" && expanded) {
       event.stopPropagation();
@@ -385,6 +527,7 @@
       button.style.setProperty("--index", index);
       button.style.zIndex = toasts.length - index;
     });
+    layoutSurface();
   }
 
   function removeToast(revision) {
@@ -396,7 +539,7 @@
     layoutToasts();
   }
 
-  function showToast(task) {
+  function showToast(task, duration = 15_000) {
     if (!web.id(task?.id) || !task.revision || toasts.some(item => item.revision === task.revision)) return;
     const title = oneLine(task.name);
     const button = element("button", "toast" + (task.failed ? " stuck" : ""));
@@ -412,11 +555,27 @@
         setTimeout(() => removeToast(task.revision), 110);
       }
     });
-    toasts.unshift({ id: task.id, revision: task.revision, button, timer: setTimeout(() => removeToast(task.revision), 15_000) });
+    toasts.unshift({ id: task.id, revision: task.revision, button, timer: setTimeout(() => removeToast(task.revision), Math.max(100, duration)) });
     if (toasts.length > 3) removeToast(toasts.at(-1).revision);
     stack.prepend(button);
     layoutToasts();
     fitText(body, title);
+  }
+
+  const toastSeen = new Set();
+  let toastRequest = 0;
+  async function refreshToasts() {
+    if (!toastOnly) return;
+    const generation = ++toastRequest;
+    const result = await request("tp.surface.toasts").catch(() => null);
+    if (generation !== toastRequest) return;
+    toastLoaded = true;
+    for (const task of [...(result?.tasks || [])].reverse()) {
+      if (toastSeen.has(task.revision)) continue;
+      toastSeen.add(task.revision);
+      showToast(task, result.remaining);
+    }
+    layoutSurface();
   }
 
   let stateChanged = false;
@@ -428,31 +587,49 @@
       state = changes[web.keys.state].newValue ?? rules.blank();
       for (const toast of [...toasts]) {
         const task = state.tasks[toast.id];
-        if (!task?.pending || rules.revision(task) !== toast.revision) removeToast(toast.revision);
+        if (!task?.pending || !rules.taskAccessible(state, task) || rules.revision(task) !== toast.revision) removeToast(toast.revision);
       }
     }
     if (changes[pinKey]) {
       pinChanged = true;
       pinned = changes[pinKey].newValue === true;
-      if (pinned || !hovered) expanded = pinned;
+      if (pinned || !hovered) expanded = side || pinned;
     }
-    if (changes[web.keys.state] || changes[pinKey]) render();
+    if (changes[ui.keys.position] || changes[ui.keys.grouping] || changes[ui.keys.tabGroups]) {
+      for (const key of [ui.keys.position, ui.keys.grouping, ui.keys.tabGroups]) if (changes[key]) prefsChanged.add(key);
+      if (changes[ui.keys.position] && !drag && !frame) position = changes[ui.keys.position].newValue;
+      if (changes[ui.keys.grouping]) {
+        groupMode = changes[ui.keys.grouping].newValue === "tab" ? "tab" : "dataagent";
+        choices.clear(); lastRows = "";
+      }
+      if (changes[ui.keys.tabGroups]) tabGroups = changes[ui.keys.tabGroups].newValue || {};
+    }
+    if (changes[web.keys.state] || changes[pinKey] || changes[ui.keys.position] ||
+        changes[ui.keys.grouping] || changes[ui.keys.tabGroups]) render();
   });
-  chrome.storage.local.get([web.keys.state, pinKey]).then(items => {
+  chrome.storage.local.get([web.keys.state, pinKey, ui.keys.position, ui.keys.grouping, ui.keys.tabGroups]).then(items => {
     if (!stateChanged) state = items[web.keys.state] ?? rules.blank();
     if (!pinChanged) {
       pinned = items[pinKey] === true;
       if (pinned) expanded = true;
     }
+    if (!frame && !prefsChanged.has(ui.keys.position)) position = items[ui.keys.position];
+    if (!prefsChanged.has(ui.keys.grouping)) groupMode = items[ui.keys.grouping] === "tab" ? "tab" : "dataagent";
+    if (!prefsChanged.has(ui.keys.tabGroups)) tabGroups = items[ui.keys.tabGroups] || {};
     render();
   }).catch(() => {});
   chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
-    if (msg?.kind === "tp.show") {
+    if (native && msg?.kind === "tp.route") {
+      render();
+      reply({ ok: true });
+      return false;
+    }
+    if (native && msg?.kind === "tp.show") {
       if (expanded) closePanel();
       else setExpanded(true);
       reply({ ok: true });
     }
-    if (msg?.kind === "tp.replies" && !document.hidden && web.conversationPage(location.href)) {
+    if (native && msg?.kind === "tp.replies" && !document.hidden && web.conversationPage(location.href)) {
       // Storage changes and worker messages can be delivered in either order.
       // Revalidate the exact reply before displaying a delayed toast.
       void chrome.storage.local.get(web.keys.state).then(items => {
@@ -460,7 +637,8 @@
         const saved = items[web.keys.state] ?? rules.blank();
         for (const task of msg.tasks ?? []) {
           const current = saved.tasks[task.id];
-          if (current?.pending && rules.revision(current) === task.revision) showToast(task);
+          if (current?.pending && rules.taskFresh(saved, current, Date.now()) && rules.canAcknowledge(current) &&
+              rules.revision(current) === task.revision) showToast(task);
         }
         reply({ ok: true });
       }).catch(() => reply({ ok: false }));
@@ -478,15 +656,36 @@
     lastVisitAt = Date.now();
     void chrome.runtime.sendMessage({ kind: "tp.visit", id, at: Date.now() }).catch(() => {});
   }
-  document.addEventListener("pointerdown", userVisit, true);
-  document.addEventListener("keydown", userVisit, true);
+  if (native) {
+    document.addEventListener("pointerdown", userVisit, true);
+    document.addEventListener("keydown", userVisit, true);
+  }
+  if (frame) window.addEventListener("message", event => {
+    if (event.source !== parent || event.origin !== attached.origin) return;
+    if (event.data?.type === "tp-host-drag-ended" && drag?.gesture === event.data.gesture)
+      clearDrag(event.data.moved === true);
+    if (event.data?.type === "tp-host-open" && !toastOnly) setExpanded(!expanded);
+    if (event.data?.type === "tp-host-refresh" && toastOnly) void refreshToasts();
+    if (event.data?.type === "tp-host-viewport" && !toastOnly) {
+      viewport = { width: Math.max(44, Math.min(10000, Number(event.data.width) || 240)),
+        height: Math.max(84, Math.min(10000, Number(event.data.height) || 600)) };
+      position = ui.normalized(event.data.position);
+      frameGeometryReady = true;
+      layoutSurface();
+    }
+  });
   document.addEventListener("visibilitychange", () => { if (alive()) render(); });
-  window.addEventListener("resize", () => { if (expanded) updateTimes(Date.now(), true); });
-  const clock = setInterval(() => {
+  window.addEventListener("resize", () => { if (expanded) updateTimes(Date.now(), true); layoutSurface(); });
+  if (!toastOnly && !side) {
+    const observer = new ResizeObserver(layoutSurface);
+    observer.observe(list);
+    observer.observe(note);
+  }
+  const clock = toastOnly ? null : setInterval(() => {
     if (!alive()) {
       clearInterval(clock);
       clearInterval(panelClock);
       host.remove();
     } else if (!document.hidden) render();
   }, 15_000);
-})();
+})().catch(error => console.warn("TaskPulse:", error?.message || error));

@@ -1,5 +1,5 @@
 // Manifest V3 service worker. Collection stays in one DataAgent tab.
-importScripts("config.js", "state.js");
+importScripts("config.js", "state.js", "ui-rules.js", "surface-worker.js");
 
 const web = globalThis.TaskPulseWeb;
 const rules = globalThis.TaskPulseState;
@@ -72,7 +72,9 @@ async function getLeader() {
 }
 
 const isPage = tab => web.conversationPage(tab?.url) !== null;
-const isReady = tab => isPage(tab) && tab.status === "complete" && (!tab.pendingUrl || tab.pendingUrl === tab.url) && !tab.discarded && !tab.frozen;
+const isUsable = tab => !!tab?.url && tab.status === "complete" &&
+  (!tab.pendingUrl || tab.pendingUrl === tab.url) && !tab.discarded && !tab.frozen;
+const isReady = tab => isPage(tab) && isUsable(tab);
 const pages = () => chrome.tabs.query({ url: web.match });
 
 async function signal(tabId, message) {
@@ -102,6 +104,16 @@ async function probe(tab) {
   }
 }
 
+async function markSourceUnavailable() {
+  const state = await getState();
+  if (!state.sourceUnavailable) {
+    state.sourceUnavailable = true;
+    state.revalidateAfter = Math.max(state.revalidateAfter || 0, Date.now());
+    await saveState(state);
+    await updateBadge(state);
+  }
+}
+
 async function syncLeader({ install = false, nudge = false } = {}) {
   const old = await getLeader();
   const candidates = (await pages()).filter(isReady);
@@ -112,7 +124,14 @@ async function syncLeader({ install = false, nudge = false } = {}) {
   }
 
   const current = candidates.find(tab => tab.id === old?.tabId);
-  if (current) {
+  const state = await getState();
+  const lastProgress = Math.max(old?.since || 0, Math.min(state.at || 0, state.listAt || 0));
+  // A content script can answer a probe while its background timers have
+  // stopped producing usable data. Prefer another ready page only once the
+  // existing source-stale window is exceeded; healthy sources never churn.
+  const stalled = Boolean(current && candidates.some(tab => tab.id !== current.id) &&
+    Date.now() - lastProgress > web.timing.sourceStale);
+  if (current && !stalled) {
     const answer = await probe(current);
     if (answer?.pageId === old.pageId) {
       if (answer.lease !== old.lease) {
@@ -125,17 +144,24 @@ async function syncLeader({ install = false, nudge = false } = {}) {
     }
   }
 
-  candidates.sort((a, b) => Number(b.active) - Number(a.active));
+  candidates.sort((a, b) =>
+    (stalled ? Number(a.id === current.id) - Number(b.id === current.id) : 0) ||
+    Number(b.active) - Number(a.active));
+  // Fence cached evidence before granting any replacement lease.
+  await markSourceUnavailable();
   for (const tab of candidates) {
     const answer = await probe(tab);
     if (!answer?.pageId) continue;
-    const next = { tabId: tab.id, pageId: answer.pageId, lease: crypto.randomUUID() };
+    const next = { tabId: tab.id, pageId: answer.pageId, lease: crypto.randomUUID(), since: Date.now() };
     await chrome.storage.session.set({ [web.keys.leader]: next });
     if (old) await signal(old.tabId, { kind: "tp.role", pageId: old.pageId, lease: "" });
     const accepted = await signal(tab.id, { kind: "tp.role", pageId: next.pageId, lease: next.lease });
     if (accepted?.pageId === next.pageId) return;
+    // A timed-out role response may still have started a collector.
+    await signal(tab.id, { kind: "tp.role", pageId: next.pageId, lease: "" });
   }
   await chrome.storage.session.remove(web.keys.leader);
+  if (old) await signal(old.tabId, { kind: "tp.role", pageId: old.pageId, lease: "" });
 }
 
 let refreshTimer = null;
@@ -147,7 +173,7 @@ function refreshLeader() {
   }, 80);
 }
 
-async function foregroundPage() {
+async function foregroundTab() {
   // Activation events caused by a valid navigation may arrive during an API
   // query. Retry once if the event epoch changed; never accept a stale snapshot.
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -155,15 +181,85 @@ async function foregroundPage() {
     const win = await chrome.windows.getLastFocused({}).catch(() => null);
     if (!win?.focused || !Number.isInteger(win.id) || win.id < 0) return null;
     const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
-    if (!isReady(tab) || tab.active !== true || tab.windowId !== win.id) return null;
+    if (!isUsable(tab) || tab.active !== true || tab.windowId !== win.id) return null;
     const actual = await chrome.tabs.get(tab.id).catch(() => null);
     const confirm = await chrome.windows.getLastFocused({}).catch(() => null);
     if (epoch !== focusEpoch) continue;
     if (!confirm?.focused || confirm.id !== win.id ||
-        !isReady(actual) || !actual.active || actual.windowId !== win.id || actual.url !== tab.url) return null;
+        !isUsable(actual) || !actual.active || actual.windowId !== win.id || actual.url !== tab.url) return null;
     return actual;
   }
   return null;
+}
+
+async function foregroundPage() {
+  const tab = await foregroundTab();
+  return isReady(tab) ? tab : null;
+}
+
+// Hidden DataAgent pages can be throttled. During verified active work only,
+// the MV3 worker asks the same collector to run its existing due-work queue.
+// No second collector, no new permissions and no artificial keepalive.
+let fastWakeTimer = null, fastWakeLeader = null, fastWakeUntil = 0;
+let hiddenCollector = false, activityUntil = 0;
+function stopFastWake() {
+  if (fastWakeTimer !== null) clearTimeout(fastWakeTimer);
+  fastWakeTimer = null;
+  fastWakeLeader = null;
+  fastWakeUntil = 0;
+}
+function armFastWake() {
+  if (fastWakeTimer !== null || !fastWakeLeader || Date.now() >= fastWakeUntil) return;
+  fastWakeTimer = setTimeout(async () => {
+    fastWakeTimer = null;
+    const expected = fastWakeLeader;
+    try {
+      const current = await getLeader();
+      if (!expected || current?.lease !== expected.lease || Date.now() >= fastWakeUntil) {
+        stopFastWake();
+        return;
+      }
+      const answer = await signal(current.tabId, { kind: "tp.nudge", pageId: current.pageId });
+      if (!answer?.pageId) { stopFastWake(); refreshLeader(); return; }
+    } catch { stopFastWake(); return; }
+    armFastWake();
+  }, web.timing.hot);
+}
+function updateFastWake(leader, state, hidden) {
+  hiddenCollector = hidden === true;
+  const active = !state.error && !state.sourceUnavailable && Object.values(state.tasks).some(task =>
+    !task.accessDeniedAt && (task.runAt || task.awaitingReply) &&
+    (!task.settleUntil || Date.now() <= task.settleUntil));
+  if (!hiddenCollector || (!active && activityUntil <= Date.now())) { stopFastWake(); return; }
+  fastWakeLeader = leader;
+  fastWakeUntil = active ? Math.min(Date.now() + web.timing.sourceStale,
+    state.at + web.timing.sourceStale) : activityUntil;
+  armFastWake();
+}
+async function relayActivity(msg, sender) {
+  const actual = await chrome.tabs.get(sender.tab.id).catch(() => null);
+  if (!isReady(actual)) return { ok: false };
+  const leader = await getLeader();
+  if (!leader) { refreshLeader(); return { ok: true }; }
+  const cid = web.conversationId(actual.url);
+  activityUntil = Date.now() + web.timing.hotWindow;
+  if (leader.tabId !== sender.tab.id || msg.route === true)
+    await signal(leader.tabId, { kind: "tp.nudge", pageId: leader.pageId, activity: true, cid });
+  if (hiddenCollector) {
+    fastWakeLeader = leader;
+    fastWakeUntil = Math.max(fastWakeUntil, activityUntil);
+    armFastWake();
+  }
+  return { ok: true };
+}
+
+async function collectorVisibility(msg, sender) {
+  const leader = await getLeader();
+  if (!leader || leader.tabId !== sender.tab.id || leader.pageId !== msg.pageId || leader.lease !== msg.lease)
+    return { ok: false };
+  const state = await getState();
+  updateFastWake(leader, state, msg.hidden);
+  return { ok: true };
 }
 
 function matchesConversation(tab, cid, agentId) {
@@ -186,10 +282,7 @@ function activeConversation(state, tab) {
 }
 
 function freshTask(state, task, now = Date.now()) {
-  return !state.error && state.at && now - state.at <= web.timing.sourceStale &&
-    state.listAt && now - state.listAt <= web.timing.sourceStale &&
-    task && task.listedAt === state.listAt && !task.listUncertain && !task.queueError && task.observedAt &&
-    now - task.observedAt <= web.timing.queueStale;
+  return rules.taskFresh(state, task, now);
 }
 
 function canAutoRead(state, task, manual = false) {
@@ -232,6 +325,11 @@ async function clearReadNotices(state) {
     const revision = key.slice(REPLY_NOTICE.length);
     const [id, agentId, update, replyKey] = revision.split("/");
     const task = state.tasks[id];
+    // Explicit login loss and unverified retained rows must not expose
+    // prior account titles through system notifications. Preserve the
+    // pending watermark/outbox; do not mark the task read.
+    if (state.authBlocked || rules.authError(state.error)) return true;
+    if (task && !rules.taskAccessible(state, task)) return true;
     if (!task || task.agentId !== agentId ||
         task.pending && rules.revision(task) === revision) return false;
     // Existing 2.1.1 storage may have a confirmed read watermark but no
@@ -334,6 +432,13 @@ async function acceptReport(msg, sender) {
   if (!leader || leader.tabId !== sender.tab.id || leader.pageId !== msg.pageId || leader.lease !== msg.lease) {
     return { ok: false };
   }
+  // The sender snapshot may predate a navigation or removal of its tab.
+  const actual = await chrome.tabs.get(sender.tab.id).catch(() => null);
+  if (!isReady(actual)) {
+    await markSourceUnavailable();
+    refreshLeader();
+    return { ok: false };
+  }
   const state = await getState();
   await jumpReady;
   // First absorb observations without guessing which page will remain focused.
@@ -346,21 +451,31 @@ async function acceptReport(msg, sender) {
     // pruneOutbox removes read, replaced or expired-history tasks.
     pruneOutbox(next);
     await saveState(next);
+    updateFastWake(leader, next, msg.payload.hidden);
     await syncNotices(next);
-    const currentPage = await foregroundPage();
-    const pendingReplies = replies.filter(task => noticeTask(next, rules.revision(task)));
-    if (currentPage && pendingReplies.length) await signal(currentPage.id, {
+    const pendingReplies = replies.filter(task => {
+      const current = noticeTask(next, rules.revision(task));
+      return freshTask(next, current) && rules.canAcknowledge(current);
+    });
+    const currentPage = pendingReplies.length ? await foregroundTab() : null;
+    if (currentPage && isPage(currentPage)) await signal(currentPage.id, {
       kind: "tp.replies",
       tasks: pendingReplies.slice(0, 3).reverse().map(task => ({
         id: task.id, name: task.name, revision: rules.revision(task), failed: task.failed
       }))
     });
+    else if (currentPage) await surfaces.notify(currentPage, pendingReplies).catch(info);
   }
   return { ok: true };
 }
 
 async function markVisited(tabId, windowId) {
   const state = await getState();
+  if (tabId !== undefined && (state.sourceUnavailable || !state.at ||
+      Date.now() - Math.min(state.at || 0, state.listAt || 0) > web.timing.sourceStale)) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (isReady(tab)) refreshLeader();
+  }
   if (!await readForeground(state, tabId, windowId, true)) return;
   pruneOutbox(state);
   await saveState(state);
@@ -453,7 +568,8 @@ async function openTask(id, revision, allowSavedId = false, intent = "row") {
     await jumpReady;
     const state = await getState();
     const task = state.tasks[id];
-    if (!task && !allowSavedId) return { ok: false };
+    if (state.authBlocked || rules.authError(state.error) ||
+        task && !rules.taskAccessible(state, task) || !task && !allowSavedId) return { ok: false };
     const agentId = web.id(revision.split("/")[1]) || task?.agentId;
     const landing = await focusConversation(id, agentId, revision);
     if (!landing) return { ok: false };
@@ -465,7 +581,8 @@ async function openTask(id, revision, allowSavedId = false, intent = "row") {
       // before committing a read; focus or route may have changed meanwhile.
       const actual = await foregroundPage();
       if (actual?.id !== tabId || !matchesConversation(actual, id, agentId) ||
-          jumpTabs.get(tabId)?.token !== guard.token || /HTTP (401|403)/.test(fresh.error)) {
+          jumpTabs.get(tabId)?.token !== guard.token || fresh.authBlocked || rules.authError(fresh.error) ||
+          current && !rules.taskAccessible(fresh, current)) {
         await abandonJump(tabId, guard, previous);
         return { ok: false, clearNotice: false };
       }
@@ -539,14 +656,36 @@ function senderIsPage(sender) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-  if (!msg || !senderIsPage(sender)) return false;
+  if (!msg || sender.id !== chrome.runtime.id) return false;
   let reply;
+  const page = senderIsPage(sender);
+  if (msg.kind === "tp.surface.register" && surfaces.topSender(sender)) reply = surfaces.register(sender);
+  else if (surfaces.candidate(sender)) {
+    if (msg.kind === "tp.surface.attach") reply = surfaces.attach(sender, msg.token);
+    else if (msg.kind === "tp.surface.toasts") reply = surfaces.toastData(sender, msg.token);
+    else if (["tp.open", "tp.check", "tp.settings"].includes(msg.kind)) {
+      reply = surfaces.validate(sender, msg.token).then(allowed => {
+        if (!allowed) return { ok: false };
+        if (msg.kind === "tp.open") return openTask(msg.id, msg.revision, false, msg.intent);
+        if (msg.kind === "tp.check") return serialize(() => markChecked(msg.id, msg.revision, msg.checked));
+        return chrome.runtime.openOptionsPage().then(() => ({ ok: true }));
+      });
+    }
+  }
+  if (!page) {
+    if (!reply) return false;
+    reply.then(respond, error => { info(error); respond({ ok: false }); });
+    return true;
+  }
   if (msg.kind === "tp.ready") {
     refreshLeader();
     respond({ ok: true });
     return false;
   }
   if (msg.kind === "tp.webstate") reply = serialize(() => acceptReport(msg, sender));
+  if (msg.kind === "tp.activity") reply = relayActivity(msg, sender);
+  if (msg.kind === "tp.visibility") reply = collectorVisibility(msg, sender);
+  if (msg.kind === "tp.settings") reply = chrome.runtime.openOptionsPage().then(() => ({ ok: true }));
   if (msg.kind === "tp.open") reply = openTask(msg.id, msg.revision, false, msg.intent);
   if (msg.kind === "tp.check") reply = serialize(() => markChecked(msg.id, msg.revision, msg.checked));
   if (msg.kind === "tp.visit" && !opening.has(msg.id)) {
@@ -601,13 +740,14 @@ function wake(install = false) {
   }).catch(() => {});
 }
 
-chrome.runtime.onInstalled.addListener(() => wake(true));
-chrome.runtime.onStartup.addListener(() => wake());
+chrome.runtime.onInstalled.addListener(() => { wake(true); surfaces.install(); });
+chrome.runtime.onStartup.addListener(() => { wake(); surfaces.install(); });
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === ALARM) wake();
 });
 
 chrome.tabs.onUpdated.addListener((id, change) => {
+  if (change.groupId !== undefined || change.url || change.status === "complete") surfaces.scheduleGroups();
   if (!(change.url || change.discarded !== undefined || change.frozen !== undefined || change.status === "complete")) return;
   focusEpoch++;
   void (async () => {
@@ -617,11 +757,16 @@ chrome.tabs.onUpdated.addListener((id, change) => {
     const tab = await chrome.tabs.get(id).catch(() => null);
     if (!tab) return;
     const cid = web.conversationId(tab.url);
+    if (change.url && tab.active) {
+      void signal(tab.id, { kind: "tp.route" }).catch(info);
+      if (!isPage(tab)) surfaces.activate(id);
+    }
     if ((change.url || change.status === "complete") && jumpTabs.has(id) &&
         jumpTabs.get(id)?.cid !== cid && tab.status === "complete" && tab.url !== "about:blank" &&
         (!tab.pendingUrl || tab.pendingUrl === tab.url)) await forgetJump(id, true);
     if (isPage(tab)) {
       refreshLeader();
+      if (change.url && tab.active) void relayActivity({ route: true }, { tab }).catch(() => {});
       if (tab.active && !jumpTabs.has(id) && !opening.has(cid) && (change.url || change.status === "complete")) {
         await serialize(() => markVisited(id, tab.windowId));
       }
@@ -635,6 +780,7 @@ chrome.tabs.onRemoved.addListener(id => {
 });
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   focusEpoch++;
+  surfaces.activate(tabId);
   void (async () => {
     await jumpReady;
     // A genuine switch away releases the previous tab's versioned protection.
@@ -668,7 +814,14 @@ chrome.windows.onFocusChanged.addListener(windowId => {
 });
 
 chrome.action.onClicked.addListener(tab => {
+  // Browser-protected pages cannot host content scripts. Opening a native
+  // side panel must occur directly inside the user's toolbar gesture.
+  if (!isPage(tab) && chrome.sidePanel?.open && Number.isInteger(tab.windowId)) {
+    void chrome.sidePanel.open({ windowId: tab.windowId }).catch(info);
+    return;
+  }
   void (async () => {
+    if (!isPage(tab) && await surfaces.toolbar(tab)) return;
     const candidates = isReady(tab) ? [tab] : await pages();
     const target = candidates.find(isReady) ?? (isPage(tab) ? tab : candidates.find(isPage));
     if (!target) {
@@ -682,3 +835,6 @@ chrome.action.onClicked.addListener(tab => {
     }
   })().catch(info);
 });
+
+// Instantiate last: keep the original listener order for navigation and tests.
+const surfaces = globalThis.TaskPulseSurfaceWorker.create({ web, rules, signal, getState });

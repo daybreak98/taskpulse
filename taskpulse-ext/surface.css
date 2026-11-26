@@ -1,0 +1,3 @@
+/* Keep the embedded document and iframe on the same light color scheme.
+   The UI paints its own dark glass; the browser must not paint a canvas. */
+:root, html, body { margin: 0; width: 100%; height: 100%; background: transparent !important; color-scheme: light; overflow: hidden; }
