@@ -691,14 +691,20 @@
   });
   // A real interaction with the DataAgent page (not the capsule) is an
   // independent visit after an old notification landed on this conversation.
-  let lastVisitAt = 0;
+  let lastVisitAt = 0, lastVisitKey = "";
   function userVisit(event) {
     if (!event.isTrusted || document.hidden || !document.hasFocus() ||
-        event.composedPath().includes(host) || Date.now() - lastVisitAt < 2_000) return;
+        event.composedPath().includes(host)) return;
     const id = web.conversationId(location.href);
     if (!id) return;
-    lastVisitAt = Date.now();
-    void chrome.runtime.sendMessage({ kind: "tp.visit", id, at: Date.now() }).catch(() => {});
+    const task = state.tasks[id];
+    const key = id + "/" + (task ? rules.revision(task) : "");
+    const now = Date.now();
+    // Debounce repeated input for the same reply, never a newer reply version.
+    if (key === lastVisitKey && now - lastVisitAt < 2_000) return;
+    lastVisitAt = now;
+    lastVisitKey = key;
+    void chrome.runtime.sendMessage({ kind: "tp.visit", id, at: now }).catch(() => {});
   }
   if (native) {
     document.addEventListener("pointerdown", userVisit, true);
