@@ -68,6 +68,7 @@
   const list = root.querySelector(".groups");
   const stack = root.querySelector(".toast-stack");
   const buttons = [...root.querySelectorAll("[data-filter]")];
+  const counters = [...root.querySelectorAll(".capsule")];
   const choices = new Map();
   const toasts = [];
   const textMeasure = document.createElement("canvas").getContext("2d");
@@ -382,6 +383,8 @@
     const view = rules.view(state, now);
     const warning = explain(view);
     compact.classList.toggle("alerting", Boolean(warning));
+    const allZero = !view.stale && kinds.every(kind => view.counts[kind] === 0);
+    for (const counter of counters) counter.classList.toggle("all-zero", allZero);
     for (const button of buttons) {
       const kind = button.dataset.filter;
       const count = view.counts[kind];
