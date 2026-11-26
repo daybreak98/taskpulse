@@ -173,16 +173,16 @@ async function trial() {
       } finally { clone.remove(); }
     });
     assert.deepEqual(palette.zero.map(p => p.base), ["59 119 156", "148 126 83", "86 117 137"]);
-    assert.deepEqual(palette.active.map(p => p.base), ["63 140 187", "167 150 102", "105 145 165"]);
+    assert.deepEqual(palette.active.map(p => p.base), ["65 151 204", "194 150 61", "111 154 177"]);
     assert.equal(new Set(palette.zero.map(p => p.base)).size, 3);
     const brightness = color => color.split(" ").map(Number).reduce((sum, channel, i) => sum + channel * [0.2126, 0.7152, 0.0722][i], 0);
     for (let i = 0; i < 3; i++) {
-      assert.ok(brightness(palette.active[i].light) > brightness(palette.zero[i].light));
+      assert.ok(brightness(palette.active[i].light) - brightness(palette.zero[i].light) >= 45);
       assert.deepEqual(palette.selected[i].map(p => p.base), palette.active.map(p => p.base));
-      assert.deepEqual(palette.selected[i].map(p => p.selection), [0, 1, 2].map(j => j === i ? ".16" : "0"));
+      assert.deepEqual(palette.selected[i].map(p => p.selection), [0, 1, 2].map(j => j === i ? ".42" : "0"));
     }
     assert.deepEqual(palette.selectedZero.map(p => p.base), palette.zero.map(p => p.base));
-    assert.equal(palette.selectedZero[2].selection, ".16");
+    assert.equal(palette.selectedZero[2].selection, ".42");
     assert.deepEqual((await readPalette(compact)).map(p => p.base),
       [palette.active[0].base, palette.zero[1].base, palette.zero[2].base]);
     console.log("Reference capsule palette: zero, active and selected states retain all three segment hues");
@@ -307,7 +307,7 @@ async function trial() {
     assert.equal(await attention.getAttribute("aria-pressed"), "true");
     const selectedPalette = await readPalette(horizontal);
     assert.deepEqual(selectedPalette.map(p => p.base), palette.zero.map(p => p.base));
-    assert.deepEqual(selectedPalette.map(p => p.selection), ["0", ".16", "0"]);
+    assert.deepEqual(selectedPalette.map(p => p.selection), ["0", ".42", "0"]);
     assert.equal(await horizontal.locator(".dimmed").count(), 2);
     await attention.click();
     if (await group.getAttribute("aria-expanded") === "false") await group.click();
