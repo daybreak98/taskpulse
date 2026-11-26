@@ -129,10 +129,9 @@ async function trial() {
   try {
     const extension = await installFixtureCopy(dir, origin);
     // Fault injection is confined to this disposable extension copy.
-    // First registration returns synchronously without a result; the next
-    // rejects asynchronously, then an authenticated frame never completes
-    // rendering. Keep the synchronous case: it exposed the latched promise.
-    // Each independent failure scenario must recover on its own.
+    // Two independent scenarios: registration fails synchronously or
+    // asynchronously, then the first authenticated frame never completes
+    // rendering. The synchronous case exposed the latched promise.
     const hostPath = path.join(extension, "surface-host.js");
     const hostSource = await fs.readFile(hostPath, "utf8");
     const regAnchor = 'const result = await chrome.runtime.sendMessage({ kind: "tp.surface.register" }).catch(() => null);';

@@ -1837,7 +1837,7 @@ test("historical user-message backfill never reopens a dismissed conversation, i
   const original = currentTask(app);
   const version = rules.displayVersion(original);
   assert.equal((await app.send({ kind: "tp.dismiss", id, version })).ok, true);
-  const saved = structuredClone(app.local.data[web.keys.state]);
+  const saved = structuredClone(app.local.data);
   assert.equal(currentTask(app).dismissedAt, now);
   const restarted = worker({ local: saved, session: app.session.data });
   for (const [delta, userId, atMessage] of [
