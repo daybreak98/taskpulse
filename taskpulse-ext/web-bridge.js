@@ -430,9 +430,10 @@
         for (let index = 0; index < due.length; index++) {
           const { row, sample } = due[index];
           if (token !== lease || generation !== leaseGeneration || deadline - Date.now() < 250 || !budgetAvailable()) break;
-          // A cold audit normally needs a queue AND a message read.
-          // Reserve both slots so it cannot repeatedly skip its message audit.
-          if (cold(row, sample) && !isHot(row, sample, Date.now()) && !budgetAvailable(Date.now(), 2)) break;
+          // Any queue can turn idle. Reserve the accompanying message slot
+          // before beginning, including first discovery; otherwise a row
+          // aligned with the periodic list could miss every message audit.
+          if (!budgetAvailable(Date.now(), 2)) break;
           const wasBusy = TaskPulseState.queueBusy(sample.queue) === true;
           if (await pullQueue(row, sample, deadline) && token === lease && generation === leaseGeneration &&
               TaskPulseState.queueBusy(sample.queue) === false) {
