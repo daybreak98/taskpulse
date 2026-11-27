@@ -19,7 +19,7 @@ async function startFixture() {
   let updated = seed, working = true, lastReply = seed, pendingReply = seed, replyReadyAt = 0;
   let lastFailed = false, pendingFailed = false, queueFault = false, listFault = false;
   let queueDenied = false, listRegression = false;
-  let account = "a";
+  let account = "a", rateLimited = false, rateLimitHits = 0;
   const alternate = { id: 21, agentId: 515, name: "合成账号 B 的会话" };
   const expired = { id: 22, agentId: 515, name: "25 小时前的会话" };
   const completed = { id: 23, agentId: 515, name: "已查看的近期会话" };
@@ -49,6 +49,11 @@ async function startFixture() {
       return;
     }
     requests.push({ path: url.pathname, from: request.headers.referer || "" });
+    if (rateLimited) {
+      rateLimitHits++;
+      response.writeHead(429, { "Retry-After": "90" }).end();
+      return;
+    }
     if (account === "logout" ||
         account === "b" && !url.pathname.endsWith("/list") &&
           !["21", "22", "23"].some(id => url.pathname.includes("/" + id + "/"))) {
@@ -108,7 +113,9 @@ async function startFixture() {
     setListFault: value => { listFault = value; },
     setQueueDenied: value => { queueDenied = value; },
     setListRegression: value => { listRegression = value; },
-    setAccount: value => { account = value; }
+    setAccount: value => { account = value; },
+    setRateLimited: value => { rateLimited = value; },
+    rateLimitHits: () => rateLimitHits
   };
 }
 
@@ -128,7 +135,10 @@ async function installFixtureCopy(dir, origin) {
   const ui = (await fs.readFile(uiPath, "utf8")).replace('const origins = ["http://*/*", "https://*/*"];',
     'const origins = ["http://127.0.0.1/*", "http://localhost/*"];');
   const config = (await fs.readFile(configPath, "utf8")).replace(production, origin)
-    .replace('const match = page.href + "*";', 'const match = page.origin.replace(/:[0-9]+$/, "") + page.pathname + "*";');
+    .replace('const match = page.href + "*";', 'const match = page.origin.replace(/:[0-9]+$/, "") + page.pathname + "*";')
+    // Shorten default pauses ONLY in this disposable fixture for the older
+    // transient-failure scenarios. Dedicated 429 still honors 90s.
+    .replace("pressureBase: 30_000, pressureMax: 300_000", "pressureBase: 1_000, pressureMax: 4_000");
   await Promise.all([fs.writeFile(manifestPath, JSON.stringify(manifest)), fs.writeFile(configPath, config), fs.writeFile(uiPath, ui)]);
   return destination;
 }
@@ -320,6 +330,41 @@ async function trial() {
     const listReads = () => fixture.requests.filter(r => r.path.endsWith("/list")).length;
     const other = monitor(await context.newPage());
     await other.goto(existing);
+    {
+      // Native reads on the non-leader page, not made by the extension.
+      const readNativeProbe = () => worker.evaluate(async url => {
+        const tab = (await chrome.tabs.query({})).find(t => t.url === url);
+        return tab && chrome.tabs.sendMessage(tab.id, { kind: "tp.probe" }, { frameId: 0 }).catch(() => null);
+      }, existing);
+      let nativeProbe;
+      for (let i = 0; i < 40; i++) {
+        nativeProbe = await readNativeProbe();
+        if (nativeProbe?.nativeObservation?.supported) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      assert.ok(nativeProbe?.nativeObservation?.supported, "Resource Timing observer was not installed");
+      assert.equal(nativeProbe.lease, "", "native page unexpectedly owns a collector lease");
+      await other.evaluate(async () => {
+        await (await fetch("/rest/flow/api/v1/conversations/11/queue", { cache: "no-store" })).json();
+        await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open("GET", "/rest/flow/api/v1/conversations/11/messages?pageNo=1&pageSize=1");
+          xhr.onload = resolve; xhr.onerror = reject; xhr.send();
+        });
+      });
+      for (let i = 0; i < 40; i++) {
+        nativeProbe = await readNativeProbe();
+        const o = nativeProbe?.nativeObservation;
+        if (o && o.native.queue + o.unknownStatus.queue >= 1 &&
+            o.native.messages + o.unknownStatus.messages >= 1) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      const nativeStats = nativeProbe.nativeObservation;
+      assert.ok(nativeStats.native.queue + nativeStats.unknownStatus.queue >= 1);
+      assert.ok(nativeStats.native.messages + nativeStats.unknownStatus.messages >= 1);
+      assert.deepEqual(nativeStats.own, { list: 0, queue: 0, messages: 0 });
+      console.log("Native resource timing (synthetic page, no extra observer requests):", JSON.stringify(nativeStats));
+    }
     await page.bringToFront();
     const group = panel.locator(".group-head").filter({ hasText: "数据质量" });
     await group.click();
@@ -891,6 +936,31 @@ async function trial() {
     await external2.bringToFront();
     await external2.locator("#taskpulse-global-host").waitFor({ state: "detached" });
     console.log("Global permission preference off removes ordinary-site surfaces");
+    {
+      fixture.setRateLimited(true);
+      await nudgePrimary();
+      const paused = await waitState(s => fixture.rateLimitHits() > 0 &&
+        s?.pressureUntil >= Date.now() + 85_000, "server Retry-After persisted");
+      const count = fixture.requests.length;
+      assert.equal(fixture.rateLimitHits(), 1);
+      await nudgePrimary();
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      assert.equal(fixture.requests.length, count);
+      const retired = await currentLeader();
+      await worker.evaluate(id => chrome.tabs.remove(id), retired.tabId);
+      let pressureSuccessor;
+      for (let i = 0; i < 80; i++) {
+        pressureSuccessor = await currentLeader();
+        if (pressureSuccessor?.tabId && pressureSuccessor.tabId !== retired.tabId) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      assert.ok(pressureSuccessor?.tabId && pressureSuccessor.tabId !== retired.tabId, "collector handoff not exercised");
+      await nudgePrimary();
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      assert.equal(fixture.requests.length, count, "handoff bypassed server Retry-After");
+      assert.ok((await readState()).pressureUntil >= paused.pressureUntil);
+      console.log("Server 429 stopped all endpoint requests and survived actual tab handoff");
+    }
   } catch (error) {
     console.error("Fixture pages:", context?.pages().map(page => page.url()));
     const worker = context?.serviceWorkers()[0];

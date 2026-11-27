@@ -27,6 +27,7 @@
         "config.js",
         "state.js",
         "ui-rules.js",
+        "native-observer.js",
         "web-bridge.js",
         "capsule.js"
       ],

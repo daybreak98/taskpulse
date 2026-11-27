@@ -39,32 +39,94 @@
   let roundTimerDelay = 0;
   let lastUrl = location.href;
   const requestTimes = [];
-  function budgetAvailable(now = Date.now()) {
+  let pressureUntil = 0, pressureLevel = 0, pressureAt = 0, failureStreak = 0;
+  const native = globalThis.TaskPulseNative?.observe(web);
+  function budgetAvailable(now = Date.now(), slots = 1) {
+    if (now < pressureUntil) return false;
     while (requestTimes.length && now - requestTimes[0] >= timing.budgetWindow) requestTimes.shift();
-    return requestTimes.length < timing.requestBurst;
+    return requestTimes.length + slots <= timing.requestBurst;
+  }
+
+  function retryAfter(response, now) {
+    const raw = response?.headers?.get?.("Retry-After");
+    if (!raw?.trim()) return 0;
+    const value = raw.trim(), seconds = Number(value);
+    const until = /^\d+(\.\d+)?$/.test(value) && Number.isFinite(seconds) ?
+      now + Math.ceil(seconds * 1000) : Date.parse(value);
+    return Number.isSafeInteger(until) && until > now ? until : 0;
+  }
+
+  async function pauseAll(response) {
+    const at = Date.now();
+    if (at - pressureAt > 10 * 60_000) pressureLevel = 0;
+    const delay = Math.min(timing.pressureMax, timing.pressureBase * 2 ** pressureLevel);
+    pressureLevel = Math.min(pressureLevel + 1, 4);
+    pressureAt = at;
+    pressureUntil = Math.max(pressureUntil, retryAfter(response, at),
+      at + delay + Math.floor(Math.random() * delay * .2));
+    failureStreak = 0;
+    dirty = urgent = true;
+    // Save the shared pause immediately, independently of report throttling.
+    // The worker validates the current lease before accepting it.
+    try {
+      const result = await chrome.runtime.sendMessage({ kind: "tp.pressure", pageId, lease,
+        at, until: pressureUntil, level: pressureLevel });
+      if (result?.ok && Number.isSafeInteger(result.until))
+        pressureUntil = Math.max(pressureUntil, result.until);
+    } catch { /* Local pause still applies if the worker is unavailable. */ }
   }
 
   async function fetchInfo(path, deadline, init = {}) {
     const remaining = deadline - Date.now();
     const token = lease, generation = leaseGeneration;
-    if (remaining <= 0 || !token) throw new Error("已暂停采集");
+    if (remaining <= 0 || !token || !budgetAvailable()) throw new Error("已暂停采集");
     requestTimes.push(Date.now());
+    const url = new URL(path, location.origin);
+    const finishOwn = native?.startOwn(url.href);
     const controller = new AbortController();
     request = controller;
-    const timeout = setTimeout(() => controller.abort(), Math.min(remaining, timing.request));
+    let timedOut = false, received = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, Math.min(remaining, timing.request));
     try {
-      const response = await fetch(new URL(path, location.origin), {
+      const response = await fetch(url, {
         ...init, credentials: "same-origin", cache: "no-store",
         redirect: "error", signal: controller.signal
       });
-      if (!response.ok) throw Object.assign(new Error("HTTP " + response.status), { httpStatus: response.status });
+      received = true;
+      if (token !== lease || generation !== leaseGeneration) throw new Error("采集租约已变更");
+      if (!response.ok) {
+        // Explicit throttling is global; an isolated 503 may only affect
+        // one conversation. Consecutive 5xx failures also stop the source.
+        if (response.status === 429 || response.status === 503 && retryAfter(response, Date.now())) {
+          clearTimeout(timeout);
+          await pauseAll(response);
+        } else if (response.status >= 500 && ++failureStreak >= 2) {
+          clearTimeout(timeout);
+          await pauseAll(response);
+        }
+        else if (response.status < 500) failureStreak = 0;
+        throw Object.assign(new Error("HTTP " + response.status), { httpStatus: response.status });
+      }
       const data = await response.json();
       if (token !== lease || generation !== leaseGeneration) throw new Error("采集租约已变更");
       if (!data?.data || typeof data.data !== "object" || data.success === false || data.error_msg) {
+        // Endpoint-level errors only; do not confuse reply text with an
+        // overloaded status endpoint.
+        if (typeof data?.error_msg === "string" &&
+            /服务繁忙|请求过于频繁|too many requests|rate limit|tpm limit/i.test(data.error_msg)) {
+          clearTimeout(timeout);
+          await pauseAll(response);
+        }
         throw new Error("DataAgent 返回无效数据");
       }
+      failureStreak = 0;
       return data.data;
+    } catch (failure) {
+      if (token === lease && generation === leaseGeneration &&
+          (timedOut || !received && failure?.name === "TypeError") && ++failureStreak >= 2) await pauseAll();
+      throw failure;
     } finally {
+      finishOwn?.();
       clearTimeout(timeout);
       if (request === controller) request = null;
     }
@@ -258,6 +320,22 @@
     if (accepted?.ok && generation === leaseGeneration) { dirty = false; urgent = false; }
   }
 
+  // Only a confirmed, unchanged, unopened and already-seen conversation
+  // may use the long audit cadence. Preserve 60s for opened/unread/uncertain
+  // rows and the existing fast paths for activity. Never extend freshness.
+  function cold(row, sample) {
+    const task = trackedTasks[row.id], probe = probes.get(row.id);
+    return !row.retained && !opened.has(row.id) && !!task &&
+      task.status === "seen" && !task.pending && !task.runAt && !task.awaitingReply &&
+      !task.messageUncertain && !task.queueError && !task.listUncertain && !task.accessDeniedAt &&
+      !sample.errorAt && !sample.awaiting && TaskPulseState.queueBusy(sample.queue) === false &&
+      !!probe?.lastAt && probe.lastAt >= sample.at && !probe.errorAt &&
+      Number(probe.updateTime) === Number(row.updateTime) &&
+      Number(task.messageUpdate) === Number(row.updateTime) &&
+      Number(task.update) === Number(row.updateTime) &&
+      Number(task.agentId) === Number(row.agentId || api.body.agentIdList[0]);
+  }
+
   function dueAt(now) {
     return TaskPulseState.watchRows(conversations, samples, trackedTasks, now, opened, hints).map(row => {
       let sample = samples.get(row.id);
@@ -280,12 +358,14 @@
       if (!row.retained && probe?.errorAt && now >= probe.nextAt && now - sample.checked >= timing.hot) return true;
       const interval = row.retained && sample.errorAt ? timing.idle :
         hot ? (sample.settleSince && now - sample.settleSince >= timing.settleFast && sample.awaiting ? 5_000 : timing.hot) :
-        task?.messageUncertain || sample.awaiting || task?.awaitingReply ? 15_000 : timing.idle;
+        task?.messageUncertain || sample.awaiting || task?.awaitingReply ? 15_000 :
+        cold(row, sample) ? timing.coldIdle : timing.idle;
       return now - sample.checked >= interval;
     }).sort((a, b) => {
       const priority = ({ row, sample }) => isHot(row, sample, now) ? 2 : opened.has(row.id) ? 1 : 0;
       const oldest = item => item.sample.checked || item.sample.firstDue;
-      const overdue = item => now - oldest(item) >= timing.idle * 2 ? 1 : 0;
+      const overdue = item => now - oldest(item) >=
+        (cold(item.row, item.sample) && !isHot(item.row, item.sample, now) ? timing.coldIdle + timing.idle : timing.idle * 2) ? 1 : 0;
       // Even a saturated hot/open set cannot indefinitely starve a cold row.
       // Once overdue, oldest service wins before normal priority.
       return overdue(b) - overdue(a) ||
@@ -324,9 +404,18 @@
       // Read the durable monitoring set on every round, including after a
       // collector handoff. Old active/uncertain tasks retain their queue slots.
       const saved = await chrome.storage.local.get(web.keys.state).catch(() => null);
-      if (saved) trackedTasks = saved[web.keys.state]?.tasks || {};
+      if (saved) {
+        const durable = saved[web.keys.state];
+        trackedTasks = durable?.tasks || {};
+        if (durable?.pressureUntil > pressureUntil) pressureUntil = durable.pressureUntil;
+        if (durable?.pressureAt >= pressureAt) {
+          pressureAt = durable.pressureAt;
+          pressureLevel = Math.min(4, Math.max(0, durable.pressureLevel || 0));
+        }
+      }
       if (token !== lease || generation !== leaseGeneration) return;
       const stamp = Date.now();
+      if (stamp < pressureUntil) return;
       for (const [cid, until] of hints) if (until <= stamp) hints.delete(cid);
       const listInterval = fastWork(stamp) && !error ? timing.activeList : timing.list;
       const dueList = error ? nextListAt : listAt ? Math.min(nextListAt, listAt + listInterval) : nextListAt;
@@ -341,6 +430,10 @@
         for (let index = 0; index < due.length; index++) {
           const { row, sample } = due[index];
           if (token !== lease || generation !== leaseGeneration || deadline - Date.now() < 250 || !budgetAvailable()) break;
+          // Any queue can turn idle. Reserve the accompanying message slot
+          // before beginning, including first discovery; otherwise a row
+          // aligned with the periodic list could miss every message audit.
+          if (!budgetAvailable(Date.now(), 2)) break;
           const wasBusy = TaskPulseState.queueBusy(sample.queue) === true;
           if (await pullQueue(row, sample, deadline) && token === lease && generation === leaseGeneration &&
               TaskPulseState.queueBusy(sample.queue) === false) {
@@ -370,7 +463,9 @@
   }
 
   function configureTimer() {
-    const delay = fastWork(Date.now()) && !error ? timing.tick : timing.idleTick;
+    const now = Date.now();
+    const delay = now < pressureUntil ? Math.min(timing.list, Math.max(timing.idleTick, pressureUntil - now)) :
+      fastWork(now) && !error ? timing.tick : timing.idleTick;
     if (timer !== null && roundTimerDelay === delay) return;
     if (timer !== null) clearInterval(timer);
     roundTimerDelay = delay;
@@ -417,7 +512,8 @@
   }
 
   chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
-    if (msg?.kind === "tp.probe" && web.conversationPage(location.href)) reply({ pageId, lease });
+    if (msg?.kind === "tp.probe" && web.conversationPage(location.href))
+      reply({ pageId, lease, nativeObservation: native?.snapshot() });
     if (msg?.pageId !== pageId) return;
     if (msg.kind === "tp.role") {
       setRole(msg.lease || "");

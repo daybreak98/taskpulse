@@ -55,6 +55,7 @@
       tick: 1_000, idleTick: 2_000, report: 4_000, urgentReport: 250, list: 30_000,
       activeList: 5_000, hot: 2_000, idle: 60_000, hotWindow: 20_000,
       settleFast: 12_000, settleSlow: 90_000, queueBudget: 6, watch: 24,
+      coldIdle: 300_000, pressureBase: 30_000, pressureMax: 300_000,
       budgetWindow: 2_000, requestBurst: 12, round: 10_000, request: 4_000,
       queueStale: 120_000, sourceStale: 180_000
     },
