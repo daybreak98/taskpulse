@@ -130,7 +130,7 @@ async function syncLeader({ install = false, nudge = false } = {}) {
   // stopped producing usable data. Prefer another ready page only once the
   // existing source-stale window is exceeded; healthy sources never churn.
   const stalled = Boolean(current && candidates.some(tab => tab.id !== current.id) &&
-    Date.now() - lastProgress > web.timing.sourceStale);
+    !(state.pressureUntil > Date.now()) && Date.now() - lastProgress > web.timing.sourceStale);
   if (current && !stalled) {
     const answer = await probe(current);
     if (answer?.pageId === old.pageId) {
@@ -227,6 +227,7 @@ function armFastWake() {
 }
 function updateFastWake(leader, state, hidden) {
   hiddenCollector = hidden === true;
+  if (state.pressureUntil > Date.now()) { stopFastWake(); return; }
   const active = !state.error && !state.sourceUnavailable && Object.values(state.tasks).some(task =>
     !task.accessDeniedAt && (task.runAt || task.awaitingReply) &&
     (!task.settleUntil || Date.now() <= task.settleUntil));
@@ -242,6 +243,7 @@ async function relayActivity(msg, sender) {
   const leader = await getLeader();
   if (!leader) { refreshLeader(); return { ok: true }; }
   const cid = web.conversationId(actual.url);
+  if ((await getState()).pressureUntil > Date.now()) return { ok: true };
   activityUntil = Date.now() + web.timing.hotWindow;
   if (leader.tabId !== sender.tab.id || msg.route === true)
     await signal(leader.tabId, { kind: "tp.nudge", pageId: leader.pageId, activity: true, cid });
@@ -495,6 +497,26 @@ async function acknowledge(state, task, checked = false, jumpToken = "") {
   pruneOutbox(state);
   await saveState(state);
   await syncNotices(state);
+}
+
+async function acceptPressure(msg, sender) {
+  const leader = await getLeader();
+  if (!leader || leader.tabId !== sender.tab.id || leader.pageId !== msg.pageId ||
+      leader.lease !== msg.lease || !isReady(await chrome.tabs.get(sender.tab.id).catch(() => null)))
+    return { ok: false };
+  const now = Date.now();
+  if (!Number.isSafeInteger(msg.at) || msg.at > now + 5000 ||
+      !Number.isSafeInteger(msg.until) || msg.until <= now ||
+      !Number.isInteger(msg.level) || msg.level < 1 || msg.level > 4) return { ok: false };
+  const state = await getState();
+  state.pressureUntil = Math.max(state.pressureUntil || 0, msg.until);
+  if (msg.at >= (state.pressureAt || 0)) {
+    state.pressureAt = msg.at;
+    state.pressureLevel = msg.level;
+  }
+  await saveState(state);
+  stopFastWake();
+  return { ok: true, until: state.pressureUntil };
 }
 
 async function acceptReport(msg, sender) {
@@ -792,6 +814,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     return false;
   }
   if (msg.kind === "tp.webstate") reply = serialize(() => acceptReport(msg, sender));
+  if (msg.kind === "tp.pressure") reply = serialize(() => acceptPressure(msg, sender));
   if (msg.kind === "tp.activity") reply = relayActivity(msg, sender);
   if (msg.kind === "tp.visibility") reply = collectorVisibility(msg, sender);
   if (msg.kind === "tp.settings") reply = chrome.runtime.openOptionsPage().then(() => ({ ok: true }));

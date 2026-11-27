@@ -2401,3 +2401,250 @@ test("P1 a visited red reply cannot auto-read a later foreground reply", async (
     assert.equal(app.session.data["tp-web-jump-tabs-v1"]?.["9"], undefined);
   }
 });
+
+
+// Low-load collector fixture: real production scheduler + fake clock and
+// local endpoint responses. No real DataAgent traffic.
+async function lowLoadCollector({ rows, stamp = now, opened = [], initialState,
+    oldCadence = false, responder = null, requestTimeout = null } = {}) {
+  let durable = structuredClone(initialState || rules.blank()), interval;
+  const requests = [], reports = [], replies = [], pauses = [], listeners = [];
+  const success = data => ({ ok: true, json: async () => ({ success: true, data }) });
+  const chrome = {
+    storage: { local: { get: async key => ({ [key]: key === web.keys.opened ? opened : durable }) } },
+    runtime: { id: "low-load-fixture", onMessage: { addListener: fn => listeners.push(fn) },
+      sendMessage: async packet => {
+        if (packet.kind === "tp.pressure") {
+          pauses.push(packet);
+          durable = { ...durable, pressureUntil: Math.max(durable.pressureUntil || 0, packet.until),
+            pressureAt: packet.at, pressureLevel: packet.level };
+          return { ok: true, until: durable.pressureUntil };
+        }
+        if (packet.kind === "tp.webstate") {
+          reports.push(packet.payload);
+          const result = rules.absorb(durable, packet.payload, stamp);
+          durable = result.state;
+          replies.push(...result.replies.map(task => ({ id: task.id, at: stamp, revision: rules.revision(task) })));
+        }
+        return { ok: true };
+      }
+    }
+  };
+  class Clock extends Date { static now() { return stamp; } }
+  const context = vm.createContext({
+    chrome, URL, console, crypto: webcrypto, AbortController, Date: Clock,
+    location: new URL(web.page), document: { hidden: false, addEventListener() {} },
+    setTimeout, clearTimeout, setInterval: fn => { interval = fn; return 1; }, clearInterval() {},
+    fetch: async (url, init) => {
+      requests.push({ at: stamp, path: url.pathname });
+      const extra = responder?.({ url, init, stamp, requests });
+      if (extra !== undefined) return extra;
+      if (url.pathname.endsWith("/list")) return success({ groups: [], ungrouped: { conversations: rows } });
+      const cid = url.pathname.split("/").at(-2);
+      const item = rows.find(r => r.id === cid);
+      if (url.pathname.endsWith("/queue")) return success({ sessionState: item?.busy ? "BUSY" : "IDLE", pending: [] });
+      return success({ list: [{ sender: "assistant", id: item?.messageId || "old-" + cid,
+        createTime: item?.messageAt || item?.updateTime - 1 }] });
+    }
+  });
+  for (const file of ["config.js", "state.js", "native-observer.js", "web-bridge.js"]) {
+    if (file === "state.js") {
+      // Counterfactual changes only the cold cadence, isolating its cost.
+      if (oldCadence) vm.runInContext("TaskPulseWeb.timing.coldIdle = TaskPulseWeb.timing.idle", context);
+      if (requestTimeout) vm.runInContext("TaskPulseWeb.timing.request = " + requestTimeout, context);
+    }
+    vm.runInContext(fs.readFileSync(path.join(ext, file), "utf-8"), context, { filename: file });
+  }
+  let page;
+  listeners[0]({ kind: "tp.probe" }, {}, answer => { page = answer; });
+  const role = lease => listeners[0]({ kind: "tp.role", pageId: page.pageId, lease }, {}, () => {});
+  role("low-load");
+  await until(() => reports.length >= 1, "initial low-load report");
+  await new Promise(resolve => setTimeout(resolve, 5));
+  return {
+    requests, reports, replies, pauses, state: () => durable, time: () => stamp,
+    role,
+    nudge: cid => listeners[0]({ kind: "tp.nudge", pageId: page.pageId, activity: true, cid }, {}, () => {}),
+    advance: async (ms, step = 2_000) => {
+      const until = stamp + ms;
+      while (stamp < until) {
+        stamp = Math.min(until, stamp + step);
+        await interval();
+      }
+    },
+    close: () => role("")
+  };
+}
+
+const quietRows = (count = 24) => Array.from({ length: count }, (_, i) => ({
+  ...row(now - 3_600_000 - i, now - 3_600_000 - i), id: String(42 + i)
+}));
+
+test("low-load cold audit: measured steady-state requests fall without dropping initial coverage", async () => {
+  async function measure(oldCadence) {
+    const app = await lowLoadCollector({ rows: quietRows(), oldCadence });
+    try {
+      await app.advance(120_000);
+      assert.equal(Object.values(app.state().tasks).filter(t => t.observedAt && t.messageObservedAt).length, 24);
+      const start = app.time();
+      await app.advance(600_000);
+      const counts = { list: 0, queue: 0, messages: 0 };
+      for (const req of app.requests.filter(r => r.at > start)) counts[req.path.split("/").at(-1)]++;
+      assert.equal(app.replies.length, 0);
+      return { ...counts, total: Object.values(counts).reduce((a, b) => a + b, 0) };
+    } finally { app.close(); }
+  }
+  const before = await measure(true), after = await measure(false);
+  console.log("LOW_LOAD_10MIN " + JSON.stringify({ before, after,
+    reduction: (before.total - after.total) / before.total }));
+  assert.equal(before.list, after.list);
+  assert.ok(after.total <= before.total * .35, JSON.stringify({ before, after }));
+  assert.ok(after.queue >= 24, "a cold conversation must still receive periodic audits");
+  assert.ok(after.messages >= 24, "audits must still read message identities");
+});
+
+test("low-load changed list version promotes a cold row immediately; unrelated cold rows stay quiet", async () => {
+  const rows = quietRows(4), app = await lowLoadCollector({ rows });
+  try {
+    await app.advance(120_000);
+    const at = app.time();
+    rows[0].updateTime = at + 1;
+    rows[0].messageAt = at + 1;
+    rows[0].messageId = "new-cold";
+    await app.advance(34_000);
+    assert.equal(app.replies.length, 1);
+    assert.equal(app.replies[0].id, id);
+    assert.ok(app.replies[0].at - at <= 34_000);
+    assert.ok(app.state().tasks[id].pending);
+    assert.equal(app.requests.filter(r => r.at > at && /\/(43|44|45)\/queue$/.test(r.path)).length, 0);
+  } finally { app.close(); }
+});
+
+test("low-load opened rows retain their cadence and quiet rows audit even if list clock never changes", async () => {
+  const rows = quietRows(2), app = await lowLoadCollector({ rows, opened: ["43"] });
+  try {
+    await app.advance(124_000);
+    const at = app.time();
+    rows[0].messageAt = at + 1;
+    rows[0].messageId = "new-without-list-update";
+    await app.advance(190_000);
+    assert.ok(app.replies.some(r => r.id === id), "cold audit did not discover independent new reply");
+    assert.ok(app.requests.filter(r => r.path.endsWith("/43/queue")).length >= 4, "opened conversation was slowed");
+  } finally { app.close(); }
+});
+
+test("low-load cold evidence is not relabeled fresh and activity restores the fast path", async () => {
+  const rows = quietRows(2), app = await lowLoadCollector({ rows });
+  try {
+    await app.advance(140_000);
+    const before = app.state().tasks[id];
+    assert.equal(rules.taskFresh(app.state(), before, app.time()), false);
+    const at = app.time();
+    rows[0].busy = true;
+    app.nudge(id);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await app.advance(4_000);
+    assert.equal(app.state().tasks[id].status, "running");
+    assert.ok(app.state().tasks[id].observedAt >= at);
+  } finally { app.close(); }
+});
+
+test("low-load HTTP 429 stops ALL endpoints, honors Retry-After and survives collector replacement", async () => {
+  const rows = quietRows(3);
+  const app = await lowLoadCollector({ rows, responder: ({ url }) => url.pathname.endsWith("/queue")
+    ? { ok: false, status: 429, headers: { get: name => name === "Retry-After" ? "90" : null } } : undefined });
+  let saved, until;
+  try {
+    assert.equal(app.pauses.length, 1);
+    assert.equal(app.requests.length, 2, "other endpoints must stop in the same round");
+    until = app.pauses[0].until;
+    assert.ok(until >= now + 90_000);
+    await app.advance(30_000);
+    assert.equal(app.requests.length, 2);
+    saved = app.state();
+  } finally { app.close(); }
+  const replacement = await lowLoadCollector({ rows, stamp: now + 31_000, initialState: saved });
+  try {
+    assert.equal(replacement.requests.length, 0, "handoff bypassed server pause");
+    replacement.nudge(id);
+    await replacement.advance(until - replacement.time() - 1);
+    assert.equal(replacement.requests.length, 0);
+    await replacement.advance(2_001);
+    assert.ok(replacement.requests.length > 0, "collector did not resume");
+    assert.equal(replacement.pauses.length, 0);
+  } finally { replacement.close(); }
+});
+
+test("low-load isolated 503 remains per-row; consecutive server failures stop the source", async () => {
+  const rows = quietRows(4);
+  const isolated = await lowLoadCollector({ rows, responder: ({ url }) => url.pathname.endsWith("/42/queue")
+    ? { ok: false, status: 503 } : undefined });
+  try {
+    assert.equal(isolated.pauses.length, 0);
+    assert.ok(isolated.requests.some(r => r.path.endsWith("/43/queue")));
+  } finally { isolated.close(); }
+  const overloaded = await lowLoadCollector({ rows, responder: ({ url }) => url.pathname.endsWith("/queue")
+    ? { ok: false, status: 503 } : undefined });
+  try {
+    assert.equal(overloaded.pauses.length, 1);
+    assert.equal(overloaded.requests.length, 3);
+    assert.ok(overloaded.pauses[0].until >= now + web.timing.pressureBase);
+  } finally { overloaded.close(); }
+});
+
+test("low-load consecutive timeouts stop all endpoints but a single failure does not", async () => {
+  const rows = quietRows(4);
+  const app = await lowLoadCollector({ rows, requestTimeout: 2,
+    responder: ({ url, init }) => url.pathname.endsWith("/queue")
+      ? new Promise((_, reject) => init.signal.addEventListener("abort", () => {
+        const err = new Error("timed out"); err.name = "AbortError"; reject(err);
+      }, { once: true })) : undefined });
+  try {
+    assert.equal(app.pauses.length, 1);
+    assert.equal(app.requests.length, 3);
+  } finally { app.close(); }
+});
+
+test("low-load pressure is persisted only by the current collector and cannot be shortened", async () => {
+  const app = worker();
+  await app.deliver(report(now, row(), { busy: true }));
+  const pressure = { kind: "tp.pressure", pageId: "page", lease: "one",
+    at: now, until: now + 90_000, level: 1 };
+  assert.equal((await app.send({ ...pressure, lease: "retired" })).ok, false);
+  assert.equal((await app.send(pressure)).ok, true);
+  assert.equal((await app.send({ ...pressure, until: now + 30_000 })).until, now + 90_000);
+  await app.deliver(report(now + 5_000, row(), { busy: true }));
+  assert.equal(app.local.data[web.keys.state].pressureUntil, now + 90_000);
+  assert.equal(app.local.data[web.keys.state].tasks[id].status, "running");
+});
+
+test("low-load native observer is passive, scope-limited and separates possible overlap from own requests", () => {
+  let callback, clock = 100;
+  class Observer {
+    constructor(fn) { callback = fn; }
+    observe(options) { assert.equal(options.type, "resource"); assert.equal(options.buffered, false); }
+  }
+  const context = vm.createContext({ URL, location: new URL(web.page), PerformanceObserver: Observer,
+    performance: { now: () => clock } });
+  vm.runInContext(fs.readFileSync(path.join(ext, "native-observer.js"), "utf-8"), context);
+  const probe = context.TaskPulseNative.observe(web);
+  const url = new URL(web.api.prefix + "/conversations/42/queue", web.page).href;
+  const emit = (name, startTime, responseEnd, responseStatus = 200, initiatorType = "fetch") =>
+    callback({ getEntries: () => [{ name, startTime, responseEnd, responseStatus, initiatorType }] });
+  const done = probe.startOwn(url);
+  clock = 110; done();
+  emit(url, 101, 110);
+  assert.equal(probe.snapshot().native.queue, 0);
+  emit(url, 120, 130, 200, "xmlhttprequest");
+  emit("https://example.com" + web.api.prefix + "/conversations/42/queue", 121, 131);
+  emit(url, 140, 150, 0);
+  emit(url, 160, 170, 429);
+  emit(url, 180, 190, 200, "img");
+  clock = 200; probe.startOwn(url)();
+  const snapshot = probe.snapshot();
+  assert.equal(snapshot.native.queue, 1);
+  assert.equal(snapshot.own.queue, 2);
+  assert.equal(snapshot.possibleOverlap.queue, 1);
+  assert.equal(snapshot.unknownStatus.queue, 1);
+  assert.ok(!JSON.stringify(snapshot).includes("42"));
+});
